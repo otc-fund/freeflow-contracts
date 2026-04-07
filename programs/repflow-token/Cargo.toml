@@ -1,0 +1,29 @@
+[package]
+name        = "repflow-token"
+version     = "0.1.0"
+edition     = "2021"
+description = "repFlow — Non-Transferable Reputation Token for FreeFlow Network"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name       = "repflow_token"
+
+[features]
+no-entrypoint = []
+cpi           = ["no-entrypoint"]
+idl-build     = ["anchor-lang/idl-build"]
+
+[dependencies]
+anchor-lang      = { version = "0.30.0", features = ["init-if-needed"] }
+anchor-spl       = { version = "0.30.0", features = ["token_2022"] }
+spl-token-2022   = { version = "3", features = ["no-entrypoint"] }
+spl-transfer-hook-interface = "0.6"
+bytemuck         = { version = "1", features = ["derive"] }
+borsh            = { workspace = true }
+thiserror        = { workspace = true }
+
+[dev-dependencies]
+anchor-client       = "0.30.0"
+solana-program-test = { workspace = true }
+solana-sdk          = { workspace = true }
+tokio               = { workspace = true }
