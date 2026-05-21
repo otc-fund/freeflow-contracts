@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "programs/staking",
+    "programs/rewards",
+    "programs/registry",
+    "programs/repflow-token",
+    "programs/user-escrow",
+]
+resolver = "2"
+
+[workspace.dependencies]
+anchor-lang          = { version = "0.30.0" }
+anchor-spl           = { version = "0.30.0" }
+solana-program       = "1.18"
+solana-program-test  = "1.18"
+solana-sdk           = "1.18"
+spl-token            = { version = "4", features = ["no-entrypoint"] }
+borsh                = "=1.5.1"
+thiserror            = "1"
+tokio                = { version = "1", features = ["full"] }
+# Pinned for cargo 1.75 compatibility (Solana platform-tools / cargo-build-sbf).
+# borsh 1.6.0+ requires rustc 1.77; blake3 1.6+ pulls block-buffer 0.12 (edition2024);
+# proc-macro-crate 3.5.0 pulls toml_edit 0.25 → indexmap 2.13 (edition2024).
+borsh-derive         = "=1.5.7"
+blake3               = { version = "=1.5.0", default-features = false }
+proc-macro-crate     = "=3.1.0"
+hashbrown            = "=0.14.5"
+indexmap             = "=2.7.0"
+jobserver            = "=0.1.26"
+cc                   = "=1.0.83"
+unicode-segmentation = "=1.12.0"
+getrandom            = { version = "=0.2.15", features = ["custom"] }

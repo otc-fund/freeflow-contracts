@@ -1,0 +1,8 @@
+﻿target/
+Cargo.lock
+*.tsbuildinfo
+node_modules/
+
+# Tests
+tests/*.ts
+programs/*/tests/

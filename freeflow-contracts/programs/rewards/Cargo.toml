@@ -1,0 +1,19 @@
+[package]
+name        = "rewards"
+version     = "0.1.0"
+edition     = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = { workspace = true }
+spl-token      = { workspace = true }
+borsh          = { workspace = true }
+thiserror      = { workspace = true }
+
+# Force workspace pins into this crate's dependency tree so cargo-build-sbf
+# (cargo 1.75) doesn't pull edition2024 manifests from transitive deps.
+blake3    = { workspace = true, default-features = false }
+getrandom = { workspace = true }
+jobserver = { workspace = true }
