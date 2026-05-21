@@ -6,11 +6,11 @@ seeds = true
 skip-lint = false
 
 [programs.localnet]
-repflow_token = "RPFLxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-staking       = "STAKxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-rewards       = "REWDxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-registry      = "REGIxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-user_escrow   = "USEscw1111111111111111111111111111111111111"
+repflow_token = "8K4GhPEQ1yy9vdTaMPTL83G5qr5ZHZiBm2VBQ58jJs5w"
+staking       = "7N1JRX3LY3goVAZCyaJyH7kpZ3kboZvh3jteDmCq6Dz4"
+rewards       = "2yeVew5qq5jf5zuoqiE2svVLRE9HTN6J2GfB9LopdM1C"
+registry      = "HkMhMoEv7U8VowyVsCCk9pZDkWwp18ei1BZ3Fif94DCE"
+user_escrow   = "7PzcA2sNDzrvhTNLFScWZuNKS4g7jCCghsowZA9RsZ26"
 
 [programs.devnet]
 repflow_token = "8K4GhPEQ1yy9vdTaMPTL83G5qr5ZHZiBm2VBQ58jJs5w"
@@ -20,11 +20,11 @@ registry      = "HkMhMoEv7U8VowyVsCCk9pZDkWwp18ei1BZ3Fif94DCE"
 user_escrow   = "7PzcA2sNDzrvhTNLFScWZuNKS4g7jCCghsowZA9RsZ26"
 
 [programs.mainnet]
-repflow_token = "RPFLxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-staking       = "STAKxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-rewards       = "REWDxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-registry      = "REGIxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-user_escrow   = "USEscw1111111111111111111111111111111111111"
+repflow_token = "8K4GhPEQ1yy9vdTaMPTL83G5qr5ZHZiBm2VBQ58jJs5w"
+staking       = "7N1JRX3LY3goVAZCyaJyH7kpZ3kboZvh3jteDmCq6Dz4"
+rewards       = "2yeVew5qq5jf5zuoqiE2svVLRE9HTN6J2GfB9LopdM1C"
+registry      = "HkMhMoEv7U8VowyVsCCk9pZDkWwp18ei1BZ3Fif94DCE"
+user_escrow   = "7PzcA2sNDzrvhTNLFScWZuNKS4g7jCCghsowZA9RsZ26"
 
 [registry]
 url = "https://api.apr.dev"

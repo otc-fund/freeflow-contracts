@@ -279,6 +279,155 @@ pub mod user_escrow {
 
         Ok(())
     }
+
+    /// Lock $FLOW in a 7-day dispute-window hold.
+    ///
+    /// Called via CPI from rewards program's `ClaimUsage`.
+    /// Checks effective balance (`balance - held >= amount`), increments `held`,
+    /// and creates a `FundHold` PDA in `Active` state.
+    ///
+    /// Does NOT debit `balance` — the SPL token account is untouched.
+    /// `balance` is only decremented when tokens are actually burned (`BurnHeldFunds`).
+    pub fn hold_client_funds(
+        ctx:        Context<HoldClientFunds>,
+        amount:     u64,
+        claim_hash: [u8; 32],
+        session_id: [u8; 16],
+    ) -> Result<()> {
+        require!(amount > 0, EscrowError::InvalidPaymentAmount);
+
+        // 1. Verify caller is an authorized spender.
+        require!(
+            ctx.accounts.spender_registry.active_spenders
+                .contains(&ctx.accounts.service_authority.key()),
+            EscrowError::UnauthorizedCaller
+        );
+
+        let escrow = &mut ctx.accounts.user_escrow;
+
+        // 2. Effective balance check: balance - held >= amount.
+        let effective = escrow.balance.saturating_sub(escrow.held);
+        require!(effective >= amount, EscrowError::InsufficientEffectiveBalance);
+
+        // 3. Increment held (does NOT change balance).
+        escrow.held = escrow.held
+            .checked_add(amount)
+            .ok_or(EscrowError::InvalidPaymentAmount)?;
+
+        let total_held = escrow.held;
+
+        // 4. Populate FundHold PDA.
+        let hold        = &mut ctx.accounts.fund_hold;
+        hold.user       = ctx.accounts.user.key().to_bytes();
+        hold.amount     = amount;
+        hold.claim_hash = claim_hash;
+        hold.session_id = session_id;
+        hold.created_at = Clock::get()?.unix_timestamp;
+        hold.status     = HoldStatus::Active;
+
+        emit!(FundsHeld {
+            user: ctx.accounts.user.key(),
+            amount,
+            claim_hash,
+            session_id,
+            total_held,
+        });
+
+        Ok(())
+    }
+
+    /// Release a hold when the client wins a dispute.
+    ///
+    /// Called via CPI from rewards `ResolveDisputeRelaySlashed`.
+    /// Decrements `held` only — `balance` is unchanged since it was never debited.
+    pub fn release_funds(
+        ctx:         Context<ReleaseFunds>,
+        _claim_hash: [u8; 32],  // used only for PDA seed derivation in constraint
+    ) -> Result<()> {
+        // 1. Verify caller is an authorized spender.
+        require!(
+            ctx.accounts.spender_registry.active_spenders
+                .contains(&ctx.accounts.service_authority.key()),
+            EscrowError::UnauthorizedCaller
+        );
+
+        let hold   = &mut ctx.accounts.fund_hold;
+        let escrow = &mut ctx.accounts.user_escrow;
+        let amount = hold.amount;
+
+        // 2. Decrement held (balance is NOT changed — tokens stay in escrow).
+        escrow.held = escrow.held.saturating_sub(amount);
+
+        // 3. Mark hold as Released.
+        hold.status = HoldStatus::Released;
+
+        emit!(FundsReleased {
+            user:       ctx.accounts.user.key(),
+            amount,
+            claim_hash: hold.claim_hash,
+            total_held: escrow.held,
+        });
+
+        Ok(())
+    }
+
+    /// Burn held $FLOW after the 7-day dispute window expires.
+    ///
+    /// Called via CPI from rewards `ReleaseRewards` and `ResolveDisputeChallengerSlashed`.
+    /// Decrements both `held` and `balance`, then SPL-burns `amount` from the escrow
+    /// token account. The rewards program enforces the 7-day timing.
+    pub fn burn_held_funds(
+        ctx:         Context<BurnHeldFunds>,
+        _claim_hash: [u8; 32],  // used only for PDA seed derivation in constraint
+    ) -> Result<()> {
+        // 1. Verify caller is an authorized spender.
+        require!(
+            ctx.accounts.spender_registry.active_spenders
+                .contains(&ctx.accounts.service_authority.key()),
+            EscrowError::UnauthorizedCaller
+        );
+
+        let hold       = &ctx.accounts.fund_hold;
+        let amount     = hold.amount;
+        let claim_hash = hold.claim_hash;
+
+        // 2. Decrement held and balance atomically.
+        {
+            let escrow = &mut ctx.accounts.user_escrow;
+            escrow.held = escrow.held.saturating_sub(amount);
+            escrow.balance = escrow.balance
+                .checked_sub(amount)
+                .ok_or(EscrowError::InsufficientBalance)?;
+        }
+
+        // 3. SPL burn from escrow token account. user_escrow PDA is the authority.
+        let user_key    = ctx.accounts.user.key();
+        let escrow_bump = ctx.bumps.user_escrow;
+        token::burn(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Burn {
+                    mint:      ctx.accounts.token_mint.to_account_info(),
+                    from:      ctx.accounts.user_escrow_token.to_account_info(),
+                    authority: ctx.accounts.user_escrow.to_account_info(),
+                },
+                &[&[b"user_escrow", user_key.as_ref(), &[escrow_bump]]],
+            ),
+            amount,
+        )?;
+
+        // 4. Mark hold as Burned.
+        ctx.accounts.fund_hold.status = HoldStatus::Burned;
+
+        emit!(FundsBurned {
+            user:              ctx.accounts.user.key(),
+            amount,
+            claim_hash,
+            remaining_balance: ctx.accounts.user_escrow.balance,
+        });
+
+        Ok(())
+    }
 }
 
 // ─── Account structs ──────────────────────────────────────────────────────────
@@ -523,6 +672,130 @@ pub struct SpendFromEscrow<'info> {
     pub relay: UncheckedAccount<'info>,
 
     /// Global spender registry. Caller must be in active_spenders.
+    #[account(seeds = [b"spender_registry"], bump)]
+    pub spender_registry: Account<'info, AuthorizedSpenderRegistry>,
+
+    #[account(mut)]
+    pub token_mint: Account<'info, Mint>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+/// Context for locking $FLOW in a dispute-window hold.
+///
+/// Called via CPI from rewards program's `ClaimUsage` instruction.
+/// `service_authority` must be in `spender_registry.active_spenders`.
+#[derive(Accounts)]
+#[instruction(amount: u64, claim_hash: [u8; 32], session_id: [u8; 16])]
+pub struct HoldClientFunds<'info> {
+    /// Authorized spender — must be in spender_registry (e.g. rewards mint_authority PDA).
+    pub service_authority: Signer<'info>,
+
+    /// Payer for FundHold PDA rent (relay wallet in practice).
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// CHECK: User wallet — used only as PDA seed. Not a signer.
+    pub user: UncheckedAccount<'info>,
+
+    /// User's escrow accounting state. NOT debited; only `held` is incremented.
+    #[account(
+        mut,
+        seeds = [b"user_escrow", user.key().as_ref()],
+        bump,
+        constraint = user_escrow.user == user.key() @ EscrowError::UnauthorizedCaller
+    )]
+    pub user_escrow: Account<'info, UserEscrow>,
+
+    /// FundHold PDA created here. Seeds: ["fund_hold", user, claim_hash].
+    #[account(
+        init,
+        payer = payer,
+        space = FundHold::ACCOUNT_SIZE,
+        seeds = [b"fund_hold", user.key().as_ref(), claim_hash.as_ref()],
+        bump
+    )]
+    pub fund_hold: Account<'info, FundHold>,
+
+    /// Registry of Foundation-approved spenders. Caller must be listed here.
+    #[account(seeds = [b"spender_registry"], bump)]
+    pub spender_registry: Account<'info, AuthorizedSpenderRegistry>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Context for releasing a hold when the client wins a dispute.
+#[derive(Accounts)]
+#[instruction(claim_hash: [u8; 32])]
+pub struct ReleaseFunds<'info> {
+    /// Authorized spender — must be in spender_registry.
+    pub service_authority: Signer<'info>,
+
+    /// CHECK: User wallet — PDA seed only.
+    pub user: UncheckedAccount<'info>,
+
+    /// User's escrow accounting state. `held` is decremented here.
+    #[account(
+        mut,
+        seeds = [b"user_escrow", user.key().as_ref()],
+        bump,
+        constraint = user_escrow.user == user.key() @ EscrowError::UnauthorizedCaller
+    )]
+    pub user_escrow: Account<'info, UserEscrow>,
+
+    /// FundHold PDA to release. Must be in Active state.
+    #[account(
+        mut,
+        seeds = [b"fund_hold", user.key().as_ref(), claim_hash.as_ref()],
+        bump,
+        constraint = fund_hold.status == HoldStatus::Active @ EscrowError::HoldNotActive,
+        constraint = fund_hold.user == user.key().to_bytes() @ EscrowError::UnauthorizedCaller
+    )]
+    pub fund_hold: Account<'info, FundHold>,
+
+    /// Registry of Foundation-approved spenders.
+    #[account(seeds = [b"spender_registry"], bump)]
+    pub spender_registry: Account<'info, AuthorizedSpenderRegistry>,
+}
+
+/// Context for burning held tokens after the 7-day dispute window.
+#[derive(Accounts)]
+#[instruction(claim_hash: [u8; 32])]
+pub struct BurnHeldFunds<'info> {
+    /// Authorized spender — must be in spender_registry.
+    pub service_authority: Signer<'info>,
+
+    /// CHECK: User wallet — PDA seed only.
+    pub user: UncheckedAccount<'info>,
+
+    /// User's escrow accounting state. Both `held` and `balance` are decremented.
+    #[account(
+        mut,
+        seeds = [b"user_escrow", user.key().as_ref()],
+        bump,
+        constraint = user_escrow.user == user.key() @ EscrowError::UnauthorizedCaller
+    )]
+    pub user_escrow: Account<'info, UserEscrow>,
+
+    /// Escrow token account. Authority = user_escrow PDA. Tokens are burned from here.
+    #[account(
+        mut,
+        token::mint      = token_mint,
+        token::authority = user_escrow
+    )]
+    pub user_escrow_token: Account<'info, TokenAccount>,
+
+    /// FundHold PDA to burn. Must be in Active state.
+    #[account(
+        mut,
+        seeds = [b"fund_hold", user.key().as_ref(), claim_hash.as_ref()],
+        bump,
+        constraint = fund_hold.status == HoldStatus::Active @ EscrowError::HoldNotActive,
+        constraint = fund_hold.user == user.key().to_bytes() @ EscrowError::UnauthorizedCaller
+    )]
+    pub fund_hold: Account<'info, FundHold>,
+
+    /// Registry of Foundation-approved spenders.
     #[account(seeds = [b"spender_registry"], bump)]
     pub spender_registry: Account<'info, AuthorizedSpenderRegistry>,
 
