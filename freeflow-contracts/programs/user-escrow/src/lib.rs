@@ -289,16 +289,25 @@ pub mod user_escrow {
 ///
 /// CRITICAL: No withdrawal fields. No cap fields. No authorized_spender field.
 /// Authorization is registry-based (Foundation multisig controls registry).
+///
+/// Accounting invariant: usable = balance - held
+///   balance = total $FLOW (always matches SPL token account)
+///   held    = portion locked in active dispute-window claims
+///   usable  = available for new claims and spend
 #[account]
 pub struct UserEscrow {
     /// Owner — the user's wallet.
     pub user:           Pubkey,
-    /// $FLOW token balance in lamports (1 $FLOW = 1_000_000_000 lamports).
+    /// $FLOW token balance in lamports (total deposited; always equals SPL token account).
     pub balance:        u64,
     /// Active session (if any). Set by the relay layer.
     pub session_id:     Option<[u8; 16]>,
     /// Unix timestamp of last escrow top-up.
     pub last_topup_ts:  u64,
+    /// $FLOW base units locked in active holds (claims in 7-day dispute window).
+    /// Invariant: held <= balance. Usable balance = balance - held.
+    /// Only incremented by HoldClientFunds, decremented by ReleaseFunds/BurnHeldFunds.
+    pub held:           u64,
     // NOTE: No withdrawals_enabled. No cap_enabled. No authorized_spender.
     //       Contract is immutable after deployment (set-upgrade-authority --final).
 }
@@ -368,7 +377,7 @@ pub struct PurchaseAndEscrow<'info> {
     #[account(
         init_if_needed,
         payer = user,
-        space = 8 + 32 + 8 + 17 + 8,
+        space = 8 + 32 + 8 + 17 + 8 + 8,  // +8 for held: u64
         seeds = [b"user_escrow", user.key().as_ref()],
         bump
     )]
@@ -411,7 +420,7 @@ pub struct PurchaseAndEscrowPhase2<'info> {
     #[account(
         init_if_needed,
         payer = user,
-        space = 8 + 32 + 8 + 17 + 8,
+        space = 8 + 32 + 8 + 17 + 8 + 8,  // +8 for held: u64
         seeds = [b"user_escrow", user.key().as_ref()],
         bump
     )]
