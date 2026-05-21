@@ -312,6 +312,48 @@ pub struct UserEscrow {
     //       Contract is immutable after deployment (set-upgrade-authority --final).
 }
 
+/// Lifecycle state of a `FundHold` PDA.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HoldStatus {
+    /// Funds locked; 7-day dispute window open. Initial state.
+    Active,
+    /// Dispute won by client — funds returned to usable balance.
+    Released,
+    /// 7-day window elapsed — funds burned via BurnHeldFunds.
+    Burned,
+}
+
+/// Per-claim token hold tracking locked $FLOW during the 7-day dispute window.
+///
+/// PDA seeds: ["fund_hold", user_wallet, claim_hash]
+///
+/// Created by `HoldClientFunds` (called via CPI from rewards `ClaimUsage`).
+/// Settled by `ReleaseFunds` (dispute win) or `BurnHeldFunds` (timeout).
+#[account]
+pub struct FundHold {
+    /// User wallet that owns the escrowed $FLOW.
+    pub user:       [u8; 32],
+    /// $FLOW base units locked in this hold.
+    pub amount:     u64,
+    /// 32-byte claim hash linking this hold to a PendingClaim in the rewards program.
+    pub claim_hash: [u8; 32],
+    /// Session ID from the usage record that generated this claim.
+    pub session_id: [u8; 16],
+    /// Unix timestamp when the hold was created.
+    pub created_at: i64,
+    /// Current lifecycle state.
+    pub status:     HoldStatus,
+}
+
+impl FundHold {
+    /// Borsh-serialized size (without Anchor discriminator).
+    /// 32 (user) + 8 (amount) + 32 (claim_hash) + 16 (session_id) + 8 (created_at) + 1 (status) = 97
+    pub const DATA_SIZE: usize = 97;
+
+    /// On-chain account size including 8-byte Anchor discriminator.
+    pub const ACCOUNT_SIZE: usize = 8 + Self::DATA_SIZE; // = 105
+}
+
 /// Global registry of Foundation-approved spender programs.
 ///
 /// PDA: ["spender_registry"]
@@ -538,22 +580,57 @@ pub struct SpenderRegistryUpdated {
     pub version:         u64,
 }
 
+#[event]
+pub struct FundsHeld {
+    pub user:       Pubkey,
+    /// $FLOW base units locked.
+    pub amount:     u64,
+    pub claim_hash: [u8; 32],
+    pub session_id: [u8; 16],
+    /// New `UserEscrow.held` value after this hold.
+    pub total_held: u64,
+}
+
+#[event]
+pub struct FundsReleased {
+    pub user:       Pubkey,
+    pub amount:     u64,
+    pub claim_hash: [u8; 32],
+    /// New `UserEscrow.held` value after release.
+    pub total_held: u64,
+}
+
+#[event]
+pub struct FundsBurned {
+    pub user:              Pubkey,
+    pub amount:            u64,
+    pub claim_hash:        [u8; 32],
+    /// New `UserEscrow.balance` after burn.
+    pub remaining_balance: u64,
+}
+
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
 #[error_code]
 pub enum EscrowError {
     #[msg("Insufficient escrow balance")]
-    InsufficientBalance,        // 6000
+    InsufficientBalance,            // 6000
 
     #[msg("Caller is not in the verified spender registry")]
-    UnauthorizedCaller,         // 6001
+    UnauthorizedCaller,             // 6001
 
     #[msg("Invalid payment amount")]
-    InvalidPaymentAmount,       // 6002
+    InvalidPaymentAmount,           // 6002
 
     #[msg("Relay wallet does not match expected destination")]
-    InvalidRelayWallet,         // 6003
+    InvalidRelayWallet,             // 6003
 
     #[msg("Only foundation multisig can update spender registry")]
-    NotFoundation,              // 6004
+    NotFoundation,                  // 6004
+
+    #[msg("Hold is not in Active state")]
+    HoldNotActive,                  // 6005
+
+    #[msg("Insufficient effective balance (balance - held < amount)")]
+    InsufficientEffectiveBalance,   // 6006
 }
