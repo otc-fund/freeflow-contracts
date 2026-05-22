@@ -6,3 +6,8 @@ node_modules/
 # Tests
 tests/*.ts
 programs/*/tests/
+
+# Private / local-only
+prompts/
+docs/
+Wallet/
