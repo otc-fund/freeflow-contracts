@@ -1,5 +1,8 @@
 ﻿target/
-Cargo.lock
+# Cargo.lock is intentionally committed for reproducible Solana program builds.
+# The Solana platform-tools cargo (1.79) cannot parse edition2024 Cargo.toml files,
+# so the lockfile is pinned to safe dependency versions (indexmap 2.7.0, etc.).
+# See workspace Cargo.toml [workspace.dependencies] for the version constraints.
 *.tsbuildinfo
 node_modules/
 

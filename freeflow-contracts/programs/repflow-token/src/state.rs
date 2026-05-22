@@ -83,8 +83,9 @@ pub struct RepFlowUser {
 impl RepFlowUser {
     pub const SIZE: usize = 32 + 8 + 8 + 8 + 8 + 8 + 4 + 8 + 8 + 1 + 32;
 
-    /// ~6 months (180 days) to reach Icon tier (50,001 repFlow): 50,000 ÷ 180 ≈ 277/day.
-    pub const MAX_DAILY_MINT: u64 = 277;
+    /// On-chain hard cap: 200 repFlow per user per 24-hour window.
+    /// Uptime activity contributes ≤ 50/day; bandwidth 1 repFlow/GB.
+    pub const MAX_DAILY_MINT: u64 = 200;
     pub const SECS_PER_DAY:   i64 = 86_400;
 
     /// Compute the current repFlow tier from balance.

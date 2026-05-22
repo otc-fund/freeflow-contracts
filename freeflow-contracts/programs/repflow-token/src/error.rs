@@ -17,7 +17,7 @@ pub enum RepFlowError {
     UnauthorizedBurner,
 
     /// Mint amount exceeds the per-user daily rate limit.
-    #[msg("Mint amount exceeds daily rate limit (277 repFlow per user per day)")]
+    #[msg("Mint amount exceeds daily rate limit (200 repFlow per user per day)")]
     DailyRateLimitExceeded,
 
     /// The mint authority config account does not match the program.

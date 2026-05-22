@@ -3,7 +3,7 @@
 //! Mint operations are triggered by verified on-chain events or
 //! by the governance council submitting mint transactions.
 //!
-//! Rate limit: 277 repFlow per user per 24-hour window (~180 days to Icon tier).
+//! Rate limit: 200 repFlow per user per 24-hour window (uptime ≤ 50 + bandwidth 1 repFlow/GB).
 
 use anchor_lang::prelude::*;
 use anchor_spl::token_2022::{self, MintTo, Token2022};
@@ -64,7 +64,7 @@ pub struct InitializeUser<'info> {
 /// Mint repFlow to a user's token account.
 ///
 /// Only authorised minters (governance council members) can call this.
-/// Enforces a 277 repFlow daily rate limit per user (24-hour rolling window).
+/// Enforces a 200 repFlow daily rate limit per user (24-hour rolling window).
 pub fn mint_repflow(ctx: Context<MintRepFlow>, amount: u64, activity_code: u8) -> Result<()> {
     // Extract config_info before mutable borrow
     let config_bump = ctx.accounts.config.bump;
