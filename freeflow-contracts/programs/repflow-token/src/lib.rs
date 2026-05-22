@@ -148,6 +148,20 @@ pub mod repflow_token {
 
     // ── Transfer hook (SPL Token-2022 CPI) ─────────────────────────────────
 
+    /// Initialize the extra-account-metas PDA for the transfer hook.
+    ///
+    /// **Must be called once after the repFlow mint is created.** Until this PDA
+    /// exists, the SPL Token-2022 runtime cannot locate the hook's account list and
+    /// the transfer hook is not active — leaving repFlow transferable. Calling this
+    /// instruction locks the mint as soulbound from that point forward.
+    ///
+    /// Accounts: see `InitializeExtraAccountMetaList` in `transfer_hook.rs`.
+    pub fn initialize_extra_account_meta_list(
+        ctx: Context<InitializeExtraAccountMetaList>,
+    ) -> Result<()> {
+        transfer_hook::initialize_extra_account_meta_list(ctx)
+    }
+
     /// Transfer hook entry point — ALWAYS REJECTS.
     /// Called automatically by SPL Token-2022 on every transfer attempt.
     pub fn execute(ctx: Context<TransferHookExecute>, amount: u64) -> Result<()> {

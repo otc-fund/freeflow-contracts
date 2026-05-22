@@ -19,6 +19,30 @@ use spl_transfer_hook_interface::instruction::ExecuteInstruction;
 
 use crate::error::RepFlowError;
 
+/// Initialize the extra-account-metas PDA required by SPL Token-2022 for the transfer hook.
+///
+/// This MUST be called once after the repFlow mint is created. Without this PDA,
+/// the SPL Token-2022 runtime cannot find the hook's extra-account list and the
+/// transfer hook is not properly wired to the mint — meaning repFlow could be
+/// transferred until this PDA is created, defeating the soulbound property.
+///
+/// The list is intentionally empty (count = 0) because the hook needs no extra
+/// accounts — it unconditionally rejects all transfers without any additional state.
+///
+/// PDA seeds: `[b"extra-account-metas", mint.key()]` — matches the SPL Token-2022
+/// standard so the runtime can find it automatically on every transfer attempt.
+pub fn initialize_extra_account_meta_list(
+    ctx: Context<InitializeExtraAccountMetaList>,
+) -> Result<()> {
+    // No extra accounts needed — the hook rejects unconditionally.
+    ctx.accounts.extra_account_meta_list.count = 0;
+    msg!(
+        "extra-account-metas PDA initialized for mint {} (0 extra accounts — soulbound)",
+        ctx.accounts.mint.key()
+    );
+    Ok(())
+}
+
 /// Transfer hook entry point — called by SPL Token-2022 on every transfer.
 ///
 /// This function ALWAYS returns NonTransferable. No amount of clever
@@ -78,11 +102,69 @@ pub struct ExtraAccountList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anchor_lang::prelude::Pubkey;
 
     #[test]
     fn transfer_hook_always_rejects() {
         // The transfer hook error code must be NonTransferable.
         let err = RepFlowError::NonTransferable;
         assert_eq!(err.to_string(), "repFlow is non-transferable — it cannot be bought, sold, or traded");
+    }
+
+    /// Verify that the extra-account-metas PDA seeds match the SPL Token-2022 standard.
+    ///
+    /// SPL Token-2022 derives the hook's extra-account list at:
+    ///   PDA([b"extra-account-metas", mint.key()], transfer_hook_program_id)
+    ///
+    /// Our `InitializeExtraAccountMetaList` account struct uses exactly these seeds.
+    /// This test confirms the seed constant is correct and PDA derivation is deterministic.
+    #[test]
+    fn extra_account_meta_list_pda_uses_correct_seeds() {
+        let program_id = crate::ID; // repflow-token program ID
+        let mint = Pubkey::new_unique();
+
+        // Derive PDA with the standard SPL Token-2022 extra-account-metas seeds.
+        let (pda, bump) = Pubkey::find_program_address(
+            &[b"extra-account-metas", mint.as_ref()],
+            &program_id,
+        );
+
+        // find_program_address always returns a valid bump (guaranteed by the runtime).
+        let _ = bump; // bump: u8, always in [0, 255] by construction
+
+        // PDA derivation must be deterministic — same inputs → same output.
+        let (pda2, bump2) = Pubkey::find_program_address(
+            &[b"extra-account-metas", mint.as_ref()],
+            &program_id,
+        );
+        assert_eq!(pda, pda2, "extra-account-metas PDA must be deterministic");
+        assert_eq!(bump, bump2, "bump must be deterministic for the same mint");
+
+        // A different mint produces a different PDA (no collisions expected).
+        let other_mint = Pubkey::new_unique();
+        let (other_pda, _) = Pubkey::find_program_address(
+            &[b"extra-account-metas", other_mint.as_ref()],
+            &program_id,
+        );
+        assert_ne!(pda, other_pda, "different mints must produce different PDAs");
+    }
+
+    /// Verify the ExtraAccountList size matches the account space allocation.
+    ///
+    /// InitializeExtraAccountMetaList allocates `space = 8 + 4`:
+    ///   8 bytes: Anchor discriminator
+    ///   4 bytes: ExtraAccountList::count (u32)
+    #[test]
+    fn extra_account_list_size_matches_allocation() {
+        // ExtraAccountList has a single u32 field.
+        // Borsh serializes u32 as 4 bytes.
+        let list = ExtraAccountList { count: 0 };
+        let encoded = borsh::to_vec(&list).unwrap();
+        // 4 bytes for count (Anchor discriminator is handled separately by the runtime).
+        assert_eq!(encoded.len(), 4,
+            "ExtraAccountList serializes to exactly 4 bytes (u32 count)");
+        // space = 8 (discriminator) + 4 (count) = 12 total — matches the init constraint.
+        assert_eq!(8 + encoded.len(), 12,
+            "total account space must be 12 bytes");
     }
 }

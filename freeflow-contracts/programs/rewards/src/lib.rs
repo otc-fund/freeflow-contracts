@@ -134,6 +134,36 @@ pub const SWEEP_TREASURY_MINT_SHARE_BPS: u64 = 8_000;
 /// After this period the dispute defaults in the relay's favour (challenger bond burned).
 pub const DISPUTE_RESOLVE_SECONDS: i64 = 3 * 24 * 3_600;
 
+// ─── RepFlow-Bond constants (Phase 2) ─────────────────────────────────────────
+
+/// Minimum repFlow balance a relay must hold to submit ClaimUsage.
+///
+/// Tier 1 starts at 2,001 — this ensures the relay has crossed the first
+/// meaningful tier threshold before it can claim network rewards.
+pub const MIN_RELAY_REPFLOW: u64 = 2_001;
+
+/// Staking program ID — used to verify StakeAccount PDA ownership during
+/// ClaimUsage stake-gate checks and for CPI slash in dispute resolution.
+pub const STAKING_PROGRAM_ID: solana_program::pubkey::Pubkey =
+    solana_program::pubkey!("7N1JRX3LY3goVAZCyaJyH7kpZ3kboZvh3jteDmCq6Dz4");
+
+/// repflow-token program ID — used to verify RepFlowUser PDA ownership during
+/// ClaimUsage repFlow-gate checks.
+pub const REPFLOW_PROGRAM_ID: solana_program::pubkey::Pubkey =
+    solana_program::pubkey!("8K4GhPEQ1yy9vdTaMPTL83G5qr5ZHZiBm2VBQ58jJs5w");
+
+/// Minimum dynamic challenger bond in $FLOW units. Clamp lower bound.
+pub const MIN_CHALLENGER_BOND_FLOW: u64 = 10;
+
+/// Maximum dynamic challenger bond in $FLOW units. Clamp upper bound.
+pub const MAX_CHALLENGER_BOND_FLOW: u64 = 500;
+
+/// Fallback challenger bond (used when BondConfig PDA is absent or flow_price_cents = 0).
+pub const DEFAULT_CHALLENGER_BOND_FLOW: u64 = 50;
+
+/// Fallback minimum stake in $FLOW units (used when BondConfig or price unavailable).
+pub const DEFAULT_MIN_STAKE_FLOW: u64 = 100;
+
 // ─── Dispute type (P6) ────────────────────────────────────────────────────────
 
 /// The kind of chain violation being disputed.
@@ -199,6 +229,35 @@ pub enum RewardsError {
 
     /// Client signature is all-zeros (record was never countersigned by client).
     MissingClientSignature,
+
+    // ── Treasury validation errors ────────────────────────────────────────────
+
+    /// `treasury_token` account owner is not in the authorized `TreasuryConfig` pool,
+    /// or the `TreasuryConfig` PDA was not supplied when CPI minting is required.
+    /// Treasury validation is mandatory — no backward-compatible skip path.
+    UnauthorizedTreasury,
+
+    // ── RepFlow-Bond gate errors (Phase 2) ────────────────────────────────────
+
+    /// Relay's repFlow balance is below MIN_RELAY_REPFLOW (2,001).
+    /// ClaimUsage rejected until relay accumulates sufficient reputation.
+    InsufficientRelayReputation,
+
+    /// Relay's staked $FLOW is below the minimum computed from BondConfig.
+    /// ClaimUsage rejected until relay stakes enough.
+    InsufficientStake,
+
+    /// Relay has no StakeAccount in the staking program.
+    /// The relay must stake before submitting claims.
+    StakeAccountNotFound,
+
+    /// RepFlowUser PDA was not provided and is now required.
+    /// This error is returned once backward-compat mode is disabled.
+    RepFlowAccountMissing,
+
+    /// Computed challenger bond fell outside [MIN, MAX] range.
+    /// This indicates a stale or garbage price oracle value.
+    InvalidChallengerBond,
 }
 
 /// Errors specific to the dispute window.
@@ -318,6 +377,16 @@ pub fn find_mint_authority_pda(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"mint_authority"], program_id)
 }
 
+/// Derive the `slash_authority` PDA from the rewards program ID.
+///
+/// Seeds: `[b"slash_authority"]`. The rewards program signs for this PDA via
+/// `invoke_signed` when CPI-ing into the staking program's `Slash` instruction.
+/// The staking program derives this same PDA from `REWARDS_PROGRAM_PUBKEY` and
+/// accepts it as a second authorized slasher.
+pub fn find_slash_authority_pda(program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"slash_authority"], program_id)
+}
+
 /// Verify the supplied `mint_authority_ai` matches the expected PDA and return the bump.
 fn verify_and_get_mint_authority_bump(
     mint_authority_ai: &AccountInfo,
@@ -417,6 +486,191 @@ fn cpi_burn_from_escrow<'a>(
             user_escrow_token_ai.clone(),
             relay_token_ai.clone(),
             relay_wallet_ai.clone(),
+            spender_registry_ai.clone(),
+            token_mint_ai.clone(),
+            token_program_ai.clone(),
+        ],
+        &[&[b"mint_authority", &[mint_authority_bump]]],
+    )
+}
+
+/// CPI to user-escrow `hold_client_funds`.
+///
+/// Locks `amount` $FLOW in a `FundHold` PDA for the 7-day dispute window.
+/// The `mint_authority` PDA (seeds `["mint_authority"]`) is the service_authority
+/// that must be registered in the user-escrow spender registry.
+///
+/// Accounts:
+///   service_authority — mint_authority PDA (signer via invoke_signed)
+///   payer             — relay wallet (pays FundHold PDA rent)
+///   user              — user wallet (PDA seed only)
+///   user_escrow       — UserEscrow PDA (writable)
+///   fund_hold         — FundHold PDA (init, writable)
+///   spender_registry  — AuthorizedSpenderRegistry PDA
+///   system_program    — 11111…
+#[allow(clippy::too_many_arguments)]
+fn cpi_hold_client_funds<'a>(
+    user_escrow_program_ai: &AccountInfo<'a>,
+    mint_authority_ai:      &AccountInfo<'a>,  // service_authority (PDA signer)
+    payer_ai:               &AccountInfo<'a>,  // pays FundHold rent (relay wallet)
+    user_ai:                &AccountInfo<'a>,
+    user_escrow_state_ai:   &AccountInfo<'a>,  // UserEscrow PDA (writable)
+    fund_hold_ai:           &AccountInfo<'a>,  // FundHold PDA (init, writable)
+    spender_registry_ai:    &AccountInfo<'a>,
+    system_program_ai:      &AccountInfo<'a>,
+    amount:                 u64,
+    claim_hash:             [u8; 32],
+    session_id:             [u8; 16],
+    mint_authority_bump:    u8,
+) -> ProgramResult {
+    if amount == 0 {
+        return Ok(());
+    }
+
+    // Build Anchor instruction data: [discriminator:8][amount:8 LE][claim_hash:32][session_id:16]
+    let mut data = Vec::with_capacity(8 + 8 + 32 + 16);
+    data.extend_from_slice(&anchor_ix_discriminator(b"hold_client_funds"));
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&claim_hash);
+    data.extend_from_slice(&session_id);
+
+    let ix = Instruction {
+        program_id: *user_escrow_program_ai.key,
+        accounts: vec![
+            AccountMeta { pubkey: *mint_authority_ai.key,    is_signer: true,  is_writable: false },
+            AccountMeta { pubkey: *payer_ai.key,             is_signer: true,  is_writable: true  },
+            AccountMeta { pubkey: *user_ai.key,              is_signer: false, is_writable: false },
+            AccountMeta { pubkey: *user_escrow_state_ai.key, is_signer: false, is_writable: true  },
+            AccountMeta { pubkey: *fund_hold_ai.key,         is_signer: false, is_writable: true  },
+            AccountMeta { pubkey: *spender_registry_ai.key,  is_signer: false, is_writable: false },
+            AccountMeta { pubkey: *system_program_ai.key,    is_signer: false, is_writable: false },
+        ],
+        data,
+    };
+
+    invoke_signed(
+        &ix,
+        &[
+            mint_authority_ai.clone(),
+            payer_ai.clone(),
+            user_ai.clone(),
+            user_escrow_state_ai.clone(),
+            fund_hold_ai.clone(),
+            spender_registry_ai.clone(),
+            system_program_ai.clone(),
+        ],
+        &[&[b"mint_authority", &[mint_authority_bump]]],
+    )
+}
+
+/// CPI to user-escrow `release_funds`.
+///
+/// Decrements `UserEscrow.held` and marks the `FundHold` PDA as Released.
+/// Called when the relay is slashed (client wins dispute) — tokens remain in escrow.
+///
+/// Accounts:
+///   service_authority — mint_authority PDA (signer)
+///   user              — user wallet (PDA seed only)
+///   user_escrow       — UserEscrow PDA (writable)
+///   fund_hold         — FundHold PDA (writable, must be Active)
+///   spender_registry  — AuthorizedSpenderRegistry PDA
+fn cpi_release_funds<'a>(
+    user_escrow_program_ai: &AccountInfo<'a>,
+    mint_authority_ai:      &AccountInfo<'a>,
+    user_ai:                &AccountInfo<'a>,
+    user_escrow_state_ai:   &AccountInfo<'a>,
+    fund_hold_ai:           &AccountInfo<'a>,
+    spender_registry_ai:    &AccountInfo<'a>,
+    claim_hash:             [u8; 32],
+    mint_authority_bump:    u8,
+) -> ProgramResult {
+    // Build Anchor instruction data: [discriminator:8][claim_hash:32]
+    let mut data = Vec::with_capacity(8 + 32);
+    data.extend_from_slice(&anchor_ix_discriminator(b"release_funds"));
+    data.extend_from_slice(&claim_hash);
+
+    let ix = Instruction {
+        program_id: *user_escrow_program_ai.key,
+        accounts: vec![
+            AccountMeta { pubkey: *mint_authority_ai.key,    is_signer: true,  is_writable: false },
+            AccountMeta { pubkey: *user_ai.key,              is_signer: false, is_writable: false },
+            AccountMeta { pubkey: *user_escrow_state_ai.key, is_signer: false, is_writable: true  },
+            AccountMeta { pubkey: *fund_hold_ai.key,         is_signer: false, is_writable: true  },
+            AccountMeta { pubkey: *spender_registry_ai.key,  is_signer: false, is_writable: false },
+        ],
+        data,
+    };
+
+    invoke_signed(
+        &ix,
+        &[
+            mint_authority_ai.clone(),
+            user_ai.clone(),
+            user_escrow_state_ai.clone(),
+            fund_hold_ai.clone(),
+            spender_registry_ai.clone(),
+        ],
+        &[&[b"mint_authority", &[mint_authority_bump]]],
+    )
+}
+
+/// CPI to user-escrow `burn_held_funds`.
+///
+/// Decrements both `UserEscrow.held` and `UserEscrow.balance`, SPL-burns `amount`
+/// from the escrow token account, and marks the `FundHold` PDA as Burned.
+/// Called after the 7-day dispute window expires (relay wins or challenger wins).
+///
+/// Accounts:
+///   service_authority  — mint_authority PDA (signer)
+///   user               — user wallet (PDA seed only)
+///   user_escrow        — UserEscrow PDA (writable)
+///   user_escrow_token  — escrow SPL token account (writable, burned from)
+///   fund_hold          — FundHold PDA (writable, must be Active)
+///   spender_registry   — AuthorizedSpenderRegistry PDA
+///   token_mint         — $FLOW mint (writable — burn reduces supply)
+///   token_program      — SPL Token program
+#[allow(clippy::too_many_arguments)]
+fn cpi_burn_held_funds<'a>(
+    user_escrow_program_ai: &AccountInfo<'a>,
+    mint_authority_ai:      &AccountInfo<'a>,
+    user_ai:                &AccountInfo<'a>,
+    user_escrow_state_ai:   &AccountInfo<'a>,
+    user_escrow_token_ai:   &AccountInfo<'a>,
+    fund_hold_ai:           &AccountInfo<'a>,
+    spender_registry_ai:    &AccountInfo<'a>,
+    token_mint_ai:          &AccountInfo<'a>,
+    token_program_ai:       &AccountInfo<'a>,
+    claim_hash:             [u8; 32],
+    mint_authority_bump:    u8,
+) -> ProgramResult {
+    // Build Anchor instruction data: [discriminator:8][claim_hash:32]
+    let mut data = Vec::with_capacity(8 + 32);
+    data.extend_from_slice(&anchor_ix_discriminator(b"burn_held_funds"));
+    data.extend_from_slice(&claim_hash);
+
+    let ix = Instruction {
+        program_id: *user_escrow_program_ai.key,
+        accounts: vec![
+            AccountMeta { pubkey: *mint_authority_ai.key,    is_signer: true,  is_writable: false },
+            AccountMeta { pubkey: *user_ai.key,              is_signer: false, is_writable: false },
+            AccountMeta { pubkey: *user_escrow_state_ai.key, is_signer: false, is_writable: true  },
+            AccountMeta { pubkey: *user_escrow_token_ai.key, is_signer: false, is_writable: true  },
+            AccountMeta { pubkey: *fund_hold_ai.key,         is_signer: false, is_writable: true  },
+            AccountMeta { pubkey: *spender_registry_ai.key,  is_signer: false, is_writable: false },
+            AccountMeta { pubkey: *token_mint_ai.key,        is_signer: false, is_writable: true  },
+            AccountMeta { pubkey: *token_program_ai.key,     is_signer: false, is_writable: false },
+        ],
+        data,
+    };
+
+    invoke_signed(
+        &ix,
+        &[
+            mint_authority_ai.clone(),
+            user_ai.clone(),
+            user_escrow_state_ai.clone(),
+            user_escrow_token_ai.clone(),
+            fund_hold_ai.clone(),
             spender_registry_ai.clone(),
             token_mint_ai.clone(),
             token_program_ai.clone(),
@@ -561,6 +815,28 @@ pub fn process_instruction(
             process_update_reward_rates(
                 program_id, accounts,
                 routing_per_mb, seeding_per_mb, uptime_per_hour, flow_price_cents,
+            )
+        }
+        RewardsInstruction::InitializeTreasuryConfig { initial_treasury_keys } => {
+            process_initialize_treasury_config_ix(program_id, accounts, initial_treasury_keys)
+        }
+        RewardsInstruction::UpdateTreasuryPool { add_treasury_keys, remove_treasury_keys } => {
+            process_update_treasury_pool_ix(program_id, accounts, add_treasury_keys, remove_treasury_keys)
+        }
+        RewardsInstruction::InitializeBondConfig {
+            challenger_bond_cents, min_stake_usd_cents, stake_earnings_bps, max_stake_flow,
+        } => {
+            process_initialize_bond_config_ix(
+                program_id, accounts,
+                challenger_bond_cents, min_stake_usd_cents, stake_earnings_bps, max_stake_flow,
+            )
+        }
+        RewardsInstruction::UpdateBondConfig {
+            challenger_bond_cents, min_stake_usd_cents, stake_earnings_bps, max_stake_flow,
+        } => {
+            process_update_bond_config_ix(
+                program_id, accounts,
+                challenger_bond_cents, min_stake_usd_cents, stake_earnings_bps, max_stake_flow,
             )
         }
     }
@@ -838,6 +1114,74 @@ pub enum RewardsInstruction {
         uptime_per_hour: u64,
         /// New $FLOW price in US micro-cents (0 = keep current).
         flow_price_cents: u64,
+    },
+
+    /// Initialize the `TreasuryConfig` PDA.
+    ///
+    /// One-time setup — fails with `AccountAlreadyInitialized` if the PDA already exists.
+    /// Only the Foundation authority may call this.
+    ///
+    /// Accounts:
+    ///   0: foundation       (signer — must equal FOUNDATION_PUBKEY, writable — pays rent)
+    ///   1: treasury_config  (TreasuryConfig PDA [b"treasury_config"], writable — pre-created)
+    ///   2: system_program   (readonly)
+    InitializeTreasuryConfig {
+        /// Initial authorized treasury wallet pubkeys. At least 1 required, max 5.
+        initial_treasury_keys: Vec<[u8; 32]>,
+    },
+
+    /// Update the authorized treasury wallet pool in `TreasuryConfig`.
+    ///
+    /// Only the Foundation authority may call this.
+    /// Increments `change_count`. Must leave at least 1 key in the pool.
+    ///
+    /// Accounts:
+    ///   0: foundation       (signer — must equal FOUNDATION_PUBKEY)
+    ///   1: treasury_config  (TreasuryConfig PDA [b"treasury_config"], writable)
+    UpdateTreasuryPool {
+        /// Keys to add to the pool (deduplicated; ignored if already present).
+        add_treasury_keys:    Vec<[u8; 32]>,
+        /// Keys to remove from the pool. Fails if this would leave 0 keys.
+        remove_treasury_keys: Vec<[u8; 32]>,
+    },
+
+    // ── RepFlow-Bond config instructions (Phase 2) ────────────────────────────
+
+    /// Initialize the `BondConfig` PDA with dynamic bond/stake parameters.
+    ///
+    /// One-time setup. Only the Foundation authority may call this.
+    ///
+    /// Accounts:
+    ///   0: foundation    (signer, writable — pays rent)
+    ///   1: bond_config   (BondConfig PDA [b"bond_config"], writable — pre-created)
+    ///   2: system_program
+    InitializeBondConfig {
+        /// Target USD value of challenger bond in micro-cents ($1.25 = 125_000).
+        challenger_bond_cents: u64,
+        /// Target USD value of minimum relay stake in micro-cents ($2,500 = 250_000_000).
+        min_stake_usd_cents:   u64,
+        /// Additional stake per $FLOW earned, in basis points (10% = 1_000).
+        stake_earnings_bps:    u64,
+        /// Absolute ceiling for required stake in $FLOW units (100_000).
+        max_stake_flow:        u64,
+    },
+
+    /// Update the `BondConfig` PDA parameters.
+    ///
+    /// Only the Foundation authority may call this.
+    ///
+    /// Accounts:
+    ///   0: foundation    (signer — must equal FOUNDATION_PUBKEY)
+    ///   1: bond_config   (BondConfig PDA [b"bond_config"], writable)
+    UpdateBondConfig {
+        /// New challenger bond target in micro-cents (0 = keep current).
+        challenger_bond_cents: u64,
+        /// New minimum stake target in micro-cents (0 = keep current).
+        min_stake_usd_cents:   u64,
+        /// New stake earnings rate in basis points (0 = keep current).
+        stake_earnings_bps:    u64,
+        /// New maximum stake ceiling in $FLOW (0 = keep current).
+        max_stake_flow:        u64,
     },
 }
 
@@ -1200,6 +1544,36 @@ impl RewardRatesAccount {
     pub const DEFAULT_UPTIME_PER_HOUR: u64 = 10_000_000;
 }
 
+// ─── TreasuryConfig ───────────────────────────────────────────────────────────
+
+/// On-chain treasury configuration.
+///
+/// PDA seeds: `[b"treasury_config"]` on the rewards program.
+///
+/// Initialized once at deployment by the Foundation multisig via
+/// `InitializeTreasuryConfig`. Updated via `UpdateTreasuryPool`.
+///
+/// Treasury validation is **mandatory** in every 70/30 mint path.
+/// Transactions that supply a `treasury_token` account whose SPL owner is not
+/// in `treasury_keys` are rejected with `RewardsError::UnauthorizedTreasury`.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct TreasuryConfig {
+    /// Authority that may update the pool (must equal `FOUNDATION_PUBKEY`).
+    pub authority:     [u8; 32],
+    /// Authorized treasury wallet pubkeys. At least one must be present.
+    /// Up to 5 keys supported in the fixed-size allocation.
+    pub treasury_keys: Vec<[u8; 32]>,
+    /// Monotonically increasing counter of pool updates.
+    pub change_count:  u64,
+}
+
+impl TreasuryConfig {
+    /// Allocated size: authority(32) + vec_header(4) + 5×key(160) + change_count(8) = 204 bytes.
+    pub const SIZE: usize = 32 + 4 + (32 * 5) + 8;
+    /// Maximum number of authorized treasury keys.
+    pub const MAX_KEYS: usize = 5;
+}
+
 /// Foundation two-phase recovery intent for reservation reconciliation.
 ///
 /// PDA seeds: `["reconcile_intent", user_pubkey]`
@@ -1222,6 +1596,88 @@ impl ReconcileIntent {
     pub const SIZE: usize = 32 + 8 + 8 + 1; // = 49 bytes
     /// 72-hour timelock in seconds.
     pub const TIMELOCK_SECONDS: i64 = 72 * 3_600;
+}
+
+// ─── BondConfig (Phase 2) ─────────────────────────────────────────────────────
+
+/// Foundation-governed dynamic bond and stake configuration.
+///
+/// PDA seeds: `[b"bond_config"]` on the rewards program.
+///
+/// Initialized once by the Foundation via `InitializeBondConfig`.
+/// Updated via `UpdateBondConfig`. Absent until initialized — callers fall back
+/// to `DEFAULT_CHALLENGER_BOND_FLOW` and `DEFAULT_MIN_STAKE_FLOW` when missing.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct BondConfig {
+    /// Foundation authority that may update this config.
+    pub authority:             [u8; 32],
+    /// Target USD value of the challenger bond in micro-cents (1 = $0.000001).
+    /// At deployment: 125_000 = $1.25.
+    pub challenger_bond_cents: u64,
+    /// Target USD value of the minimum relay stake in micro-cents.
+    /// At deployment: 250_000_000 = $2,500.
+    pub min_stake_usd_cents:   u64,
+    /// Additional stake required per $FLOW earned, in basis points.
+    /// 1_000 bps = 10% of total_lamports_claimed.
+    pub stake_earnings_bps:    u64,
+    /// Absolute ceiling for required stake, in $FLOW units.
+    pub max_stake_flow:        u64,
+    /// PDA bump seed.
+    pub bump:                  u8,
+}
+
+impl BondConfig {
+    /// Byte size: 32 + 8 + 8 + 8 + 8 + 1 = 65 bytes.
+    pub const SIZE: usize = 32 + 8 + 8 + 8 + 8 + 1;
+
+    /// Default challenger_bond_cents: $1.25 (125,000 micro-cents).
+    pub const DEFAULT_CHALLENGER_BOND_CENTS: u64 = 125_000;
+    /// Default min_stake_usd_cents: $2,500 (250,000,000 micro-cents).
+    pub const DEFAULT_MIN_STAKE_USD_CENTS:   u64 = 250_000_000;
+    /// Default stake_earnings_bps: 10% (1,000 bps).
+    pub const DEFAULT_STAKE_EARNINGS_BPS:    u64 = 1_000;
+    /// Default max_stake_flow: 100,000 $FLOW ceiling.
+    pub const DEFAULT_MAX_STAKE_FLOW:        u64 = 100_000;
+
+    /// Compute the required challenger bond in $FLOW given the current price.
+    ///
+    /// Formula: `challenger_bond_cents * 1_000_000 / flow_price_cents`
+    ///
+    /// Returns `DEFAULT_CHALLENGER_BOND_FLOW` when `flow_price_cents` is zero
+    /// (price oracle not set) or when the result falls outside the clamped range.
+    pub fn compute_challenger_bond(&self, flow_price_cents: u64) -> u64 {
+        if flow_price_cents == 0 {
+            return DEFAULT_CHALLENGER_BOND_FLOW;
+        }
+        let bond = self.challenger_bond_cents
+            .saturating_mul(1_000_000)
+            .checked_div(flow_price_cents)
+            .unwrap_or(DEFAULT_CHALLENGER_BOND_FLOW);
+        bond.max(MIN_CHALLENGER_BOND_FLOW).min(MAX_CHALLENGER_BOND_FLOW)
+    }
+
+    /// Compute the minimum required stake in $FLOW given price and relay earnings.
+    ///
+    /// Formula:
+    ///   base  = min_stake_usd_cents * 1_000_000 / flow_price_cents
+    ///   extra = total_lamports_claimed * stake_earnings_bps / 10_000
+    ///   min   = min(base + extra, max_stake_flow)
+    ///
+    /// Returns `DEFAULT_MIN_STAKE_FLOW` when price is zero.
+    pub fn compute_min_stake(&self, flow_price_cents: u64, total_lamports_claimed: u64) -> u64 {
+        if flow_price_cents == 0 {
+            return DEFAULT_MIN_STAKE_FLOW;
+        }
+        let base = self.min_stake_usd_cents
+            .saturating_mul(1_000_000)
+            .checked_div(flow_price_cents)
+            .unwrap_or(DEFAULT_MIN_STAKE_FLOW);
+        let extra = total_lamports_claimed
+            .saturating_mul(self.stake_earnings_bps)
+            .checked_div(10_000)
+            .unwrap_or(0);
+        (base.saturating_add(extra)).min(self.max_stake_flow)
+    }
 }
 
 // ── Validation logic (extracted for testability) ─────────────────────────────
@@ -1663,6 +2119,8 @@ pub fn dispute_claim(
     challenger:      [u8; 32],
     clock_ts:        i64,
     escrow_pda:      [u8; 32],
+    // Dynamic challenger bond in $FLOW. Pass `DEFAULT_CHALLENGER_BOND_FLOW` as fallback.
+    challenger_bond: u64,
 ) -> Result<(), DisputeError> {
     let claim = store
         .claims
@@ -1699,7 +2157,7 @@ pub fn dispute_claim(
         claim_hash,
         record_index,
         disputed_record,
-        bond:         CHALLENGER_BOND_FLOW,
+        bond:         challenger_bond,
         submitted_at: clock_ts,
         nonce,
         escrow_pda,
@@ -1731,10 +2189,18 @@ pub fn resolve_dispute_relay_slashed(
         return Err(DisputeError::NotDisputed);
     }
 
-    let relay_bond               = claim.bond;
-    let challenger_reward        = relay_bond / 2;
-    let burned                   = relay_bond.saturating_sub(challenger_reward);
-    let challenger_bond_returned = CHALLENGER_BOND_FLOW;
+    let relay_bond = claim.bond;
+    let challenger_reward = relay_bond / 2;
+    let burned = relay_bond.saturating_sub(challenger_reward);
+
+    // Return the challenger's bond in full (Option C: challenger gets bond back, no bonus).
+    // Find the dispute record to get the stored challenger bond.
+    let challenger_bond_returned = store
+        .disputes
+        .iter()
+        .find(|d| d.claim_hash == claim_hash)
+        .map(|d| d.bond)
+        .unwrap_or(DEFAULT_CHALLENGER_BOND_FLOW);
 
     claim.status = ClaimStatus::Slashed;
 
@@ -1764,11 +2230,19 @@ pub fn resolve_dispute_challenger_slashed(
         return Err(DisputeError::NotDisputed);
     }
 
+    // Read the actual challenger bond from the dispute record (Phase 5 dynamic bond).
+    let challenger_bond = store
+        .disputes
+        .iter()
+        .find(|d| d.claim_hash == claim_hash)
+        .map(|d| d.bond)
+        .unwrap_or(DEFAULT_CHALLENGER_BOND_FLOW);
+
     claim.status = ClaimStatus::Resolved;
 
     // 80% of challenger bond → relay as capital-lock compensation; 20% burned.
-    let relay_reward = CHALLENGER_BOND_FLOW * TREASURY_SHARE_BPS / 10_000;
-    let burned       = CHALLENGER_BOND_FLOW.saturating_sub(relay_reward);
+    let relay_reward = challenger_bond * TREASURY_SHARE_BPS / 10_000;
+    let burned       = challenger_bond.saturating_sub(relay_reward);
 
     Ok(DisputeOutcome::ChallengerSlashed { relay_reward, burned })
 }
@@ -1787,13 +2261,16 @@ pub fn force_resolve_dispute(
     claim_hash: [u8; 32],
     clock_ts:   i64,
 ) -> Result<DisputeOutcome, DisputeError> {
-    // Find the dispute record to get the filed timestamp.
-    let dispute_submitted_at = store
+    // Find the dispute record to get the filed timestamp and dynamic bond.
+    let dispute = store
         .disputes
         .iter()
         .find(|d| d.claim_hash == claim_hash)
-        .ok_or(DisputeError::DisputeNotFound)?
-        .submitted_at;
+        .ok_or(DisputeError::DisputeNotFound)?;
+
+    let dispute_submitted_at = dispute.submitted_at;
+    // Read the actual challenger bond stored at dispute-filing time (Phase 5).
+    let challenger_bond = dispute.bond;
 
     // Enforce the 3-day inactivity timeout.
     let resolve_deadline = dispute_submitted_at.saturating_add(DISPUTE_RESOLVE_SECONDS);
@@ -1815,8 +2292,8 @@ pub fn force_resolve_dispute(
     // 80% of challenger bond → relay; 20% burned (same split as active resolution).
     claim.status = ClaimStatus::Resolved;
 
-    let relay_reward = CHALLENGER_BOND_FLOW * TREASURY_SHARE_BPS / 10_000;
-    let burned       = CHALLENGER_BOND_FLOW.saturating_sub(relay_reward);
+    let relay_reward = challenger_bond * TREASURY_SHARE_BPS / 10_000;
+    let burned       = challenger_bond.saturating_sub(relay_reward);
 
     Ok(DisputeOutcome::ChallengerSlashed { relay_reward, burned })
 }
@@ -2252,6 +2729,20 @@ fn process_record_bytes(
 ///   5: reservation       — UserEscrowReservation PDA for the user (writable, optional)
 ///   6: user_escrow       — UserEscrow PDA from user-escrow program (readable, optional)
 ///
+///   --- Hold-CPI accounts (all 6 must be present together) ---
+///   7: user_escrow_program — user-escrow program (for CPI)
+///   8: mint_authority      — rewards mint_authority PDA (PDA signer)
+///   9: hold_user           — user wallet (non-signer; PDA seed in user-escrow)
+///  10: fund_hold           — FundHold PDA (init, writable)
+///  11: hold_spender_reg    — AuthorizedSpenderRegistry PDA
+///  12: hold_system_program — System Program (for FundHold rent)
+///
+///   --- RepFlow-Bond gate accounts (Phase 2, optional for backward compat) ---
+///  13: relay_repflow_user  — RepFlowUser PDA from repflow-token program (readable, optional)
+///  14: relay_stake_account — StakeAccount PDA from staking program (readable, optional)
+///  15: bond_config         — BondConfig PDA [b"bond_config"] (readable, optional)
+///  16: reward_rates        — RewardRatesAccount PDA [b"reward_rates"] (readable, optional)
+///
 /// All records in a batch must be for the SAME client. To claim for multiple
 /// clients, submit multiple transactions.
 fn process_claim_usage(
@@ -2261,12 +2752,36 @@ fn process_claim_usage(
 ) -> ProgramResult {
     let accounts_iter     = &mut accounts.iter();
     let relay_wallet      = next_account_info(accounts_iter)?;
-    let _reward_account   = next_account_info(accounts_iter)?;
+    let reward_account_ai = next_account_info(accounts_iter)?;
     let claim_state_ai    = next_account_info(accounts_iter)?;
     let pending_claims_ai = accounts_iter.next();
     let rewards_config_ai = accounts_iter.next();
     let reservation_ai    = accounts_iter.next();
     let user_escrow_ai    = accounts_iter.next();
+
+    // Optional hold-CPI accounts (all 6 must be present to activate the hold path).
+    //  7: user_escrow_program — user-escrow program (for CPI)
+    //  8: mint_authority      — rewards mint_authority PDA ["mint_authority"] (PDA signer)
+    //  9: hold_user           — user wallet (non-signer; PDA seed in user-escrow)
+    // 10: fund_hold           — FundHold PDA (init, writable)
+    // 11: hold_spender_reg    — AuthorizedSpenderRegistry PDA
+    // 12: hold_system_program — System Program (for FundHold rent)
+    let hold_user_escrow_prog_ai = accounts_iter.next();
+    let hold_mint_authority_ai   = accounts_iter.next();
+    let hold_user_ai             = accounts_iter.next();
+    let fund_hold_ai             = accounts_iter.next();
+    let hold_spender_registry_ai = accounts_iter.next();
+    let hold_system_program_ai   = accounts_iter.next();
+
+    // Optional RepFlow-Bond gate accounts (Phase 2, backward compatible).
+    // 13: relay_repflow_user  — RepFlowUser PDA from repflow-token program
+    // 14: relay_stake_account — StakeAccount PDA from staking program
+    // 15: bond_config         — BondConfig PDA [b"bond_config"]
+    // 16: reward_rates        — RewardRatesAccount PDA [b"reward_rates"]
+    let repflow_user_ai   = accounts_iter.next();
+    let stake_account_ai  = accounts_iter.next();
+    let bond_config_ai    = accounts_iter.next();
+    let reward_rates_ai   = accounts_iter.next();
 
     if !relay_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -2288,6 +2803,157 @@ fn process_claim_usage(
                 return Err(DisputeError::MigrationWindowActive.into());
             }
         }
+    }
+
+    let relay_pubkey_bytes = relay_wallet.key.to_bytes();
+
+    // ── Phase 2: repFlow gate (backward compatible) ───────────────────────────
+    // If relay_repflow_user account (index 13) is provided, verify that the relay
+    // holds at least MIN_RELAY_REPFLOW (2,001) units.
+    // If the account is absent, we skip the check (backward-compat mode).
+    if let Some(rfu_ai) = repflow_user_ai {
+        if rfu_ai.lamports() > 0 && rfu_ai.data_len() >= 48 {
+            // Verify PDA: [b"repflow_user", relay_pubkey] from REPFLOW_PROGRAM_ID.
+            let (expected_repflow_pda, _) = Pubkey::find_program_address(
+                &[b"repflow_user", &relay_pubkey_bytes],
+                &REPFLOW_PROGRAM_ID,
+            );
+            if *rfu_ai.key != expected_repflow_pda {
+                msg!(
+                    "ClaimUsage: repflow_user PDA mismatch — expected {}, got {}",
+                    expected_repflow_pda, rfu_ai.key,
+                );
+                return Err(ProgramError::InvalidAccountData);
+            }
+            if *rfu_ai.owner != REPFLOW_PROGRAM_ID {
+                msg!("ClaimUsage: repflow_user wrong owner — {}", rfu_ai.owner);
+                return Err(ProgramError::InvalidAccountOwner);
+            }
+            // RepFlowUser layout (Anchor): 8-byte discriminator + 32-byte wallet + 8-byte balance.
+            let data = rfu_ai.try_borrow_data()?;
+            let balance = u64::from_le_bytes(data[40..48].try_into().unwrap_or([0u8; 8]));
+            msg!("ClaimUsage: repFlow balance={}", balance);
+            if balance < MIN_RELAY_REPFLOW {
+                msg!(
+                    "ClaimUsage: InsufficientRelayReputation — balance {} < minimum {}",
+                    balance, MIN_RELAY_REPFLOW,
+                );
+                return Err(RewardsError::InsufficientRelayReputation.into());
+            }
+        } else {
+            msg!("ClaimUsage: repflow_user account empty/too small — backward-compat skip");
+        }
+    } else {
+        msg!("ClaimUsage: no repflow_user account provided — backward-compat mode");
+    }
+
+    // ── Phase 2: stake gate (backward compatible) ─────────────────────────────
+    // If relay_stake_account (index 14) is provided, verify the relay has staked
+    // at least the computed minimum.
+    // If absent, skip (backward-compat mode).
+    if let Some(sa_ai) = stake_account_ai {
+        if sa_ai.lamports() > 0 && sa_ai.data_len() > 0 {
+            // Verify owner == staking program.
+            if *sa_ai.owner != STAKING_PROGRAM_ID {
+                msg!("ClaimUsage: stake_account wrong owner — {}", sa_ai.owner);
+                return Err(RewardsError::StakeAccountNotFound.into());
+            }
+            // Verify PDA derivation: [b"stake", relay_pubkey] from staking program.
+            let (expected_stake_pda, _) = Pubkey::find_program_address(
+                &[b"stake", &relay_pubkey_bytes],
+                &STAKING_PROGRAM_ID,
+            );
+            if *sa_ai.key != expected_stake_pda {
+                msg!(
+                    "ClaimUsage: stake_account PDA mismatch — expected {}, got {}",
+                    expected_stake_pda, sa_ai.key,
+                );
+                return Err(ProgramError::InvalidAccountData);
+            }
+            // StakeAccount layout (Borsh): relay_wallet[32] + staked_lamports[8] +
+            //   slashed_lamports[8] + last_stake_ts[8] + unstake_ts[8] + status[1] +
+            //   tier[1] + bump[1].
+            // staked_lamports at offset 32.
+            // status at offset 32+8+8+8+8 = 64.
+            let data           = sa_ai.try_borrow_data()?;
+            if data.len() < 65 {
+                msg!("ClaimUsage: stake_account data too short ({})", data.len());
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let staked_lamports = u64::from_le_bytes(data[32..40].try_into().unwrap_or([0u8; 8]));
+            let status          = data[64];
+
+            if status != 0 {
+                msg!(
+                    "ClaimUsage: relay not in Locked state — status={}",
+                    status
+                );
+                return Err(RewardsError::InsufficientStake.into());
+            }
+
+            // Read total_lamports_claimed from reward_account for earnings-based stake scaling.
+            let total_claimed = if reward_account_ai.data_len() >= RewardAccount::SIZE
+                && reward_account_ai.lamports() > 0
+            {
+                let ra_data = reward_account_ai.try_borrow_data()?;
+                if let Ok(ra) = RewardAccount::try_from_slice(&ra_data) {
+                    ra.total_lamports_claimed
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+            // Read price from RewardRatesAccount if provided.
+            let flow_price_cents = if let Some(rr_ai) = reward_rates_ai {
+                if rr_ai.lamports() > 0 && rr_ai.data_len() >= RewardRatesAccount::SIZE {
+                    let rr_data = rr_ai.try_borrow_data()?;
+                    if let Ok(rr) = RewardRatesAccount::try_from_slice(&rr_data) {
+                        rr.flow_price_cents
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+            // Read BondConfig if provided, else use defaults.
+            let min_stake = if let Some(bc_ai) = bond_config_ai {
+                if bc_ai.lamports() > 0 && bc_ai.data_len() >= BondConfig::SIZE {
+                    let bc_data = bc_ai.try_borrow_data()?;
+                    if let Ok(bc) = BondConfig::try_from_slice(&bc_data) {
+                        bc.compute_min_stake(flow_price_cents, total_claimed)
+                    } else {
+                        DEFAULT_MIN_STAKE_FLOW
+                    }
+                } else {
+                    DEFAULT_MIN_STAKE_FLOW
+                }
+            } else {
+                DEFAULT_MIN_STAKE_FLOW
+            };
+
+            msg!(
+                "ClaimUsage: staked={} min_required={} (price_cents={} claimed={})",
+                staked_lamports, min_stake, flow_price_cents, total_claimed,
+            );
+
+            if staked_lamports < min_stake {
+                msg!(
+                    "ClaimUsage: InsufficientStake — staked {} < minimum {}",
+                    staked_lamports, min_stake,
+                );
+                return Err(RewardsError::InsufficientStake.into());
+            }
+        } else {
+            msg!("ClaimUsage: stake_account empty — backward-compat skip");
+        }
+    } else {
+        msg!("ClaimUsage: no stake_account provided — backward-compat mode");
     }
 
     // Validate batch ordering (ascending seq) before processing.
@@ -2312,7 +2978,6 @@ fn process_claim_usage(
         }
     };
 
-    let relay_pubkey_bytes = relay_wallet.key.to_bytes();
     let user_pubkey_bytes  = records[0].user;
 
     // H-03: Validate that claim_state_ai is the canonical PDA for (user, relay).
@@ -2415,6 +3080,39 @@ fn process_claim_usage(
             &user_pubkey_bytes,
         );
 
+        // ── Hold CPI: lock total_amount in FundHold PDA ───────────────────────
+        // Activated when all 6 hold accounts (7–12) are present.  relay_wallet
+        // is the payer for FundHold rent.  user_escrow_ai (account 6) doubles as
+        // the UserEscrow state for hold_client_funds (writable).
+        if let (
+            Some(uep_ai), Some(ma_ai), Some(hu_ai), Some(fh_ai), Some(sr_ai), Some(sp_ai),
+        ) = (
+            hold_user_escrow_prog_ai, hold_mint_authority_ai, hold_user_ai,
+            fund_hold_ai, hold_spender_registry_ai, hold_system_program_ai,
+        ) {
+            let ue_state_ai = user_escrow_ai.ok_or(ProgramError::NotEnoughAccountKeys)?;
+            let bump = verify_and_get_mint_authority_bump(ma_ai, program_id)?;
+            cpi_hold_client_funds(
+                uep_ai,
+                ma_ai,
+                relay_wallet,  // payer (relay pays FundHold rent)
+                hu_ai,
+                ue_state_ai,
+                fh_ai,
+                sr_ai,
+                sp_ai,
+                total_amount,
+                hash,
+                session_id,
+                bump,
+            )?;
+            msg!(
+                "ClaimUsage: held {} $FLOW in FundHold (claim {:08x})",
+                total_amount,
+                u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]),
+            );
+        }
+
         let serialized = borsh::to_vec(&store).map_err(|_| ProgramError::InvalidAccountData)?;
         if serialized.len() <= pc_ai.data_len() {
             let mut data = pc_ai.try_borrow_mut_data()?;
@@ -2443,16 +3141,28 @@ fn process_claim_usage(
 /// Process a DisputeClaim instruction.
 ///
 /// Challenger disputes a specific record in a pending claim within the 7-day window.
+/// Process DisputeClaim instruction.
+///
+/// Account layout:
+///   0: challenger        — signer
+///   1: pending_claims    — PendingClaimsStore PDA (writable)
+///   --- Optional Phase 5 dynamic bond accounts ---
+///   2: bond_config       — BondConfig PDA [b"bond_config"] (readable, optional)
+///   3: reward_rates      — RewardRatesAccount PDA [b"reward_rates"] (readable, optional)
 fn process_dispute_claim(
-    _program_id:     &Pubkey,
+    program_id:      &Pubkey,
     accounts:        &[AccountInfo],
     claim_hash:      [u8; 32],
     record_index:    u32,
     disputed_record: UsageRecordOnChain,
 ) -> ProgramResult {
-    let accounts_iter    = &mut accounts.iter();
-    let challenger       = next_account_info(accounts_iter)?;
+    let accounts_iter     = &mut accounts.iter();
+    let challenger        = next_account_info(accounts_iter)?;
     let pending_claims_ai = next_account_info(accounts_iter)?;
+
+    // Optional Phase 5 accounts for dynamic bond computation.
+    let dispute_bond_config_ai  = accounts_iter.next();
+    let dispute_reward_rates_ai = accounts_iter.next();
 
     if !challenger.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -2468,6 +3178,60 @@ fn process_dispute_claim(
     }
 
     let clock = Clock::get()?;
+
+    // ── Phase 5: compute dynamic challenger bond ──────────────────────────────
+    // If BondConfig and RewardRatesAccount are provided, compute the bond dynamically.
+    // Otherwise fall back to DEFAULT_CHALLENGER_BOND_FLOW (50 $FLOW).
+    let flow_price_cents = if let Some(rr_ai) = dispute_reward_rates_ai {
+        if rr_ai.lamports() > 0 && rr_ai.data_len() >= RewardRatesAccount::SIZE {
+            let rr_data = rr_ai.try_borrow_data()?;
+            if let Ok(rr) = RewardRatesAccount::try_from_slice(&rr_data) {
+                // Verify PDA address to prevent spoofed reward rates.
+                let (expected_rr_pda, _) =
+                    Pubkey::find_program_address(&[b"reward_rates"], program_id);
+                if *rr_ai.key == expected_rr_pda { rr.flow_price_cents } else { 0 }
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let challenger_bond = if let Some(bc_ai) = dispute_bond_config_ai {
+        if bc_ai.lamports() > 0 && bc_ai.data_len() >= BondConfig::SIZE {
+            let bc_data = bc_ai.try_borrow_data()?;
+            if let Ok(bc) = BondConfig::try_from_slice(&bc_data) {
+                // Verify PDA address.
+                let (expected_bc_pda, _) =
+                    Pubkey::find_program_address(&[b"bond_config"], program_id);
+                if *bc_ai.key == expected_bc_pda {
+                    let bond = bc.compute_challenger_bond(flow_price_cents);
+                    msg!("DisputeClaim: dynamic challenger_bond={} (price_cents={})", bond, flow_price_cents);
+                    bond
+                } else {
+                    DEFAULT_CHALLENGER_BOND_FLOW
+                }
+            } else {
+                DEFAULT_CHALLENGER_BOND_FLOW
+            }
+        } else {
+            DEFAULT_CHALLENGER_BOND_FLOW
+        }
+    } else {
+        DEFAULT_CHALLENGER_BOND_FLOW
+    };
+
+    // Validate bond range to catch garbage oracle values.
+    if challenger_bond < MIN_CHALLENGER_BOND_FLOW || challenger_bond > MAX_CHALLENGER_BOND_FLOW {
+        msg!(
+            "DisputeClaim: computed bond {} outside [{}, {}]",
+            challenger_bond, MIN_CHALLENGER_BOND_FLOW, MAX_CHALLENGER_BOND_FLOW,
+        );
+        return Err(RewardsError::InvalidChallengerBond.into());
+    }
 
     let mut store = if pending_claims_ai.data_len() > 0 && pending_claims_ai.lamports() > 0 {
         let data = pending_claims_ai.try_borrow_data()?;
@@ -2485,6 +3249,7 @@ fn process_dispute_claim(
         challenger.key.to_bytes(),
         clock.unix_timestamp,
         pending_claims_ai.key.to_bytes(),
+        challenger_bond,
     )
     .map_err(ProgramError::from)?;
 
@@ -2496,9 +3261,10 @@ fn process_dispute_claim(
     }
 
     msg!(
-        "DisputeClaim: filed against record_index={} in claim {:08x}",
+        "DisputeClaim: filed against record_index={} in claim {:08x} (bond={} $FLOW)",
         record_index,
         u32::from_le_bytes([claim_hash[0], claim_hash[1], claim_hash[2], claim_hash[3]]),
+        challenger_bond,
     );
 
     Ok(())
@@ -2507,14 +3273,30 @@ fn process_dispute_claim(
 /// Process ResolveDisputeRelaySlashed — challenger proved forgery, relay is slashed.
 ///
 /// P1: calls `settle_reservation` (Rule 1, Rule 4, Rule 8).
+/// Phase 6: CPI-slashes relay's stake in staking program (Option C: challenger gets bond back).
 ///
 /// Account layout:
 ///   0: challenger        — signer (receives challenger reward)
 ///   1: pending_claims    — PendingClaimsStore PDA (writable)
 ///   2: reservation       — UserEscrowReservation PDA for user (writable, optional)
-///   3: user_escrow       — UserEscrow PDA (readable, optional)
+///   3: user_escrow       — UserEscrow PDA (writable, optional; also used for balance check)
+///
+///   --- Release-CPI accounts (all optional; all 5 must be present together) ---
+///   4: user_escrow_prog  — user-escrow program (for CPI)
+///   5: mint_authority    — rewards mint_authority PDA ["mint_authority"] (PDA signer)
+///   6: user_wallet       — user wallet (non-signer; PDA seed in user-escrow)
+///   7: fund_hold         — FundHold PDA (writable; Active → Released)
+///   8: spender_registry  — AuthorizedSpenderRegistry PDA
+///
+///   --- Phase 6: Staking CPI accounts (all optional; all 5 must be present together) ---
+///   9: staking_program        — staking program (read-only)
+///  10: slash_authority        — slash_authority PDA [b"slash_authority"] of rewards program (signer via PDA)
+///  11: relay_stake_account    — StakeAccount PDA (writable)
+///  12: relay_escrow_ata       — relay's $FLOW escrow ATA in staking program (writable)
+///  13: staking_treasury_ata   — treasury's $FLOW ATA (writable; receives slashed tokens)
+///  14: staking_token_program  — SPL Token program (read-only)
 fn process_resolve_relay_slashed_ix(
-    _program_id: &Pubkey,
+    program_id:  &Pubkey,
     accounts:    &[AccountInfo],
     claim_hash:  [u8; 32],
 ) -> ProgramResult {
@@ -2523,6 +3305,21 @@ fn process_resolve_relay_slashed_ix(
     let pending_claims_ai = next_account_info(accounts_iter)?;
     let reservation_ai    = accounts_iter.next();
     let user_escrow_ai    = accounts_iter.next();
+
+    // Release-CPI accounts (all optional; all 5 must be provided together).
+    let rel_user_escrow_prog_ai  = accounts_iter.next();
+    let rel_mint_authority_ai    = accounts_iter.next();
+    let rel_user_ai              = accounts_iter.next();
+    let rel_fund_hold_ai         = accounts_iter.next();
+    let rel_spender_registry_ai  = accounts_iter.next();
+
+    // Phase 6: Staking CPI accounts (all optional; all 5 must be provided together).
+    let staking_program_ai       = accounts_iter.next();
+    let slash_authority_ai       = accounts_iter.next();
+    let relay_stake_account_ai   = accounts_iter.next();
+    let relay_escrow_ata_ai      = accounts_iter.next();
+    let staking_treasury_ata_ai  = accounts_iter.next();
+    let staking_token_program_ai = accounts_iter.next();
 
     if !challenger.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -2569,11 +3366,104 @@ fn process_resolve_relay_slashed_ix(
         }
     }
 
-    if let DisputeOutcome::RelaySlashed { challenger_reward, burned, .. } = &outcome {
+    // ── Release-CPI: unhold funds (relay slashed, user keeps tokens) ──────────
+    // Activated when all 5 release-CPI accounts (4–8) are provided.
+    // release_funds decrements UserEscrow.held and marks FundHold as Released,
+    // leaving the tokens in the user's escrow (they were never burned).
+    if let (
+        Some(uep_ai), Some(ma_ai), Some(hu_ai), Some(fh_ai), Some(sr_ai),
+    ) = (
+        rel_user_escrow_prog_ai, rel_mint_authority_ai, rel_user_ai,
+        rel_fund_hold_ai, rel_spender_registry_ai,
+    ) {
+        let ue_state_ai = user_escrow_ai.ok_or(ProgramError::NotEnoughAccountKeys)?;
+        let bump = verify_and_get_mint_authority_bump(ma_ai, program_id)?;
+        cpi_release_funds(
+            uep_ai,
+            ma_ai,
+            hu_ai,
+            ue_state_ai,
+            fh_ai,
+            sr_ai,
+            claim_hash,
+            bump,
+        )?;
+        msg!(
+            "ResolveRelaySlashed: released FundHold — {} $FLOW returned to user escrow",
+            claim_total_amount,
+        );
+    }
+
+    // ── Phase 6: CPI slash to staking program ────────────────────────────────
+    // Activated when all 6 staking CPI accounts (9–14) are provided.
+    // The rewards program's slash_authority PDA signs via invoke_signed.
+    // Option C: challenger only gets bond back — no bonus from stake.
+    if let (
+        Some(sp_ai), Some(sa_auth_ai), Some(rsa_ai), Some(rea_ai), Some(sta_ai), Some(stp_ai),
+    ) = (
+        staking_program_ai, slash_authority_ai, relay_stake_account_ai,
+        relay_escrow_ata_ai, staking_treasury_ata_ai, staking_token_program_ai,
+    ) {
+        // Verify slash_authority is the expected PDA.
+        let (expected_slash_auth, slash_auth_bump) = find_slash_authority_pda(program_id);
+        if *sa_auth_ai.key != expected_slash_auth {
+            msg!(
+                "ResolveRelaySlashed: slash_authority mismatch — expected {}, got {}",
+                expected_slash_auth, sa_auth_ai.key,
+            );
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Get the challenger bond from the dispute record (the slash amount).
+        let slash_amount = if let DisputeOutcome::RelaySlashed { challenger_bond_returned, .. } = &outcome {
+            *challenger_bond_returned
+        } else {
+            DEFAULT_CHALLENGER_BOND_FLOW
+        };
+
+        // Build StakingInstruction::Slash { slash_lamports, reason: 1 } (reason=1: dispute slash).
+        // Borsh encoding: variant index (u32le = 2) + u64le + u8
+        let mut slash_data = Vec::with_capacity(1 + 8 + 1);
+        // StakingInstruction is BorshDeserialize; Slash is variant 2.
+        slash_data.extend_from_slice(&(2u32).to_le_bytes());
+        slash_data.extend_from_slice(&slash_amount.to_le_bytes());
+        slash_data.push(1u8); // reason = 1 (dispute slash)
+
+        let slash_ix = solana_program::instruction::Instruction {
+            program_id: *sp_ai.key,
+            accounts: vec![
+                solana_program::instruction::AccountMeta::new_readonly(*sa_auth_ai.key, true),
+                solana_program::instruction::AccountMeta::new(*rsa_ai.key, false),
+                solana_program::instruction::AccountMeta::new(*rea_ai.key, false),
+                solana_program::instruction::AccountMeta::new(*sta_ai.key, false),
+                solana_program::instruction::AccountMeta::new_readonly(*stp_ai.key, false),
+            ],
+            data: slash_data,
+        };
+
+        solana_program::program::invoke_signed(
+            &slash_ix,
+            &[
+                sa_auth_ai.clone(),
+                rsa_ai.clone(),
+                rea_ai.clone(),
+                sta_ai.clone(),
+                stp_ai.clone(),
+            ],
+            &[&[b"slash_authority", &[slash_auth_bump]]],
+        )?;
+
+        msg!(
+            "ResolveRelaySlashed: staking CPI slash executed — {} $FLOW slashed from relay stake",
+            slash_amount,
+        );
+    }
+
+    if let DisputeOutcome::RelaySlashed { challenger_reward, burned, challenger_bond_returned } = &outcome {
         msg!(
             "ResolveDisputeRelaySlashed: relay SLASHED (Ed25519 precompile proved forgery). \
-             challenger_reward={} $FLOW, burned={} $FLOW",
-            challenger_reward, burned
+             challenger_reward={} $FLOW, burned={} $FLOW, bond_returned={} $FLOW",
+            challenger_reward, burned, challenger_bond_returned,
         );
     }
 
@@ -2601,6 +3491,8 @@ fn process_resolve_relay_slashed_ix(
 ///  10: spender_registry  — AuthorizedSpenderRegistry PDA
 ///  11: user_escrow_prog  — user-escrow program (for CPI)
 ///  12: token_program     — SPL Token program
+///  13: fund_hold         — FundHold PDA (optional; activates burn_held_funds path)
+///                          When present, calls burn_held_funds instead of spend_from_escrow.
 fn process_resolve_challenger_slashed_ix(
     program_id: &Pubkey,
     accounts:   &[AccountInfo],
@@ -2622,6 +3514,10 @@ fn process_resolve_challenger_slashed_ix(
     let spender_registry_ai  = accounts_iter.next();
     let user_escrow_prog_ai  = accounts_iter.next();
     let token_program_ai     = accounts_iter.next();
+    // Account 13 (mandatory when CPI bridge active): TreasuryConfig PDA.
+    let treasury_config_cs_ai = accounts_iter.next();
+    // Account 14 (optional): FundHold PDA — activates burn_held_funds path.
+    let fund_hold_cs_ai      = accounts_iter.next();
 
     if !relay_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -2681,16 +3577,37 @@ fn process_resolve_challenger_slashed_ix(
             .ok_or(ProgramError::NotEnoughAccountKeys)?;
         let bump = verify_and_get_mint_authority_bump(ma_ai, program_id)?;
 
-        // relay_token (rt_ai) must be owned by relay_wallet at the SPL level.
-        // spend_from_escrow enforces relay_token.owner == relay_wallet internally;
-        // the CPI returns EscrowError::InvalidRelayWallet if this check fails.
-        // spend_from_escrow verifies: (a) mint_authority_ai in spender registry,
-        //    (b) relay_token.owner == relay_wallet, (c) escrow balance >= amount.
-        cpi_burn_from_escrow(
-            uep_ai, ma_ai, uw_ai, ue_state_ai, uet_ai,
-            rt_ai, relay_wallet, sr_ai, tm_ai, tp_ai,
-            claim_total_amount, bump,
-        )?;
+        // ── GAP-11: mandatory treasury validation ──────────────────────────────
+        let tc_ai = treasury_config_cs_ai.ok_or(RewardsError::UnauthorizedTreasury)?;
+        validate_treasury_token(tc_ai, tt_ai, program_id)?;
+
+        // If a FundHold PDA is supplied (account 14), use burn_held_funds which
+        // decrements both `held` and `balance` and marks the FundHold as Burned.
+        // Otherwise fall back to the legacy spend_from_escrow path.
+        if let Some(fh_ai) = fund_hold_cs_ai {
+            cpi_burn_held_funds(
+                uep_ai,
+                ma_ai,
+                uw_ai,
+                ue_state_ai,
+                uet_ai,
+                fh_ai,
+                sr_ai,
+                tm_ai,
+                tp_ai,
+                claim_hash,
+                bump,
+            )?;
+        } else {
+            // Legacy path: spend_from_escrow.
+            //   verifies: (a) mint_authority_ai in spender registry,
+            //   (b) relay_token.owner == relay_wallet, (c) escrow balance >= amount.
+            cpi_burn_from_escrow(
+                uep_ai, ma_ai, uw_ai, ue_state_ai, uet_ai,
+                rt_ai, relay_wallet, sr_ai, tm_ai, tp_ai,
+                claim_total_amount, bump,
+            )?;
+        }
 
         let relay_share   = claim_total_amount.saturating_mul(RELAY_MINT_SHARE_BPS).saturating_div(10_000);
         let treasury_share = claim_total_amount.saturating_sub(relay_share);
@@ -2758,6 +3675,8 @@ fn process_force_resolve_ix(
     let spender_registry_ai  = accounts_iter.next();
     let user_escrow_prog_ai  = accounts_iter.next();
     let token_program_ai     = accounts_iter.next();
+    // Account 14 (mandatory when CPI bridge active): TreasuryConfig PDA.
+    let treasury_config_fr_ai = accounts_iter.next();
 
     if !resolver.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -2820,6 +3739,10 @@ fn process_force_resolve_ix(
             .ok_or(ProgramError::NotEnoughAccountKeys)?;
         let bump = verify_and_get_mint_authority_bump(ma_ai, program_id)?;
 
+        // ── GAP-11: mandatory treasury validation ──────────────────────────────
+        let tc_ai = treasury_config_fr_ai.ok_or(RewardsError::UnauthorizedTreasury)?;
+        validate_treasury_token(tc_ai, tt_ai, program_id)?;
+
         // relay_token (rt_ai) must be owned by relay_wallet (rw_ai) at the SPL level.
         // NOTE: resolver != relay here — rw_ai is passed separately as the relay's
         // wallet pubkey (account 10 in the layout); relay_wallet is the `resolver`
@@ -2880,6 +3803,9 @@ fn process_force_resolve_ix(
 ///  11: spender_registry      — AuthorizedSpenderRegistry PDA (read-only)
 ///  12: user_escrow_program   — user-escrow program (for CPI)
 ///  13: token_program         — SPL Token program
+///  14: fund_hold             — FundHold PDA (optional; activates burn_held_funds path)
+///                              When present, calls burn_held_funds (decrements held+balance)
+///                              instead of spend_from_escrow (legacy path).
 fn process_release_rewards_ix(
     program_id: &Pubkey,
     accounts:   &[AccountInfo],
@@ -2902,6 +3828,10 @@ fn process_release_rewards_ix(
     let spender_registry_ai  = accounts_iter.next();
     let user_escrow_prog_ai  = accounts_iter.next();
     let token_program_ai     = accounts_iter.next();
+    // Account 14 (mandatory when CPI bridge active): TreasuryConfig PDA.
+    let treasury_config_ai   = accounts_iter.next();
+    // Account 15 (optional): FundHold PDA — activates burn_held_funds path.
+    let fund_hold_rr_ai      = accounts_iter.next();
 
     if !relay_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -2991,27 +3921,53 @@ fn process_release_rewards_ix(
 
         let bump = verify_and_get_mint_authority_bump(ma_ai, program_id)?;
 
+        // ── GAP-11: mandatory treasury validation (no backward-compatible skip) ──
+        let tc_ai = treasury_config_ai.ok_or(RewardsError::UnauthorizedTreasury)?;
+        validate_treasury_token(tc_ai, tt_ai, program_id)?;
+
         // relay_token (rt_ai) must be owned by relay_wallet at the SPL level.
         // spend_from_escrow enforces relay_token.owner == relay_wallet internally;
         // the CPI returns EscrowError::InvalidRelayWallet if this check fails.
 
         // 1. Burn claim_total_amount from user escrow.
-        //    spend_from_escrow verifies: (a) mint_authority_ai in spender registry,
-        //    (b) relay_token.owner == relay_wallet, (c) escrow balance >= amount.
-        cpi_burn_from_escrow(
-            uep_ai,
-            ma_ai,
-            uw_ai,
-            ue_state_ai,
-            uet_ai,
-            rt_ai,
-            relay_wallet,
-            sr_ai,
-            tm_ai,
-            tp_ai,
-            claim_total_amount,
-            bump,
-        )?;
+        //    If a FundHold PDA is supplied (account 15), use the new
+        //    burn_held_funds path which decrements both `held` and `balance`
+        //    and marks the FundHold as Burned.
+        //    Otherwise fall back to the legacy spend_from_escrow path.
+        if let Some(fh_ai) = fund_hold_rr_ai {
+            // New path: burn_held_funds (FundHold must be Active).
+            cpi_burn_held_funds(
+                uep_ai,
+                ma_ai,
+                uw_ai,
+                ue_state_ai,
+                uet_ai,
+                fh_ai,
+                sr_ai,
+                tm_ai,
+                tp_ai,
+                claim_hash,
+                bump,
+            )?;
+        } else {
+            // Legacy path: spend_from_escrow.
+            //   verifies: (a) mint_authority_ai in spender registry,
+            //   (b) relay_token.owner == relay_wallet, (c) escrow balance >= amount.
+            cpi_burn_from_escrow(
+                uep_ai,
+                ma_ai,
+                uw_ai,
+                ue_state_ai,
+                uet_ai,
+                rt_ai,
+                relay_wallet,
+                sr_ai,
+                tm_ai,
+                tp_ai,
+                claim_total_amount,
+                bump,
+            )?;
+        }
 
         // 2. Mint 70:30 split on `claim_total_amount`.
         //    Relay receives 70%, treasury receives 30%.
@@ -3474,6 +4430,378 @@ fn process_update_reward_rates(
     Ok(())
 }
 
+// ── TreasuryConfig instruction handlers ──────────────────────────────────────
+
+/// Initialize the `TreasuryConfig` PDA.
+///
+/// One-time. Fails with `AccountAlreadyInitialized` if already initialized.
+/// Only `FOUNDATION_PUBKEY` may call this.
+///
+/// Account layout:
+///   0: foundation      (signer — must equal FOUNDATION_PUBKEY, writable — pays rent)
+///   1: treasury_config (TreasuryConfig PDA [b"treasury_config"], writable — pre-created)
+///   2: system_program  (readonly)
+fn process_initialize_treasury_config_ix(
+    program_id: &Pubkey,
+    accounts:   &[AccountInfo],
+    initial_treasury_keys: Vec<[u8; 32]>,
+) -> ProgramResult {
+    let accounts_iter       = &mut accounts.iter();
+    let foundation          = next_account_info(accounts_iter)?;
+    let treasury_config_ai  = next_account_info(accounts_iter)?;
+    let _system_program     = next_account_info(accounts_iter)?;
+
+    if !foundation.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if *foundation.key != FOUNDATION_PUBKEY {
+        msg!(
+            "InitializeTreasuryConfig: unauthorized — signer {} is not Foundation",
+            foundation.key
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Verify PDA address.
+    let (expected_pda, _) = Pubkey::find_program_address(&[b"treasury_config"], program_id);
+    if *treasury_config_ai.key != expected_pda {
+        msg!(
+            "InitializeTreasuryConfig: PDA mismatch — expected {}, got {}",
+            expected_pda, treasury_config_ai.key
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Idempotency guard — refuse to reinitialize.
+    if treasury_config_ai.data_len() >= TreasuryConfig::SIZE && treasury_config_ai.lamports() > 0 {
+        msg!("InitializeTreasuryConfig: already initialized — refusing to overwrite");
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+
+    // Require at least one initial key.
+    if initial_treasury_keys.is_empty() {
+        msg!("InitializeTreasuryConfig: must provide at least one initial treasury key");
+        return Err(ProgramError::InvalidArgument);
+    }
+    if initial_treasury_keys.len() > TreasuryConfig::MAX_KEYS {
+        msg!(
+            "InitializeTreasuryConfig: too many keys ({} > max {})",
+            initial_treasury_keys.len(), TreasuryConfig::MAX_KEYS
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let config = TreasuryConfig {
+        authority:     FOUNDATION_PUBKEY.to_bytes(),
+        treasury_keys: initial_treasury_keys.clone(),
+        change_count:  0,
+    };
+
+    let serialized = borsh::to_vec(&config).map_err(|_| ProgramError::InvalidAccountData)?;
+    let mut data   = treasury_config_ai.try_borrow_mut_data()?;
+    if data.len() < serialized.len() {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    data[..serialized.len()].copy_from_slice(&serialized);
+
+    msg!(
+        "InitializeTreasuryConfig: initialized with {} treasury key(s)",
+        initial_treasury_keys.len()
+    );
+    Ok(())
+}
+
+/// Update the authorized treasury pool in `TreasuryConfig`.
+///
+/// Only `FOUNDATION_PUBKEY` may call this. Increments `change_count`.
+/// Must leave at least 1 key in the pool.
+///
+/// Account layout:
+///   0: foundation      (signer — must equal FOUNDATION_PUBKEY)
+///   1: treasury_config (TreasuryConfig PDA [b"treasury_config"], writable)
+fn process_update_treasury_pool_ix(
+    program_id:           &Pubkey,
+    accounts:             &[AccountInfo],
+    add_treasury_keys:    Vec<[u8; 32]>,
+    remove_treasury_keys: Vec<[u8; 32]>,
+) -> ProgramResult {
+    let accounts_iter      = &mut accounts.iter();
+    let foundation         = next_account_info(accounts_iter)?;
+    let treasury_config_ai = next_account_info(accounts_iter)?;
+
+    if !foundation.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if *foundation.key != FOUNDATION_PUBKEY {
+        msg!(
+            "UpdateTreasuryPool: unauthorized — signer {} is not Foundation",
+            foundation.key
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Verify PDA address.
+    let (expected_pda, _) = Pubkey::find_program_address(&[b"treasury_config"], program_id);
+    if *treasury_config_ai.key != expected_pda {
+        msg!(
+            "UpdateTreasuryPool: PDA mismatch — expected {}, got {}",
+            expected_pda, treasury_config_ai.key
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Load existing config.
+    if treasury_config_ai.data_len() < TreasuryConfig::SIZE || treasury_config_ai.lamports() == 0 {
+        msg!("UpdateTreasuryPool: treasury_config not initialized — call InitializeTreasuryConfig first");
+        return Err(ProgramError::UninitializedAccount);
+    }
+    let mut config: TreasuryConfig = {
+        let data = treasury_config_ai.try_borrow_data()?;
+        TreasuryConfig::try_from_slice(&data).map_err(|_| ProgramError::InvalidAccountData)?
+    };
+
+    // Apply removals first.
+    for key in &remove_treasury_keys {
+        config.treasury_keys.retain(|k| k != key);
+    }
+
+    // Apply additions (deduplicated).
+    for key in add_treasury_keys {
+        if !config.treasury_keys.contains(&key) {
+            if config.treasury_keys.len() >= TreasuryConfig::MAX_KEYS {
+                msg!("UpdateTreasuryPool: cannot add key — pool is at max capacity ({})", TreasuryConfig::MAX_KEYS);
+                return Err(ProgramError::InvalidArgument);
+            }
+            config.treasury_keys.push(key);
+        }
+    }
+
+    // Must retain at least one key.
+    if config.treasury_keys.is_empty() {
+        msg!("UpdateTreasuryPool: cannot remove all treasury keys — pool must have at least 1");
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    config.change_count = config.change_count.saturating_add(1);
+
+    let serialized = borsh::to_vec(&config).map_err(|_| ProgramError::InvalidAccountData)?;
+    let mut data   = treasury_config_ai.try_borrow_mut_data()?;
+    data[..serialized.len()].copy_from_slice(&serialized);
+
+    msg!(
+        "UpdateTreasuryPool: {} key(s) in pool, change_count={}",
+        config.treasury_keys.len(), config.change_count
+    );
+    Ok(())
+}
+
+// ── BondConfig instructions (Phase 2) ────────────────────────────────────────
+
+/// Initialize the `BondConfig` PDA with dynamic bond/stake parameters.
+///
+/// One-time call by Foundation. The PDA must be pre-allocated with correct
+/// rent via `SystemProgram::createAccountWithSeed` or `createAccount`.
+///
+/// Accounts:
+///   0: foundation   — signer, writable (payer)
+///   1: bond_config  — BondConfig PDA [b"bond_config"], writable
+///   2: system_program
+fn process_initialize_bond_config_ix(
+    program_id:            &Pubkey,
+    accounts:              &[AccountInfo],
+    challenger_bond_cents: u64,
+    min_stake_usd_cents:   u64,
+    stake_earnings_bps:    u64,
+    max_stake_flow:        u64,
+) -> ProgramResult {
+    let accounts_iter  = &mut accounts.iter();
+    let foundation     = next_account_info(accounts_iter)?;
+    let bond_config_ai = next_account_info(accounts_iter)?;
+
+    if !foundation.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if *foundation.key != FOUNDATION_PUBKEY {
+        msg!("InitializeBondConfig: unauthorized signer {}", foundation.key);
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let (expected_pda, bump) = Pubkey::find_program_address(&[b"bond_config"], program_id);
+    if *bond_config_ai.key != expected_pda {
+        msg!(
+            "InitializeBondConfig: PDA mismatch — expected {}, got {}",
+            expected_pda, bond_config_ai.key
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Idempotent: skip if already initialized.
+    if bond_config_ai.data_len() >= BondConfig::SIZE && bond_config_ai.lamports() > 0 {
+        msg!("InitializeBondConfig: already initialized — skipping");
+        return Ok(());
+    }
+
+    let config = BondConfig {
+        authority:             foundation.key.to_bytes(),
+        challenger_bond_cents: if challenger_bond_cents == 0 {
+            BondConfig::DEFAULT_CHALLENGER_BOND_CENTS
+        } else {
+            challenger_bond_cents
+        },
+        min_stake_usd_cents: if min_stake_usd_cents == 0 {
+            BondConfig::DEFAULT_MIN_STAKE_USD_CENTS
+        } else {
+            min_stake_usd_cents
+        },
+        stake_earnings_bps: if stake_earnings_bps == 0 {
+            BondConfig::DEFAULT_STAKE_EARNINGS_BPS
+        } else {
+            stake_earnings_bps
+        },
+        max_stake_flow: if max_stake_flow == 0 {
+            BondConfig::DEFAULT_MAX_STAKE_FLOW
+        } else {
+            max_stake_flow
+        },
+        bump,
+    };
+
+    let serialized = borsh::to_vec(&config).map_err(|_| ProgramError::InvalidAccountData)?;
+    let mut data   = bond_config_ai.try_borrow_mut_data()?;
+    if serialized.len() > data.len() {
+        msg!("InitializeBondConfig: account too small ({} < {})", data.len(), serialized.len());
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    data[..serialized.len()].copy_from_slice(&serialized);
+
+    msg!(
+        "InitializeBondConfig: challenger_bond_cents={} min_stake_usd_cents={} stake_earnings_bps={} max_stake_flow={}",
+        config.challenger_bond_cents, config.min_stake_usd_cents,
+        config.stake_earnings_bps, config.max_stake_flow,
+    );
+    Ok(())
+}
+
+/// Update the `BondConfig` PDA parameters.
+///
+/// Accounts:
+///   0: foundation   — signer (must equal FOUNDATION_PUBKEY)
+///   1: bond_config  — BondConfig PDA [b"bond_config"], writable
+fn process_update_bond_config_ix(
+    program_id:            &Pubkey,
+    accounts:              &[AccountInfo],
+    challenger_bond_cents: u64,
+    min_stake_usd_cents:   u64,
+    stake_earnings_bps:    u64,
+    max_stake_flow:        u64,
+) -> ProgramResult {
+    let accounts_iter  = &mut accounts.iter();
+    let foundation     = next_account_info(accounts_iter)?;
+    let bond_config_ai = next_account_info(accounts_iter)?;
+
+    if !foundation.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if *foundation.key != FOUNDATION_PUBKEY {
+        msg!("UpdateBondConfig: unauthorized signer {}", foundation.key);
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let (expected_pda, _) = Pubkey::find_program_address(&[b"bond_config"], program_id);
+    if *bond_config_ai.key != expected_pda {
+        msg!(
+            "UpdateBondConfig: PDA mismatch — expected {}, got {}",
+            expected_pda, bond_config_ai.key
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    if bond_config_ai.data_len() < BondConfig::SIZE || bond_config_ai.lamports() == 0 {
+        msg!("UpdateBondConfig: not initialized — call InitializeBondConfig first");
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    let mut config: BondConfig = {
+        let data = bond_config_ai.try_borrow_data()?;
+        BondConfig::try_from_slice(&data).map_err(|_| ProgramError::InvalidAccountData)?
+    };
+
+    if challenger_bond_cents != 0 { config.challenger_bond_cents = challenger_bond_cents; }
+    if min_stake_usd_cents   != 0 { config.min_stake_usd_cents   = min_stake_usd_cents;   }
+    if stake_earnings_bps    != 0 { config.stake_earnings_bps    = stake_earnings_bps;    }
+    if max_stake_flow        != 0 { config.max_stake_flow        = max_stake_flow;        }
+
+    let serialized = borsh::to_vec(&config).map_err(|_| ProgramError::InvalidAccountData)?;
+    let mut data   = bond_config_ai.try_borrow_mut_data()?;
+    data[..serialized.len()].copy_from_slice(&serialized);
+
+    msg!(
+        "UpdateBondConfig: challenger_bond_cents={} min_stake_usd_cents={} stake_earnings_bps={} max_stake_flow={}",
+        config.challenger_bond_cents, config.min_stake_usd_cents,
+        config.stake_earnings_bps, config.max_stake_flow,
+    );
+    Ok(())
+}
+
+// ── Treasury validation helper ────────────────────────────────────────────────
+
+/// Verify that `treasury_token_ai`'s SPL owner is in the authorized `TreasuryConfig` pool.
+///
+/// **Mandatory** — no backward-compatible skip path. If the `treasury_config` PDA is
+/// not initialized, or the treasury token account owner is not in the pool, this
+/// returns `RewardsError::UnauthorizedTreasury` and the whole transaction reverts.
+///
+/// Called before every `cpi_mint_to(... treasury_token ...)` in the 70/30 split paths.
+fn validate_treasury_token(
+    treasury_config_ai: &AccountInfo,
+    treasury_token_ai:  &AccountInfo,
+    program_id:         &Pubkey,
+) -> ProgramResult {
+    // Verify PDA address matches canonical seeds.
+    let (expected_pda, _) = Pubkey::find_program_address(&[b"treasury_config"], program_id);
+    if *treasury_config_ai.key != expected_pda {
+        msg!(
+            "TreasuryConfig: PDA mismatch — expected {}, got {}",
+            expected_pda, treasury_config_ai.key
+        );
+        return Err(RewardsError::UnauthorizedTreasury.into());
+    }
+
+    // Require the PDA to be initialized (non-backward-compatible).
+    if treasury_config_ai.data_len() < TreasuryConfig::SIZE || treasury_config_ai.lamports() == 0 {
+        msg!("TreasuryConfig: account not initialized — treasury validation is mandatory");
+        return Err(RewardsError::UnauthorizedTreasury.into());
+    }
+
+    let config = TreasuryConfig::try_from_slice(&treasury_config_ai.try_borrow_data()?)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    if config.treasury_keys.is_empty() {
+        msg!("TreasuryConfig: no authorized treasury keys configured");
+        return Err(RewardsError::UnauthorizedTreasury.into());
+    }
+
+    // Read treasury token account owner: SPL TokenAccount layout has owner at bytes 32..64.
+    let token_data = treasury_token_ai.try_borrow_data()?;
+    if token_data.len() < 64 {
+        msg!("TreasuryConfig: treasury_token account too small to read SPL owner field");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut owner = [0u8; 32];
+    owner.copy_from_slice(&token_data[32..64]);
+
+    if !config.treasury_keys.iter().any(|k| *k == owner) {
+        msg!(
+            "TreasuryConfig: treasury_token owner {} is not in the authorized pool",
+            Pubkey::new_from_array(owner)
+        );
+        return Err(RewardsError::UnauthorizedTreasury.into());
+    }
+
+    msg!("TreasuryConfig: treasury_token owner validated");
+    Ok(())
+}
+
 /// Sweep all Pending claims that have exceeded the 60-day timeout.
 ///
 /// P1: also calls `settle_reservation` for each swept claim belonging to the
@@ -3519,6 +4847,8 @@ fn process_sweep_expired_escrow_ix(
     let spender_registry_ai  = accounts_iter.next();
     let user_escrow_prog_ai  = accounts_iter.next();
     let token_program_ai     = accounts_iter.next();
+    // Account 13 (mandatory when CPI bridge active): TreasuryConfig PDA.
+    let treasury_config_sw_ai = accounts_iter.next();
 
     if !sweeper.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -3602,6 +4932,11 @@ fn process_sweep_expired_escrow_ix(
             .ok_or(ProgramError::NotEnoughAccountKeys)?;
 
         let bump = verify_and_get_mint_authority_bump(ma_ai, program_id)?;
+
+        // ── GAP-11: mandatory treasury validation ──────────────────────────────
+        let tc_ai = treasury_config_sw_ai.ok_or(RewardsError::UnauthorizedTreasury)?;
+        validate_treasury_token(tc_ai, tt_ai, program_id)?;
+
         let cpi_user_key = *uw_ai.key;
 
         let mut total_burned_cpi: u64 = 0;
@@ -4319,6 +5654,7 @@ mod tests {
         dispute_claim(
             &mut store, hash, 0,
             records[0].clone(), challenger_pubkey(), dispute_ts, [0u8; 32],
+            DEFAULT_CHALLENGER_BOND_FLOW,
         ).unwrap();
 
         assert_eq!(store.claims[0].status, ClaimStatus::Disputed);
@@ -4339,6 +5675,7 @@ mod tests {
         let result  = dispute_claim(
             &mut store, hash, 0,
             records[0].clone(), challenger_pubkey(), late_ts, [0u8; 32],
+            DEFAULT_CHALLENGER_BOND_FLOW,
         );
 
         assert_eq!(result, Err(DisputeError::DisputeWindowExpired));
@@ -4353,6 +5690,7 @@ mod tests {
         let result = dispute_claim(
             &mut store, wrong_hash, 0,
             records[0].clone(), challenger_pubkey(), now_ts(), [0u8; 32],
+            DEFAULT_CHALLENGER_BOND_FLOW,
         );
         assert_eq!(result, Err(DisputeError::ClaimNotFound));
     }
@@ -4366,11 +5704,13 @@ mod tests {
 
         dispute_claim(
             &mut store, hash, 0, records[0].clone(), challenger_pubkey(), ts, [0u8; 32],
+            DEFAULT_CHALLENGER_BOND_FLOW,
         ).unwrap();
 
         // Second dispute on the same claim — already Disputed.
         let result = dispute_claim(
             &mut store, hash, 0, records[0].clone(), [0xFFu8; 32], ts + 100, [0u8; 32],
+            DEFAULT_CHALLENGER_BOND_FLOW,
         );
         assert_eq!(result, Err(DisputeError::ClaimAlreadyDisputed));
     }
@@ -4386,6 +5726,7 @@ mod tests {
 
         dispute_claim(
             &mut store, hash, 0, records[0].clone(), challenger_pubkey(), ts, [0u8; 32],
+            DEFAULT_CHALLENGER_BOND_FLOW,
         ).unwrap();
 
         // Challenger proved forgery via Ed25519 precompile → relay slashed.
@@ -4409,6 +5750,7 @@ mod tests {
 
         dispute_claim(
             &mut store, hash, 0, records[0].clone(), challenger_pubkey(), ts, [0u8; 32],
+            DEFAULT_CHALLENGER_BOND_FLOW,
         ).unwrap();
 
         // Relay proved sig valid via Ed25519 precompile → challenger slashed.
@@ -4450,7 +5792,7 @@ mod tests {
         let ts        = now_ts();
         let hash      = submit_batch(&mut store, &records, ts);
 
-        dispute_claim(&mut store, hash, 0, records[0].clone(), challenger_pubkey(), ts, [0u8; 32]).unwrap();
+        dispute_claim(&mut store, hash, 0, records[0].clone(), challenger_pubkey(), ts, [0u8; 32], DEFAULT_CHALLENGER_BOND_FLOW).unwrap();
 
         // Force-resolve after 3 days + 1 second.
         let force_ts = ts + DISPUTE_RESOLVE_SECONDS + 1;
@@ -4472,7 +5814,7 @@ mod tests {
         let ts        = now_ts();
         let hash      = submit_batch(&mut store, &records, ts);
 
-        dispute_claim(&mut store, hash, 0, records[0].clone(), challenger_pubkey(), ts, [0u8; 32]).unwrap();
+        dispute_claim(&mut store, hash, 0, records[0].clone(), challenger_pubkey(), ts, [0u8; 32], DEFAULT_CHALLENGER_BOND_FLOW).unwrap();
 
         // Only 1 day elapsed — too early.
         let result = force_resolve_dispute(&mut store, hash, ts + 86_400);
@@ -4499,7 +5841,7 @@ mod tests {
         let ts        = now_ts();
         let hash      = submit_batch(&mut store, &records, ts);
 
-        dispute_claim(&mut store, hash, 0, records[0].clone(), challenger_pubkey(), ts, [0u8; 32]).unwrap();
+        dispute_claim(&mut store, hash, 0, records[0].clone(), challenger_pubkey(), ts, [0u8; 32], DEFAULT_CHALLENGER_BOND_FLOW).unwrap();
 
         // Relay resolves normally first.
         resolve_dispute_challenger_slashed(&mut store, hash).unwrap();
@@ -4552,6 +5894,7 @@ mod tests {
 
         dispute_claim(
             &mut store, hash, 0, records[0].clone(), challenger_pubkey(), ts, [0u8; 32],
+            DEFAULT_CHALLENGER_BOND_FLOW,
         ).unwrap();
 
         // Cannot release a disputed claim (status is Disputed, not Pending).
@@ -4576,6 +5919,7 @@ mod tests {
 
         dispute_claim(
             &mut store, hash, 0, records[0].clone(), challenger_pubkey(), now_ts(), [0u8; 32],
+            DEFAULT_CHALLENGER_BOND_FLOW,
         ).unwrap();
 
         let outcome = resolve_dispute_relay_slashed(&mut store, hash).unwrap();
@@ -4607,6 +5951,7 @@ mod tests {
         // Dispute claim 1, release claim 2 after window.
         dispute_claim(
             &mut store, hash1, 0, records1[0].clone(), challenger_pubkey(), ts, [0u8; 32],
+            DEFAULT_CHALLENGER_BOND_FLOW,
         ).unwrap();
 
         // release_ts must exceed deadline of claim2 = ts + 60 + DISPUTE_WINDOW_SECONDS
@@ -5203,6 +6548,7 @@ mod tests {
         // Attempting to dispute a Swept claim must fail with ClaimAlreadySettled.
         let result = dispute_claim(
             &mut store, hash, 0, records[0].clone(), challenger_pubkey(), ts, [0u8; 32],
+            DEFAULT_CHALLENGER_BOND_FLOW,
         );
         assert_eq!(result, Err(DisputeError::ClaimAlreadySettled),
             "Swept claims must not be disputable (M3 dispute gate)");
@@ -5557,6 +6903,7 @@ mod tests {
             [99u8; 32],    // challenger pubkey
             ts,            // clock_ts
             [0u8; 32],     // escrow_pda
+            DEFAULT_CHALLENGER_BOND_FLOW,
         );
         // resolve: relay slashed (fraudulent claim)
         let outcome = resolve_dispute_relay_slashed(&mut store, hash);
@@ -5584,6 +6931,7 @@ mod tests {
             [99u8; 32],    // challenger pubkey
             ts,            // clock_ts
             [0u8; 32],     // escrow_pda
+            DEFAULT_CHALLENGER_BOND_FLOW,
         );
         let outcome = resolve_dispute_challenger_slashed(&mut store, hash);
         assert!(outcome.is_ok());
@@ -5609,6 +6957,7 @@ mod tests {
             [99u8; 32],    // challenger pubkey
             ts,            // clock_ts
             [0u8; 32],     // escrow_pda
+            DEFAULT_CHALLENGER_BOND_FLOW,
         );
         // Force resolve after 3-day timeout.
         let resolve_ts = ts + DISPUTE_RESOLVE_SECONDS + 86_400;
@@ -5858,5 +7207,284 @@ mod tests {
             assert!(relay_share >= treasury_share,
                 "relay (70%) must receive at least as much as treasury (30%)");
         }
+    }
+
+    // ─── Phase 9: BondConfig unit tests ─────────────────────────────────────
+
+    fn default_bond_config() -> BondConfig {
+        BondConfig {
+            authority:             [0u8; 32],
+            challenger_bond_cents: BondConfig::DEFAULT_CHALLENGER_BOND_CENTS, // 125_000
+            min_stake_usd_cents:   BondConfig::DEFAULT_MIN_STAKE_USD_CENTS,   // 250_000_000
+            stake_earnings_bps:    BondConfig::DEFAULT_STAKE_EARNINGS_BPS,    // 1_000
+            max_stake_flow:        BondConfig::DEFAULT_MAX_STAKE_FLOW,        // 100_000
+            bump:                  255,
+        }
+    }
+
+    /// The challenger bond formula is: bond = challenger_bond_cents * 1_000_000 / flow_price_cents
+    ///
+    /// With challenger_bond_cents = 125_000 ($1.25), the flow_price_cents at which bond = 50:
+    ///   50 = 125_000 * 1_000_000 / flow_price_cents  →  flow_price_cents = 2_500_000_000
+    #[test]
+    fn bond_config_compute_challenger_bond_at_default_price() {
+        let cfg = default_bond_config();
+        // Derived: price at which 125_000 * 1_000_000 / price = 50
+        let flow_price_cents = 2_500_000_000u64;
+        let bond = cfg.compute_challenger_bond(flow_price_cents);
+        assert_eq!(bond, DEFAULT_CHALLENGER_BOND_FLOW,
+            "bond must equal DEFAULT_CHALLENGER_BOND_FLOW = 50 at this price");
+    }
+
+    /// Bond is clamped at MAX_CHALLENGER_BOND_FLOW (500) for low prices.
+    ///
+    /// At price = 250_000_000: 125_000 * 1_000_000 / 250_000_000 = 500 (= MAX exactly).
+    #[test]
+    fn bond_config_compute_challenger_bond_low_price_clamped_to_max() {
+        let cfg = default_bond_config();
+        // 125_000 * 1_000_000 / 250_000_000 = 500 (exactly at MAX)
+        let flow_price_cents = 250_000_000u64;
+        let bond = cfg.compute_challenger_bond(flow_price_cents);
+        assert_eq!(bond, MAX_CHALLENGER_BOND_FLOW,
+            "price 250_000_000 → bond = MAX_CHALLENGER_BOND_FLOW = 500");
+
+        // Any lower price → still MAX.
+        let even_lower = 100_000_000u64; // → raw 1250 → clamped to 500
+        assert_eq!(cfg.compute_challenger_bond(even_lower), MAX_CHALLENGER_BOND_FLOW,
+            "lower price still clamps to MAX");
+    }
+
+    /// Bond is clamped at MIN_CHALLENGER_BOND_FLOW (10) for high prices.
+    ///
+    /// At price = 12_500_000_000: 125_000 * 1_000_000 / 12_500_000_000 = 10 (= MIN exactly).
+    #[test]
+    fn bond_config_compute_challenger_bond_high_price_clamped_to_min() {
+        let cfg = default_bond_config();
+        // 125_000 * 1_000_000 / 12_500_000_000 = 10 (exactly at MIN)
+        let flow_price_at_min = 12_500_000_000u64;
+        let bond = cfg.compute_challenger_bond(flow_price_at_min);
+        assert_eq!(bond, MIN_CHALLENGER_BOND_FLOW,
+            "price 12_500_000_000 → bond = MIN_CHALLENGER_BOND_FLOW = 10");
+
+        // Any higher price → still MIN.
+        let very_high = 100_000_000_000u64; // → raw 1 → clamped to 10
+        assert_eq!(cfg.compute_challenger_bond(very_high), MIN_CHALLENGER_BOND_FLOW,
+            "higher price still clamps to MIN");
+    }
+
+    /// flow_price_cents = 0 (oracle not set) → DEFAULT_CHALLENGER_BOND_FLOW (50).
+    #[test]
+    fn bond_config_compute_challenger_bond_zero_price_returns_default() {
+        let cfg = default_bond_config();
+        assert_eq!(
+            cfg.compute_challenger_bond(0),
+            DEFAULT_CHALLENGER_BOND_FLOW,
+            "price=0 must fall back to DEFAULT_CHALLENGER_BOND_FLOW"
+        );
+    }
+
+    /// Monotonic: higher $FLOW price → lower bond requirement.
+    #[test]
+    fn bond_config_compute_challenger_bond_decreases_with_price() {
+        let cfg = default_bond_config();
+        // Prices spanning from MAX-clamp region to MIN-clamp region.
+        let prices = [250_000_000u64, 1_000_000_000, 2_500_000_000, 10_000_000_000, 12_500_000_000];
+        let bonds: Vec<u64> = prices.iter().map(|&p| cfg.compute_challenger_bond(p)).collect();
+        for i in 1..bonds.len() {
+            assert!(bonds[i] <= bonds[i - 1],
+                "bond[{}]={} must be <= bond[{}]={} (higher price → lower bond)",
+                i, bonds[i], i - 1, bonds[i - 1]);
+        }
+    }
+
+    /// At a high $FLOW price, base min-stake is below max_stake_flow.
+    ///
+    /// Formula: base = min_stake_usd_cents * 1_000_000 / flow_price_cents
+    /// With min_stake_usd_cents = 250_000_000 and price = 25_000_000_000:
+    ///   base = 250_000_000 * 1_000_000 / 25_000_000_000 = 10_000 FLOW
+    #[test]
+    fn bond_config_compute_min_stake_base_only() {
+        let cfg = default_bond_config();
+        // 250_000_000 * 1_000_000 / 25_000_000_000 = 10_000
+        let flow_price_cents = 25_000_000_000u64;
+        let min_stake = cfg.compute_min_stake(flow_price_cents, 0);
+        assert_eq!(min_stake, 10_000,
+            "at this price with no earnings, min_stake = 10_000 FLOW");
+    }
+
+    /// Earnings increase min_stake linearly (10% of total_lamports_claimed added).
+    #[test]
+    fn bond_config_compute_min_stake_with_earnings() {
+        let cfg = default_bond_config();
+        // base = 250_000_000 * 1_000_000 / 25_000_000_000 = 10_000
+        let flow_price_cents = 25_000_000_000u64;
+        // stake_earnings_bps = 1_000 (10%): extra = 50_000 * 1_000 / 10_000 = 5_000
+        let total_lamports_claimed = 50_000u64;
+        let min_stake = cfg.compute_min_stake(flow_price_cents, total_lamports_claimed);
+        assert_eq!(min_stake, 15_000,
+            "base(10_000) + extra(5_000) = 15_000 FLOW");
+    }
+
+    /// min_stake is capped at max_stake_flow (100_000) regardless of earnings.
+    #[test]
+    fn bond_config_compute_min_stake_capped_at_max() {
+        let cfg = default_bond_config();
+        // base = 10_000 at this price
+        let flow_price_cents = 25_000_000_000u64;
+        // earnings that push past 100_000:
+        //   extra = 999_000 * 1_000 / 10_000 = 99_900 → total = 109_900 → capped at 100_000
+        let huge_earnings = 999_000u64;
+        let min_stake = cfg.compute_min_stake(flow_price_cents, huge_earnings);
+        assert_eq!(min_stake, BondConfig::DEFAULT_MAX_STAKE_FLOW,
+            "min_stake must be capped at max_stake_flow = 100_000");
+    }
+
+    /// flow_price_cents = 0 → DEFAULT_MIN_STAKE_FLOW (100).
+    #[test]
+    fn bond_config_compute_min_stake_zero_price_returns_default() {
+        let cfg = default_bond_config();
+        assert_eq!(
+            cfg.compute_min_stake(0, 0),
+            DEFAULT_MIN_STAKE_FLOW,
+            "price=0 must fall back to DEFAULT_MIN_STAKE_FLOW"
+        );
+    }
+
+    /// BondConfig Borsh round-trip serialization/deserialization.
+    #[test]
+    fn bond_config_borsh_roundtrip() {
+        let cfg = BondConfig {
+            authority:             [0xABu8; 32],
+            challenger_bond_cents: 99_999,
+            min_stake_usd_cents:   123_456_789,
+            stake_earnings_bps:    500,
+            max_stake_flow:        50_000,
+            bump:                  42,
+        };
+        let encoded = borsh::to_vec(&cfg).unwrap();
+        assert_eq!(encoded.len(), BondConfig::SIZE,
+            "BondConfig serializes to exactly {} bytes", BondConfig::SIZE);
+        let decoded: BondConfig = borsh::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.authority,             cfg.authority);
+        assert_eq!(decoded.challenger_bond_cents, cfg.challenger_bond_cents);
+        assert_eq!(decoded.min_stake_usd_cents,   cfg.min_stake_usd_cents);
+        assert_eq!(decoded.stake_earnings_bps,    cfg.stake_earnings_bps);
+        assert_eq!(decoded.max_stake_flow,        cfg.max_stake_flow);
+        assert_eq!(decoded.bump,                  cfg.bump);
+    }
+
+    /// dispute_claim() stores the passed `challenger_bond` in DisputeRecord.bond.
+    ///
+    /// This is the mechanism that makes bond resolution dynamic: the bond is computed
+    /// off-chain (or from BondConfig) at dispute time and stored for later resolution.
+    #[test]
+    fn dispute_stores_challenger_bond_in_record() {
+        let mut store = PendingClaimsStore::default();
+        let ts   = now_ts();
+        let hash = submit_batch(&mut store, &make_batch(1, 1), ts);
+        let custom_bond = 123u64; // arbitrary non-default value
+        dispute_claim(
+            &mut store, hash, 0, make_batch(1, 1)[0].clone(),
+            challenger_pubkey(), ts, [0u8; 32], custom_bond,
+        ).unwrap();
+        let dispute = store.disputes.iter().find(|d| d.claim_hash == hash).unwrap();
+        assert_eq!(dispute.bond, custom_bond,
+            "DisputeRecord.bond must equal the passed challenger_bond");
+    }
+
+    /// resolve_dispute_relay_slashed() reads challenger_bond from DisputeRecord.bond.
+    ///
+    /// Verifies that the `challenger_bond_returned` field in the outcome equals
+    /// the bond stored at dispute time, not the hardcoded CHALLENGER_BOND_FLOW constant.
+    #[test]
+    fn relay_slash_outcome_returns_record_bond() {
+        let mut store = PendingClaimsStore::default();
+        let ts   = now_ts();
+        let hash = submit_batch(&mut store, &make_batch(1, 1), ts);
+        let custom_bond = 200u64; // 4× default
+        dispute_claim(
+            &mut store, hash, 0, make_batch(1, 1)[0].clone(),
+            challenger_pubkey(), ts, [0u8; 32], custom_bond,
+        ).unwrap();
+        let outcome = resolve_dispute_relay_slashed(&mut store, hash).unwrap();
+        if let DisputeOutcome::RelaySlashed { challenger_bond_returned, challenger_reward, burned } = outcome {
+            assert_eq!(challenger_bond_returned, custom_bond,
+                "challenger_bond_returned must equal the bond stored in DisputeRecord");
+            // relay_bond is split 50/50 (independent of challenger bond).
+            assert_eq!(challenger_reward + burned, RELAY_BOND_FLOW,
+                "relay_bond total must split into challenger_reward + burned");
+        } else {
+            panic!("Expected DisputeOutcome::RelaySlashed");
+        }
+    }
+
+    /// resolve_dispute_challenger_slashed() uses DisputeRecord.bond for the slash amounts.
+    ///
+    /// relay_reward and burned are computed from `dispute.bond`, not from CHALLENGER_BOND_FLOW.
+    #[test]
+    fn challenger_slash_outcome_uses_record_bond() {
+        let mut store = PendingClaimsStore::default();
+        let ts   = now_ts();
+        let hash = submit_batch(&mut store, &make_batch(1, 1), ts);
+        let custom_bond = 300u64; // 6× default
+        dispute_claim(
+            &mut store, hash, 0, make_batch(1, 1)[0].clone(),
+            challenger_pubkey(), ts, [0u8; 32], custom_bond,
+        ).unwrap();
+        let outcome = resolve_dispute_challenger_slashed(&mut store, hash).unwrap();
+        if let DisputeOutcome::ChallengerSlashed { relay_reward, burned } = outcome {
+            assert_eq!(relay_reward + burned, custom_bond,
+                "relay_reward + burned must equal the stored challenger bond (not CHALLENGER_BOND_FLOW)");
+            let expected_relay_reward = custom_bond * TREASURY_SHARE_BPS / 10_000;
+            assert_eq!(relay_reward, expected_relay_reward,
+                "relay_reward = bond * TREASURY_SHARE_BPS / 10_000");
+        } else {
+            panic!("Expected DisputeOutcome::ChallengerSlashed");
+        }
+    }
+
+    /// force_resolve uses DisputeRecord.bond for the slash amounts (same as challenger slash).
+    #[test]
+    fn force_resolve_uses_record_bond() {
+        let mut store = PendingClaimsStore::default();
+        let ts   = now_ts();
+        let hash = submit_batch(&mut store, &make_batch(1, 1), ts);
+        let custom_bond = 75u64; // 1.5× default
+        dispute_claim(
+            &mut store, hash, 0, make_batch(1, 1)[0].clone(),
+            challenger_pubkey(), ts, [0u8; 32], custom_bond,
+        ).unwrap();
+        let resolve_ts = ts + DISPUTE_RESOLVE_SECONDS + 1;
+        let outcome = force_resolve_dispute(&mut store, hash, resolve_ts).unwrap();
+        if let DisputeOutcome::ChallengerSlashed { relay_reward, burned } = outcome {
+            assert_eq!(relay_reward + burned, custom_bond,
+                "force_resolve must use DisputeRecord.bond, not CHALLENGER_BOND_FLOW");
+        } else {
+            panic!("Expected DisputeOutcome::ChallengerSlashed from force_resolve");
+        }
+    }
+
+    /// Multiple disputes with different bonds each use their own record.
+    #[test]
+    fn multiple_disputes_each_use_own_bond() {
+        let mut store = PendingClaimsStore::default();
+        let ts = now_ts();
+
+        // Two separate claims with different challenger bonds.
+        let records1 = make_batch(1, 1);
+        let records2 = make_batch(1, 100);
+        let hash1 = submit_batch(&mut store, &records1, ts);
+        let hash2 = submit_batch(&mut store, &records2, ts + 1);
+
+        let bond1 = 30u64;
+        let bond2 = 150u64;
+
+        dispute_claim(&mut store, hash1, 0, records1[0].clone(), [0x11u8; 32], ts, [0u8; 32], bond1).unwrap();
+        dispute_claim(&mut store, hash2, 0, records2[0].clone(), [0x22u8; 32], ts + 1, [0u8; 32], bond2).unwrap();
+
+        let d1 = store.disputes.iter().find(|d| d.claim_hash == hash1).unwrap();
+        let d2 = store.disputes.iter().find(|d| d.claim_hash == hash2).unwrap();
+        assert_eq!(d1.bond, bond1, "dispute 1 must store bond1");
+        assert_eq!(d2.bond, bond2, "dispute 2 must store bond2");
     }
 }

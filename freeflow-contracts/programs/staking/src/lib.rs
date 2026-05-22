@@ -28,6 +28,7 @@
 //!   [6] system_program    readonly
 
 use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::program_pack::Pack;
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint,
@@ -46,6 +47,15 @@ use thiserror::Error;
 /// FreeFlow governance multisig address (Foundation authority wallet).
 const GOVERNANCE_PUBKEY: solana_program::pubkey::Pubkey =
     solana_program::pubkey!("8SL4dhnXU9tjvsbwfkVzQbfV99wGnVZBECoiuwrdbaJk");
+
+/// Rewards program ID — used to derive the `slash_authority` PDA that is authorized
+/// to invoke Slash via CPI during dispute resolution (RepFlow-Bond Phase 1).
+///
+/// The rewards program uses `invoke_signed` with seeds `[b"slash_authority"]` to sign
+/// as this PDA. The staking program derives the expected PDA from this program ID
+/// at runtime and accepts it as a second authorized slasher.
+const REWARDS_PROGRAM_PUBKEY: solana_program::pubkey::Pubkey =
+    solana_program::pubkey!("2yeVew5qq5jf5zuoqiE2svVLRE9HTN6J2GfB9LopdM1C");
 
 pub const NETWORK_AUTHORITY_PUBKEY: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
@@ -356,8 +366,17 @@ fn process_slash(
     }
 
     if cfg!(not(feature = "devnet-permissive")) {
-        if *governance.key != GOVERNANCE_PUBKEY {
-            msg!("Unauthorized: signer is not governance");
+        // Derive the rewards program's slash_authority PDA — this is what the rewards
+        // program passes (and signs via invoke_signed) when CPI-ing into Slash.
+        let (slash_authority_pda, _) = solana_program::pubkey::Pubkey::find_program_address(
+            &[b"slash_authority"],
+            &REWARDS_PROGRAM_PUBKEY,
+        );
+        if *governance.key != GOVERNANCE_PUBKEY && *governance.key != slash_authority_pda {
+            msg!(
+                "Unauthorized: signer {} is not governance ({}) or rewards slash_authority ({})",
+                governance.key, GOVERNANCE_PUBKEY, slash_authority_pda,
+            );
             return Err(ProgramError::IllegalOwner);
         }
     }
