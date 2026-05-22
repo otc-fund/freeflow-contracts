@@ -64,7 +64,7 @@ pub struct InitializeUser<'info> {
 /// Mint repFlow to a user's token account.
 ///
 /// Only authorised minters (governance council members) can call this.
-/// Enforces a 100K daily rate limit per user.
+/// Enforces a 277 repFlow daily rate limit per user (24-hour rolling window).
 pub fn mint_repflow(ctx: Context<MintRepFlow>, amount: u64, activity_code: u8) -> Result<()> {
     // Extract config_info before mutable borrow
     let config_bump = ctx.accounts.config.bump;
