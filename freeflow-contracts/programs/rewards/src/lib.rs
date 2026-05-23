@@ -965,8 +965,9 @@ pub enum RewardsInstruction {
     /// Requires the Foundation signer.
     ///
     /// Accounts:
-    ///   0: foundation (signer — Foundation multisig)
-    ///   1: rewards_config (RewardsConfig PDA, writable — pre-created)
+    ///   0: foundation     (signer — Foundation multisig, writable — pays rent)
+    ///   1: rewards_config (RewardsConfig PDA [b"rewards_config"], writable — will be created)
+    ///   2: system_program (SystemProgram)
     InitializeRewardsConfig,
 
     /// Permissionlessly initialize a `UserEscrowReservation` PDA for a user.
@@ -1123,7 +1124,7 @@ pub enum RewardsInstruction {
     ///
     /// Accounts:
     ///   0: foundation       (signer — must equal FOUNDATION_PUBKEY, writable — pays rent)
-    ///   1: treasury_config  (TreasuryConfig PDA [b"treasury_config"], writable — pre-created)
+    ///   1: treasury_config  (TreasuryConfig PDA [b"treasury_config"], writable — will be created)
     ///   2: system_program   (readonly)
     InitializeTreasuryConfig {
         /// Initial authorized treasury wallet pubkeys. At least 1 required, max 5.
@@ -1153,7 +1154,7 @@ pub enum RewardsInstruction {
     ///
     /// Accounts:
     ///   0: foundation    (signer, writable — pays rent)
-    ///   1: bond_config   (BondConfig PDA [b"bond_config"], writable — pre-created)
+    ///   1: bond_config   (BondConfig PDA [b"bond_config"], writable — will be created)
     ///   2: system_program
     InitializeBondConfig {
         /// Target USD value of challenger bond in micro-cents ($1.25 = 125_000).
@@ -4007,56 +4008,80 @@ fn process_release_rewards_ix(
 
 /// Initialize the global `RewardsConfig` PDA.
 ///
-/// Idempotent: if already initialized, returns Ok(()) unchanged.
+/// Creates and funds the PDA account, then writes the initial config.
 /// Sets `migration_mode = true` on first call (Rule 9).
+/// One-shot — refuses to overwrite an already-initialized account.
 ///
 /// Account layout:
-///   0: foundation (signer)
-///   1: rewards_config (RewardsConfig PDA, writable — pre-created with rent-exempt lamports)
+///   0: foundation     (signer — Foundation multisig)
+///   1: rewards_config (RewardsConfig PDA [b"rewards_config"], writable — will be created)
+///   2: system_program (SystemProgram)
 fn process_initialize_rewards_config(
-    _program_id: &Pubkey,
-    accounts:    &[AccountInfo],
+    program_id: &Pubkey,
+    accounts:   &[AccountInfo],
 ) -> ProgramResult {
-    let accounts_iter    = &mut accounts.iter();
-    let foundation       = next_account_info(accounts_iter)?;
+    let accounts_iter     = &mut accounts.iter();
+    let foundation        = next_account_info(accounts_iter)?;
     let rewards_config_ai = next_account_info(accounts_iter)?;
+    let system_prog_info  = next_account_info(accounts_iter)?;
 
     if !foundation.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
     // C-01: Verify the signer is the authorised Foundation multisig.
-    // Without this check, any signer can call this instruction.
     if *foundation.key != FOUNDATION_PUBKEY {
         msg!("InitializeRewardsConfig: unauthorized — signer {} is not Foundation", foundation.key);
         return Err(ProgramError::InvalidArgument);
     }
+    if *system_prog_info.key != system_program::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
 
-    // Fix 1 (Critical): Hard guard — refuse to write if the account already has
-    // valid size and lamports, regardless of whether current data deserializes.
-    //
-    // The prior idempotent pattern fell through to overwrite when Borsh
-    // deserialization failed (e.g. garbage data in a funded PDA), resetting
-    // `foundation_pre_minted = false` and re-enabling a double 200M $FLOW pre-mint.
-    //
-    // Once the config PDA is allocated and funded (first init), it must never be
-    // re-initialized. Callers that need to read the current state should load it
-    // directly; this instruction is a one-shot bootstrap.
+    // Derive and verify the PDA.
+    let (expected_pda, bump) = Pubkey::find_program_address(&[b"rewards_config"], program_id);
+    if *rewards_config_ai.key != expected_pda {
+        msg!(
+            "InitializeRewardsConfig: PDA mismatch — expected {}, got {}",
+            expected_pda, rewards_config_ai.key
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Hard guard — refuse to overwrite an already-initialized account.
+    // Once the config PDA is allocated and funded, it must never be re-initialized.
+    // (Prevents double 200M $FLOW pre-mint by resetting foundation_pre_minted.)
     if rewards_config_ai.data_len() >= RewardsConfig::SIZE && rewards_config_ai.lamports() > 0 {
         msg!("InitializeRewardsConfig: config account already initialized — refusing to overwrite");
         return Err(ProgramError::AccountAlreadyInitialized);
     }
 
+    // Create and fund the PDA account.
+    let rent     = Rent::get()?;
+    let lamports = rent.minimum_balance(RewardsConfig::SIZE);
+    let pda_seeds: &[&[u8]] = &[b"rewards_config", &[bump]];
+    invoke_signed(
+        &system_instruction::create_account(
+            foundation.key,
+            &expected_pda,
+            lamports,
+            RewardsConfig::SIZE as u64,
+            program_id,
+        ),
+        &[foundation.clone(), rewards_config_ai.clone(), system_prog_info.clone()],
+        &[pda_seeds],
+    )?;
+
     let cfg = RewardsConfig {
         migration_mode:        true,  // start in migration mode (Rule 9)
         migration_locked:      false,
-        bump:                  0,
+        bump,
         total_minted:          0,
         max_supply:            RewardsConfig::MAX_SUPPLY,
         foundation_pre_minted: false,
     };
     write_rewards_config(rewards_config_ai, &cfg)?;
 
-    msg!("InitializeRewardsConfig: initialized with migration_mode=true");
+    msg!("InitializeRewardsConfig: initialized with migration_mode=true bump={}", bump);
     Ok(())
 }
 
@@ -4434,12 +4459,13 @@ fn process_update_reward_rates(
 
 /// Initialize the `TreasuryConfig` PDA.
 ///
-/// One-time. Fails with `AccountAlreadyInitialized` if already initialized.
+/// Creates and funds the PDA account, then writes the initial config.
+/// One-time — fails with `AccountAlreadyInitialized` if already initialized.
 /// Only `FOUNDATION_PUBKEY` may call this.
 ///
 /// Account layout:
 ///   0: foundation      (signer — must equal FOUNDATION_PUBKEY, writable — pays rent)
-///   1: treasury_config (TreasuryConfig PDA [b"treasury_config"], writable — pre-created)
+///   1: treasury_config (TreasuryConfig PDA [b"treasury_config"], writable — will be created)
 ///   2: system_program  (readonly)
 fn process_initialize_treasury_config_ix(
     program_id: &Pubkey,
@@ -4449,7 +4475,7 @@ fn process_initialize_treasury_config_ix(
     let accounts_iter       = &mut accounts.iter();
     let foundation          = next_account_info(accounts_iter)?;
     let treasury_config_ai  = next_account_info(accounts_iter)?;
-    let _system_program     = next_account_info(accounts_iter)?;
+    let system_prog_info    = next_account_info(accounts_iter)?;
 
     if !foundation.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -4461,9 +4487,12 @@ fn process_initialize_treasury_config_ix(
         );
         return Err(ProgramError::InvalidArgument);
     }
+    if *system_prog_info.key != system_program::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
 
-    // Verify PDA address.
-    let (expected_pda, _) = Pubkey::find_program_address(&[b"treasury_config"], program_id);
+    // Derive and verify the PDA.
+    let (expected_pda, bump) = Pubkey::find_program_address(&[b"treasury_config"], program_id);
     if *treasury_config_ai.key != expected_pda {
         msg!(
             "InitializeTreasuryConfig: PDA mismatch — expected {}, got {}",
@@ -4490,6 +4519,22 @@ fn process_initialize_treasury_config_ix(
         );
         return Err(ProgramError::InvalidArgument);
     }
+
+    // Create and fund the PDA account.
+    let rent     = Rent::get()?;
+    let lamports = rent.minimum_balance(TreasuryConfig::SIZE);
+    let pda_seeds: &[&[u8]] = &[b"treasury_config", &[bump]];
+    invoke_signed(
+        &system_instruction::create_account(
+            foundation.key,
+            &expected_pda,
+            lamports,
+            TreasuryConfig::SIZE as u64,
+            program_id,
+        ),
+        &[foundation.clone(), treasury_config_ai.clone(), system_prog_info.clone()],
+        &[pda_seeds],
+    )?;
 
     let config = TreasuryConfig {
         authority:     FOUNDATION_PUBKEY.to_bytes(),
@@ -4599,12 +4644,12 @@ fn process_update_treasury_pool_ix(
 
 /// Initialize the `BondConfig` PDA with dynamic bond/stake parameters.
 ///
-/// One-time call by Foundation. The PDA must be pre-allocated with correct
-/// rent via `SystemProgram::createAccountWithSeed` or `createAccount`.
+/// Creates and funds the PDA account, then writes the initial config.
+/// One-time call by Foundation — idempotent (returns Ok if already initialized).
 ///
 /// Accounts:
-///   0: foundation   — signer, writable (payer)
-///   1: bond_config  — BondConfig PDA [b"bond_config"], writable
+///   0: foundation    — signer, writable (payer)
+///   1: bond_config   — BondConfig PDA [b"bond_config"], writable (will be created)
 ///   2: system_program
 fn process_initialize_bond_config_ix(
     program_id:            &Pubkey,
@@ -4614,9 +4659,10 @@ fn process_initialize_bond_config_ix(
     stake_earnings_bps:    u64,
     max_stake_flow:        u64,
 ) -> ProgramResult {
-    let accounts_iter  = &mut accounts.iter();
-    let foundation     = next_account_info(accounts_iter)?;
-    let bond_config_ai = next_account_info(accounts_iter)?;
+    let accounts_iter    = &mut accounts.iter();
+    let foundation       = next_account_info(accounts_iter)?;
+    let bond_config_ai   = next_account_info(accounts_iter)?;
+    let system_prog_info = next_account_info(accounts_iter)?;
 
     if !foundation.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -4624,6 +4670,9 @@ fn process_initialize_bond_config_ix(
     if *foundation.key != FOUNDATION_PUBKEY {
         msg!("InitializeBondConfig: unauthorized signer {}", foundation.key);
         return Err(ProgramError::InvalidArgument);
+    }
+    if *system_prog_info.key != system_program::ID {
+        return Err(ProgramError::IncorrectProgramId);
     }
 
     let (expected_pda, bump) = Pubkey::find_program_address(&[b"bond_config"], program_id);
@@ -4640,6 +4689,22 @@ fn process_initialize_bond_config_ix(
         msg!("InitializeBondConfig: already initialized — skipping");
         return Ok(());
     }
+
+    // Create and fund the PDA account.
+    let rent     = Rent::get()?;
+    let lamports = rent.minimum_balance(BondConfig::SIZE);
+    let pda_seeds: &[&[u8]] = &[b"bond_config", &[bump]];
+    invoke_signed(
+        &system_instruction::create_account(
+            foundation.key,
+            &expected_pda,
+            lamports,
+            BondConfig::SIZE as u64,
+            program_id,
+        ),
+        &[foundation.clone(), bond_config_ai.clone(), system_prog_info.clone()],
+        &[pda_seeds],
+    )?;
 
     let config = BondConfig {
         authority:             foundation.key.to_bytes(),
@@ -4675,9 +4740,9 @@ fn process_initialize_bond_config_ix(
     data[..serialized.len()].copy_from_slice(&serialized);
 
     msg!(
-        "InitializeBondConfig: challenger_bond_cents={} min_stake_usd_cents={} stake_earnings_bps={} max_stake_flow={}",
+        "InitializeBondConfig: challenger_bond_cents={} min_stake_usd_cents={} stake_earnings_bps={} max_stake_flow={} bump={}",
         config.challenger_bond_cents, config.min_stake_usd_cents,
-        config.stake_earnings_bps, config.max_stake_flow,
+        config.stake_earnings_bps, config.max_stake_flow, bump,
     );
     Ok(())
 }

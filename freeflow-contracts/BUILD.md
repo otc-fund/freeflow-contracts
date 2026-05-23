@@ -252,3 +252,44 @@ anchor build --no-idl
 
 Do **not** delete `target/deploy/*.so` — they are the final artefacts.
 Do **not** delete `Cargo.lock`.
+
+### `lock file version 4 requires -Znext-lockfile-bump`
+
+Cargo 1.79 (Solana platform-tools) cannot read Cargo.lock version 4. This
+happens when cargo 1.95+ regenerates the lock file (version 4 is the default
+in newer cargo). The fix is to manually change the lock file header:
+
+```
+# Change this line:
+version = 4
+# To:
+version = 3
+```
+
+Then commit the updated `Cargo.lock`. The package entries are identical between
+versions 3 and 4 — only the header version number differs.
+
+### `rewards-keypair.json` is not the deployed rewards program
+
+**The `target/deploy/rewards-keypair.json` keypair generates pubkey
+`4QToanmYAk16WiBYYPEAR68pNsupg7CnHvWVqnVBuhce`, NOT the deployed program
+`2yeVew5qq5jf5zuoqiE2svVLRE9HTN6J2GfB9LopdM1C`.**
+
+The rewards program was originally deployed with a different keypair that is no
+longer present in the repo. Always deploy upgrades using the program's on-chain
+address string, NOT the keypair file:
+
+```bash
+# CORRECT — use the deployed program ID string
+solana program deploy target/deploy/rewards.so \
+  --url devnet --keypair $WALLET \
+  --program-id 2yeVew5qq5jf5zuoqiE2svVLRE9HTN6J2GfB9LopdM1C
+
+# WRONG — this creates/upgrades a different program at 4QToanmYAk16...
+solana program deploy target/deploy/rewards.so \
+  --url devnet --keypair $WALLET \
+  --program-id target/deploy/rewards-keypair.json
+```
+
+This applies to any program whose keypair file was lost after the original deploy.
+Always verify with `solana-keygen pubkey <keypair.json>` before upgrading.
