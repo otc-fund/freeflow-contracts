@@ -52,6 +52,41 @@ impl RepFlowConfig {
     }
 }
 
+/// Earning activity codes for repFlow minting.
+///
+/// Used by `mint_repflow`, `mint_repflow_from_rewards`, and `claim_daily_uptime_repflow`
+/// to identify the source of earned repFlow in events and sub-limit enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, AnchorSerialize, AnchorDeserialize)]
+pub enum RepFlowEarningActivity {
+    /// Relay uptime contribution. Max 50 repFlow/day sub-limit.
+    Uptime     = 1,
+    /// Bandwidth routed: 1 repFlow per GB. Counts toward 200/day total cap.
+    Bandwidth  = 2,
+    /// 1 repFlow per 1 $FLOW escrowed (client path — separate from relay earning).
+    Escrow     = 3,
+    /// Governance discretionary award (community contribution).
+    Community  = 4,
+    /// Code contribution reward.
+    Code       = 5,
+    /// Challenger won a dispute (earns repFlow for policing the network).
+    DisputeWin = 6,
+}
+
+impl RepFlowEarningActivity {
+    /// Parse an activity code byte into the enum.  Returns `None` for unknown codes.
+    pub fn try_from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Uptime),
+            2 => Some(Self::Bandwidth),
+            3 => Some(Self::Escrow),
+            4 => Some(Self::Community),
+            5 => Some(Self::Code),
+            6 => Some(Self::DisputeWin),
+            _ => None,
+        }
+    }
+}
+
 /// Per-user reputation account — tracks earnings, tier and slash history.
 ///
 /// PDA seeds: [b"repflow_user", wallet_pubkey]
@@ -78,15 +113,29 @@ pub struct RepFlowUser {
     pub milestones_claimed:  u64,
     /// PDA bump seed.
     pub bump:                u8,
+    /// Uptime repFlow minted today (sub-limit tracker).
+    ///
+    /// Resets with `daily_minted` when the daily window rolls over.
+    /// Enforces the 50/day uptime sub-limit — `uptime_daily_minted` ≤ 50 per window.
+    ///
+    /// **Backward compat:** field is appended after `bump`. Existing accounts (initialized
+    /// before this field was added) have zero bytes at this position in the PDA, so
+    /// Borsh deserializes the value as 0, which is the correct default.
+    pub uptime_daily_minted: u64,
 }
 
 impl RepFlowUser {
-    pub const SIZE: usize = 32 + 8 + 8 + 8 + 8 + 8 + 4 + 8 + 8 + 1 + 32;
+    // wallet(32) + balance(8) + lifetime_earned(8) + lifetime_slashed(8)
+    // + daily_minted(8) + daily_window_start(8) + slash_count(4) + last_earned_at(8)
+    // + milestones_claimed(8) + bump(1) + uptime_daily_minted(8) + padding(24)
+    // = 125 bytes (unchanged — absorbed 8 bytes from the 32-byte trailing padding)
+    pub const SIZE: usize = 32 + 8 + 8 + 8 + 8 + 8 + 4 + 8 + 8 + 1 + 8 + 24;
 
     /// On-chain hard cap: 200 repFlow per user per 24-hour window.
-    /// Uptime activity contributes ≤ 50/day; bandwidth 1 repFlow/GB.
-    pub const MAX_DAILY_MINT: u64 = 200;
-    pub const SECS_PER_DAY:   i64 = 86_400;
+    pub const MAX_DAILY_MINT: u64  = 200;
+    /// Uptime sub-limit: at most 50 of the 200 daily cap can come from uptime.
+    pub const MAX_DAILY_UPTIME: u64 = 50;
+    pub const SECS_PER_DAY:    i64 = 86_400;
 
     /// Compute the current repFlow tier from balance.
     pub fn tier(&self) -> RepFlowTierCode {
@@ -99,10 +148,13 @@ impl RepFlowUser {
     }
 
     /// Reset daily mint window if it has expired.
+    ///
+    /// Also resets `uptime_daily_minted` so the 50/day uptime sub-limit renews each window.
     pub fn refresh_daily_window(&mut self, now: i64) {
         if now - self.daily_window_start >= Self::SECS_PER_DAY {
-            self.daily_minted       = 0;
-            self.daily_window_start = now;
+            self.daily_minted        = 0;
+            self.uptime_daily_minted = 0;
+            self.daily_window_start  = now;
         }
     }
 

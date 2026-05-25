@@ -52,4 +52,19 @@ pub enum RepFlowError {
     /// slash_id must equal the user's current slash_count to prevent gaps/replays.
     #[msg("slash_id must equal user's current slash_count (sequential enforcement)")]
     InvalidSlashId,
+
+    /// The CPI caller's rewards_authority PDA does not match the expected rewards program PDA.
+    /// Only the rewards program can call `mint_repflow_from_rewards`.
+    #[msg("Caller is not the authorized rewards program CPI authority")]
+    UnauthorizedRewardsCPI,
+
+    /// Uptime repFlow minting would exceed the 50/day sub-limit for this user.
+    /// Uptime contributes at most 50 of the 200 daily cap.
+    #[msg("Uptime repFlow mint would exceed 50/day sub-limit")]
+    UptimeDailyCapExceeded,
+
+    /// Unknown earning activity code passed to mint_repflow_from_rewards.
+    /// Valid codes: 1=Uptime, 2=Bandwidth, 6=DisputeWin.
+    #[msg("Unknown activity code — valid codes: 1=Uptime, 2=Bandwidth, 6=DisputeWin")]
+    InvalidActivityCode,
 }

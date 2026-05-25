@@ -25,6 +25,10 @@ use state::RepFlowConfig;
 
 declare_id!("8K4GhPEQ1yy9vdTaMPTL83G5qr5ZHZiBm2VBQ58jJs5w");
 
+/// Rewards program ID — used in `mint_repflow_from_rewards` to verify that the
+/// CPI caller's authority PDA is derived from the rewards program.
+pub const REWARDS_PROGRAM_ID: Pubkey = pubkey!("2yeVew5qq5jf5zuoqiE2svVLRE9HTN6J2GfB9LopdM1C");
+
 #[program]
 pub mod repflow_token {
     use super::*;
@@ -121,6 +125,33 @@ pub mod repflow_token {
         activity_code: u8,
     ) -> Result<()> {
         mint::mint_repflow(ctx, amount, activity_code)
+    }
+
+    /// Mint repFlow via the rewards program CPI (automated earning pipeline).
+    ///
+    /// Only callable by the rewards program — verified by checking that
+    /// `rewards_authority` is a signer whose key equals
+    /// `find_pda([b"mint_authority"], REWARDS_PROGRAM_ID)`.
+    ///
+    /// Activity codes: 1=Uptime (≤50/day), 2=Bandwidth (1 per GB), 6=DisputeWin.
+    pub fn mint_repflow_from_rewards(
+        ctx:           Context<MintRepFlowFromRewards>,
+        amount:        u64,
+        activity_code: u8,
+    ) -> Result<()> {
+        mint::mint_repflow_from_rewards(ctx, amount, activity_code)
+    }
+
+    /// Claim daily uptime repFlow (relay-signed, separate from $FLOW release cycle).
+    ///
+    /// The relay wallet signs this instruction to prove liveness.
+    /// Capped at 50/day (uptime sub-limit) plus 200/day (total daily cap).
+    /// The relay sidecar triggers this once per 24-hour window.
+    pub fn claim_daily_uptime_repflow(
+        ctx:    Context<ClaimDailyUptimeRepflow>,
+        amount: u64,
+    ) -> Result<()> {
+        mint::claim_daily_uptime_repflow(ctx, amount)
     }
 
     // ── Slashing (burning) ──────────────────────────────────────────────────

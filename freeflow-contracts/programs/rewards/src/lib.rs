@@ -731,6 +731,75 @@ fn cpi_mint_to<'a>(
     )
 }
 
+/// CPI to repflow-token's `mint_repflow_from_rewards` instruction.
+///
+/// Mints `amount` repFlow tokens to `repflow_ata_ai` for the relay or challenger.
+/// Signs with the rewards program's `mint_authority` PDA (seeds `[b"mint_authority"]`),
+/// which repflow-token verifies as proof that the caller is the rewards program.
+///
+/// Activity codes: 1 = Uptime, 2 = Bandwidth (1 repFlow/GB), 6 = DisputeWin.
+///
+/// Returns `Ok(())` immediately if `amount == 0` (no-op, no CPI needed).
+fn cpi_mint_repflow<'a>(
+    repflow_program_ai: &AccountInfo<'a>,
+    repflow_config_ai:  &AccountInfo<'a>,
+    repflow_user_ai:    &AccountInfo<'a>,
+    repflow_mint_ai:    &AccountInfo<'a>,
+    repflow_ata_ai:     &AccountInfo<'a>,
+    rewards_authority:  &AccountInfo<'a>,
+    token_program_ai:   &AccountInfo<'a>,
+    amount:             u64,
+    activity_code:      u8,
+    mint_authority_bump: u8,
+) -> ProgramResult {
+    if amount == 0 {
+        return Ok(());
+    }
+
+    // Anchor discriminator: sha256("global:mint_repflow_from_rewards")[0..8]
+    let preimage = b"global:mint_repflow_from_rewards";
+    let hash     = solana_program::hash::hashv(&[preimage]);
+    let disc     = &hash.to_bytes()[..8];
+
+    // Instruction data: discriminator(8) + amount(u64 le)(8) + activity_code(u8)(1)
+    let mut data = Vec::with_capacity(17);
+    data.extend_from_slice(disc);
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.push(activity_code);
+
+    use solana_program::instruction::{AccountMeta, Instruction};
+    let ix = Instruction {
+        program_id: *repflow_program_ai.key,
+        accounts:   vec![
+            AccountMeta::new(*repflow_config_ai.key,  false), // config (mut)
+            AccountMeta::new(*repflow_user_ai.key,    false), // repflow_user (mut)
+            AccountMeta::new(*repflow_mint_ai.key,    false), // mint (mut)
+            AccountMeta::new(*repflow_ata_ai.key,     false), // recipient_ata (mut)
+            AccountMeta::new_readonly(*rewards_authority.key, true), // rewards_authority (signer)
+            AccountMeta::new_readonly(*token_program_ai.key, false), // token_program
+        ],
+        data,
+    };
+
+    invoke_signed(
+        &ix,
+        &[
+            repflow_config_ai.clone(),
+            repflow_user_ai.clone(),
+            repflow_mint_ai.clone(),
+            repflow_ata_ai.clone(),
+            rewards_authority.clone(),
+            token_program_ai.clone(),
+            repflow_program_ai.clone(), // callee program must be in account_infos
+        ],
+        &[&[b"mint_authority", &[mint_authority_bump]]],
+    )
+    .map_err(|e| {
+        msg!("cpi_mint_repflow failed (activity={}): {:?}", activity_code, e);
+        e
+    })
+}
+
 pub fn process_instruction(
     program_id: &Pubkey,
     accounts:   &[AccountInfo],
@@ -1352,6 +1421,22 @@ pub struct PendingClaim {
     /// on-chain data will have `None` (old format had no trailing bytes).
     /// The terminal handlers skip reservation settlement for `None` user claims.
     pub user:             Option<[u8; 32]>,
+    /// Total bytes routed in this claim batch — used to calculate repFlow bandwidth reward.
+    ///
+    /// Rate: 1 repFlow per GB (1_073_741_824 bytes).
+    /// Populated by `ClaimUsage` from the sum of `UsageRecordOnChain.bytes` fields.
+    ///
+    /// **Backward compatibility:** Field appended after `user`. Pre-existing claims
+    /// (without this field) will fail to deserialize — clear the pending claims PDA
+    /// before deploying this version on devnet.
+    pub bytes_routed:     u64,
+    /// Total bytes seeded in this claim batch.
+    /// Reserved for future seeding reward calculation. Currently always 0.
+    pub bytes_seeded:     u64,
+    /// Uptime seconds during this claim period.
+    /// Reserved for Approach 1 (uptime-on-release). Currently always 0.
+    /// Uptime repFlow is claimed via `claim_daily_uptime_repflow` (Approach 2).
+    pub uptime_seconds:   u64,
 }
 
 /// Monotonically increasing nonce per escrow PDA for dispute replay protection.
@@ -1990,6 +2075,9 @@ pub fn compute_claim_hash(
 /// Identified by the chain tip (session + nonce + hash) rather than the full batch.
 /// The relay pre-computes `total_amount` and `record_count` from the chain off-chain.
 ///
+/// `bytes_routed` is the sum of `UsageRecordOnChain.bytes` across all records in the batch.
+/// It is stored on the claim so `ReleaseRewards` can calculate the repFlow bandwidth reward.
+///
 /// Returns the `claim_hash` assigned to this batch.
 pub fn submit_claim_with_bond(
     store:        &mut PendingClaimsStore,
@@ -2001,6 +2089,8 @@ pub fn submit_claim_with_bond(
     record_count: u32,
     clock_ts:     i64,
     user_pubkey:  &[u8; 32],
+    bytes_routed: u64,
+    bytes_seeded: u64,
 ) -> [u8; 32] {
     let claim_hash = compute_claim_hash(relay_pubkey, session_id, tip_nonce, tip_hash);
 
@@ -2015,6 +2105,9 @@ pub fn submit_claim_with_bond(
         status:           ClaimStatus::Pending,
         is_force_claim:   false,
         user:             Some(*user_pubkey),
+        bytes_routed,
+        bytes_seeded,
+        uptime_seconds:   0, // Approach 2: uptime repFlow claimed separately
     };
     store.claims.push(claim);
     claim_hash
@@ -2064,6 +2157,8 @@ pub fn force_claim(
     last_activity_ts:   i64,
     session_updated_at: i64,
     user_pubkey:        &[u8; 32],
+    bytes_routed:       u64,
+    bytes_seeded:       u64,
 ) -> Result<([u8; 32], u64), RewardsError> {
     // Gate 1: 24-hour relay-level inactivity check.
     let relay_elapsed = clock_ts.saturating_sub(last_activity_ts);
@@ -2098,6 +2193,9 @@ pub fn force_claim(
         status:           ClaimStatus::Pending,
         is_force_claim:   true,
         user:             Some(*user_pubkey),
+        bytes_routed,
+        bytes_seeded,
+        uptime_seconds:   0,
     };
     store.claims.push(claim);
 
@@ -3076,6 +3174,8 @@ fn process_claim_usage(
         let session_id   = tip.session_id;
         let total_amount: u64 = records.iter().map(|r| r.charge_flow).sum();
         let record_count = records.len() as u32;
+        // Sum bytes routed across all records — stored in PendingClaim for repFlow calc.
+        let bytes_routed: u64 = records.iter().map(|r| r.bytes).sum();
 
         // ── P1: reservation check + increment ─────────────────────────────────
         // If a reservation account is provided, enforce effective-balance check
@@ -3122,6 +3222,8 @@ fn process_claim_usage(
             record_count,
             clock.unix_timestamp,
             &user_pubkey_bytes,
+            bytes_routed,
+            0, // bytes_seeded: not tracked in UsageRecordOnChain
         );
 
         // ── Hold CPI: lock total_amount in FundHold PDA ───────────────────────
@@ -3365,6 +3467,17 @@ fn process_resolve_relay_slashed_ix(
     let staking_treasury_ata_ai  = accounts_iter.next();
     let staking_token_program_ai = accounts_iter.next();
 
+    // ── repFlow accounts (all optional; accounts 15-20) ───────────────────────
+    // Challenger earns repFlow for policing the network (DisputeWin activity).
+    // Rate: 1 repFlow per GB of the disputed traffic (same as bandwidth rate).
+    // Uses rel_mint_authority_ai (account 5) as rewards_authority for signing.
+    let repflow_program_rs_ai      = accounts_iter.next(); // 15: repflow-token program
+    let repflow_config_rs_ai       = accounts_iter.next(); // 16: RepFlowConfig PDA
+    let repflow_chal_user_rs_ai    = accounts_iter.next(); // 17: challenger's RepFlowUser PDA (writable)
+    let repflow_mint_rs_ai         = accounts_iter.next(); // 18: repFlow SPL mint (writable)
+    let repflow_chal_ata_rs_ai     = accounts_iter.next(); // 19: challenger's repFlow ATA (writable)
+    let repflow_token_prog_rs_ai   = accounts_iter.next(); // 20: Token-2022 program
+
     if !challenger.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -3378,7 +3491,7 @@ fn process_resolve_relay_slashed_ix(
     };
 
     // ── P1 Rule 8: terminal guard ──────────────────────────────────────────────
-    let claim_total_amount = {
+    let (claim_total_amount, claim_bytes_routed_rs) = {
         let claim = store
             .claims
             .iter()
@@ -3387,7 +3500,7 @@ fn process_resolve_relay_slashed_ix(
         if claim.status.is_terminal() {
             return Err(DisputeError::ClaimAlreadySettled.into());
         }
-        claim.total_amount
+        (claim.total_amount, claim.bytes_routed)
     };
 
     let outcome = resolve_dispute_relay_slashed(&mut store, claim_hash)
@@ -3436,6 +3549,33 @@ fn process_resolve_relay_slashed_ix(
             "ResolveRelaySlashed: released FundHold — {} $FLOW returned to user escrow",
             claim_total_amount,
         );
+
+        // ── repFlow CPI: challenger earns DisputeWin repFlow ─────────────────
+        // Challenger earns 1 repFlow per GB of the fraudulently-claimed traffic.
+        // Uses rel_mint_authority_ai (ma_ai) as the rewards_authority PDA signer.
+        let repflow_dispute_win = claim_bytes_routed_rs / 1_073_741_824;
+        if let (
+            Some(rfp_ai), Some(rfc_ai), Some(rfcu_ai),
+            Some(rfm_ai), Some(rfcata_ai), Some(rftp_ai),
+        ) = (
+            repflow_program_rs_ai, repflow_config_rs_ai, repflow_chal_user_rs_ai,
+            repflow_mint_rs_ai, repflow_chal_ata_rs_ai, repflow_token_prog_rs_ai,
+        ) {
+            cpi_mint_repflow(
+                rfp_ai, rfc_ai, rfcu_ai, rfm_ai, rfcata_ai,
+                ma_ai,  // rel_mint_authority — rewards_authority PDA signer
+                rftp_ai,
+                repflow_dispute_win,
+                6, // DisputeWin activity code
+                bump,
+            )?;
+            if repflow_dispute_win > 0 {
+                msg!(
+                    "ResolveRelaySlashed repFlow: {} repFlow to challenger (DisputeWin)",
+                    repflow_dispute_win
+                );
+            }
+        }
     }
 
     // ── Phase 6: CPI slash to staking program ────────────────────────────────
@@ -3563,6 +3703,15 @@ fn process_resolve_challenger_slashed_ix(
     // Account 14 (optional): FundHold PDA — activates burn_held_funds path.
     let fund_hold_cs_ai      = accounts_iter.next();
 
+    // ── repFlow accounts (all optional; accounts 15-20) ───────────────────────
+    // When all 6 are present and claim.bytes_routed > 0, mints bandwidth repFlow to relay.
+    let repflow_program_cs_ai    = accounts_iter.next(); // 15: repflow-token program
+    let repflow_config_cs_ai     = accounts_iter.next(); // 16: RepFlowConfig PDA
+    let repflow_user_cs_ai       = accounts_iter.next(); // 17: relay's RepFlowUser PDA (writable)
+    let repflow_mint_cs_ai       = accounts_iter.next(); // 18: repFlow SPL mint (writable)
+    let repflow_relay_ata_cs_ai  = accounts_iter.next(); // 19: relay's repFlow ATA (writable)
+    let repflow_token_prog_cs_ai = accounts_iter.next(); // 20: Token-2022 program
+
     if !relay_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -3576,7 +3725,7 @@ fn process_resolve_challenger_slashed_ix(
     };
 
     // ── P1 Rule 8: terminal guard ──────────────────────────────────────────────
-    let claim_total_amount = {
+    let (claim_total_amount, claim_bytes_routed_cs) = {
         let claim = store
             .claims
             .iter()
@@ -3585,7 +3734,7 @@ fn process_resolve_challenger_slashed_ix(
         if claim.status.is_terminal() {
             return Err(DisputeError::ClaimAlreadySettled.into());
         }
-        claim.total_amount
+        (claim.total_amount, claim.bytes_routed)
     };
 
     let outcome = resolve_dispute_challenger_slashed(&mut store, claim_hash)
@@ -3662,6 +3811,32 @@ fn process_resolve_challenger_slashed_ix(
             "ResolveDisputeChallengerSlashed CPI: burned={}, minted_relay={}, minted_treasury={}",
             claim_total_amount, relay_share, treasury_share
         );
+
+        // ── repFlow CPI: bandwidth repFlow for relay (relay won the dispute) ──
+        // Relay earns repFlow for the bandwidth it legitimately routed.
+        let repflow_bandwidth_cs = claim_bytes_routed_cs / 1_073_741_824;
+        if let (
+            Some(rfp_ai), Some(rfc_ai), Some(rfu_ai),
+            Some(rfm_ai), Some(rfata_ai), Some(rftp_ai),
+        ) = (
+            repflow_program_cs_ai, repflow_config_cs_ai, repflow_user_cs_ai,
+            repflow_mint_cs_ai, repflow_relay_ata_cs_ai, repflow_token_prog_cs_ai,
+        ) {
+            cpi_mint_repflow(
+                rfp_ai, rfc_ai, rfu_ai, rfm_ai, rfata_ai,
+                ma_ai,  // rewards_authority (PDA signer)
+                rftp_ai,
+                repflow_bandwidth_cs,
+                2, // Bandwidth activity code
+                bump,
+            )?;
+            if repflow_bandwidth_cs > 0 {
+                msg!(
+                    "ResolveDisputeChallengerSlashed repFlow: {} repFlow to relay",
+                    repflow_bandwidth_cs
+                );
+            }
+        }
     }
 
     if let DisputeOutcome::ChallengerSlashed { burned, .. } = &outcome {
@@ -3722,6 +3897,15 @@ fn process_force_resolve_ix(
     // Account 14 (mandatory when CPI bridge active): TreasuryConfig PDA.
     let treasury_config_fr_ai = accounts_iter.next();
 
+    // ── repFlow accounts (all optional; accounts 15-20) ───────────────────────
+    // When all 6 are present and claim.bytes_routed > 0, mints bandwidth repFlow to relay.
+    let repflow_program_fr_ai    = accounts_iter.next(); // 15: repflow-token program
+    let repflow_config_fr_ai     = accounts_iter.next(); // 16: RepFlowConfig PDA
+    let repflow_user_fr_ai       = accounts_iter.next(); // 17: relay's RepFlowUser PDA (writable)
+    let repflow_mint_fr_ai       = accounts_iter.next(); // 18: repFlow SPL mint (writable)
+    let repflow_relay_ata_fr_ai  = accounts_iter.next(); // 19: relay's repFlow ATA (writable)
+    let repflow_token_prog_fr_ai = accounts_iter.next(); // 20: Token-2022 program
+
     if !resolver.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -3737,7 +3921,7 @@ fn process_force_resolve_ix(
     };
 
     // ── P1 Rule 8: terminal guard ──────────────────────────────────────────────
-    let claim_total_amount = {
+    let (claim_total_amount, claim_bytes_routed_fr) = {
         let claim = store
             .claims
             .iter()
@@ -3746,7 +3930,7 @@ fn process_force_resolve_ix(
         if claim.status.is_terminal() {
             return Err(DisputeError::ClaimAlreadySettled.into());
         }
-        claim.total_amount
+        (claim.total_amount, claim.bytes_routed)
     };
 
     let outcome = force_resolve_dispute(&mut store, claim_hash, clock.unix_timestamp)
@@ -3810,6 +3994,31 @@ fn process_force_resolve_ix(
             "ForceResolve CPI: burned={}, minted_relay={}, minted_treasury={}",
             claim_total_amount, relay_share, treasury_share
         );
+
+        // ── repFlow CPI: bandwidth repFlow for relay (relay wins by inaction) ──
+        let repflow_bandwidth_fr = claim_bytes_routed_fr / 1_073_741_824;
+        if let (
+            Some(rfp_ai), Some(rfc_ai), Some(rfu_ai),
+            Some(rfm_ai), Some(rfata_ai), Some(rftp_ai),
+        ) = (
+            repflow_program_fr_ai, repflow_config_fr_ai, repflow_user_fr_ai,
+            repflow_mint_fr_ai, repflow_relay_ata_fr_ai, repflow_token_prog_fr_ai,
+        ) {
+            cpi_mint_repflow(
+                rfp_ai, rfc_ai, rfu_ai, rfm_ai, rfata_ai,
+                ma_ai,  // rewards_authority (PDA signer)
+                rftp_ai,
+                repflow_bandwidth_fr,
+                2, // Bandwidth activity code
+                bump,
+            )?;
+            if repflow_bandwidth_fr > 0 {
+                msg!(
+                    "ForceResolve repFlow: {} repFlow minted to relay",
+                    repflow_bandwidth_fr
+                );
+            }
+        }
     }
 
     if let DisputeOutcome::ChallengerSlashed { burned, .. } = &outcome {
@@ -3877,6 +4086,15 @@ fn process_release_rewards_ix(
     // Account 15 (optional): FundHold PDA — activates burn_held_funds path.
     let fund_hold_rr_ai      = accounts_iter.next();
 
+    // ── repFlow accounts (all optional; accounts 16-21) ───────────────────────
+    // When all 6 are present and claim.bytes_routed > 0, mints bandwidth repFlow to relay.
+    let repflow_program_rr_ai    = accounts_iter.next(); // 16: repflow-token program
+    let repflow_config_rr_ai     = accounts_iter.next(); // 17: RepFlowConfig PDA
+    let repflow_user_rr_ai       = accounts_iter.next(); // 18: relay's RepFlowUser PDA (writable)
+    let repflow_mint_rr_ai       = accounts_iter.next(); // 19: repFlow SPL mint (writable)
+    let repflow_relay_ata_rr_ai  = accounts_iter.next(); // 20: relay's repFlow ATA (writable)
+    let repflow_token_prog_rr_ai = accounts_iter.next(); // 21: Token-2022 program
+
     if !relay_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -3892,7 +4110,7 @@ fn process_release_rewards_ix(
     };
 
     // ── P1 Rule 8: terminal guard — check claim is NOT already terminal ────────
-    let claim_total_amount = {
+    let (claim_total_amount, claim_bytes_routed) = {
         let claim = store
             .claims
             .iter()
@@ -3902,7 +4120,7 @@ fn process_release_rewards_ix(
             msg!("ReleaseRewards: claim already in terminal state {:?}", claim.status);
             return Err(DisputeError::ClaimAlreadySettled.into());
         }
-        claim.total_amount
+        (claim.total_amount, claim.bytes_routed)
     };
 
     let (amount, bond, _treasury_penalty) =
@@ -4027,6 +4245,34 @@ fn process_release_rewards_ix(
             "ReleaseRewards CPI: burned={}, minted_relay={}, minted_treasury={}",
             claim_total_amount, relay_share, treasury_share
         );
+
+        // ── repFlow CPI: bandwidth repFlow for relay ──────────────────────────
+        // Activated when all 6 repFlow accounts (16-21) are present.
+        // Rate: 1 repFlow per GB (1_073_741_824 bytes) of claim.bytes_routed.
+        // `ma_ai` is reused as `rewards_authority` — the same PDA signs both CPIs.
+        let repflow_bandwidth = claim_bytes_routed / 1_073_741_824;
+        if let (
+            Some(rfp_ai), Some(rfc_ai), Some(rfu_ai),
+            Some(rfm_ai), Some(rfata_ai), Some(rftp_ai),
+        ) = (
+            repflow_program_rr_ai, repflow_config_rr_ai, repflow_user_rr_ai,
+            repflow_mint_rr_ai, repflow_relay_ata_rr_ai, repflow_token_prog_rr_ai,
+        ) {
+            cpi_mint_repflow(
+                rfp_ai, rfc_ai, rfu_ai, rfm_ai, rfata_ai,
+                ma_ai,   // rewards_authority (PDA signer, reused from $FLOW CPI block)
+                rftp_ai,
+                repflow_bandwidth,
+                2,       // Bandwidth activity code
+                bump,
+            )?;
+            if repflow_bandwidth > 0 {
+                msg!(
+                    "ReleaseRewards repFlow: {} repFlow minted to relay ({}GB bandwidth)",
+                    repflow_bandwidth, claim_bytes_routed / 1_073_741_824
+                );
+            }
+        }
     }
 
     // Credit released amount to the relay's aggregate reward account.
@@ -5674,11 +5920,13 @@ mod tests {
         let session_id   = tip.session_id;
         let total_amount: u64 = records.iter().map(|r| r.charge_flow).sum();
         let record_count = records.len() as u32;
+        let bytes_routed: u64 = records.iter().map(|r| r.bytes).sum();
         // Use the user from the first record (all records in a batch share the same user).
         let user_pubkey  = records[0].user;
         submit_claim_with_bond(
             store, &relay_pubkey(), &session_id, tip_nonce, &tip_hash,
             total_amount, record_count, ts, &user_pubkey,
+            bytes_routed, 0,
         )
     }
 
@@ -6433,7 +6681,7 @@ mod tests {
 
         let result = force_claim(
             &mut store, &relay_pubkey(), &sid, nonce, &tip,
-            1_000_000, 5, clock, last_act, net_act, &client_x(),
+            1_000_000, 5, clock, last_act, net_act, &client_x(), 0, 0,
         );
         assert!(result.is_ok(), "force_claim should succeed: {result:?}");
         assert_eq!(store.claims.len(), 1);
@@ -6449,7 +6697,7 @@ mod tests {
 
         let result = force_claim(
             &mut store, &relay_pubkey(), &sid, nonce, &tip,
-            1_000_000, 5, clock_ts, last_activity_ts, session_updated_at, &client_x(),
+            1_000_000, 5, clock_ts, last_activity_ts, session_updated_at, &client_x(), 0, 0,
         );
         assert_eq!(result, Err(RewardsError::ForceClaimTooEarly));
         assert!(store.claims.is_empty());
@@ -6466,7 +6714,7 @@ mod tests {
 
         let result = force_claim(
             &mut store, &relay_pubkey(), &sid, nonce, &tip,
-            1_000_000, 5, clock_ts, last_activity_ts, session_updated_at, &client_x(),
+            1_000_000, 5, clock_ts, last_activity_ts, session_updated_at, &client_x(), 0, 0,
         );
         assert_eq!(result, Err(RewardsError::SessionStillActive));
         assert!(store.claims.is_empty());
@@ -6481,7 +6729,7 @@ mod tests {
 
         let result = force_claim(
             &mut store, &relay_pubkey(), &sid, nonce, &tip,
-            5_000, 2, clock, last_act, net_act, &client_x(),
+            5_000, 2, clock, last_act, net_act, &client_x(), 0, 0,
         );
         assert!(result.is_ok());
         assert_eq!(store.claims[0].is_force_claim, true);
@@ -6496,7 +6744,7 @@ mod tests {
 
         let (_, penalty) = force_claim(
             &mut store, &relay_pubkey(), &sid, nonce, &tip,
-            total_amount, 1, clock, last_act, net_act, &client_x(),
+            total_amount, 1, clock, last_act, net_act, &client_x(), 0, 0,
         ).unwrap();
 
         assert_eq!(penalty, 2_000); // 20% of 10_000
@@ -6510,7 +6758,7 @@ mod tests {
 
         let (hash, _) = force_claim(
             &mut store, &relay_pubkey(), &sid, nonce, &tip,
-            1_000, 1, clock, last_act, net_act, &client_x(),
+            1_000, 1, clock, last_act, net_act, &client_x(), 0, 0,
         ).unwrap();
 
         let claim = store.claims.iter().find(|c| c.claim_hash == hash).unwrap();
@@ -6528,7 +6776,7 @@ mod tests {
 
         let (hash, _) = force_claim(
             &mut store, &relay_pubkey(), &sid, nonce, &tip,
-            total_amount, 1, clock, last_act, net_act, &client_x(),
+            total_amount, 1, clock, last_act, net_act, &client_x(), 0, 0,
         ).unwrap();
 
         // Release after the dispute window.
@@ -6552,7 +6800,7 @@ mod tests {
 
         let (hash, _) = force_claim(
             &mut store, &relay_pubkey(), &sid, nonce, &tip,
-            1_000, 1, clock, last_act, net_act, &client_x(),
+            1_000, 1, clock, last_act, net_act, &client_x(), 0, 0,
         ).unwrap();
 
         let claim = store.claims.iter().find(|c| c.claim_hash == hash).unwrap();
@@ -6577,13 +6825,13 @@ mod tests {
 
         let (force_hash, _) = force_claim(
             &mut store, &relay_pubkey(), &session_id, 3, &tip_hash,
-            1_000, 1, clock, last_act, net_act, &client_x(),
+            1_000, 1, clock, last_act, net_act, &client_x(), 0, 0,
         ).unwrap();
 
         // Normal claim with a different tip_nonce.
         let normal_hash = submit_claim_with_bond(
             &mut store, &relay_pubkey(), &session_id, 4, &tip_hash,
-            1_000, 1, clock, &client_x(),
+            1_000, 1, clock, &client_x(), 0, 0,
         );
 
         assert_ne!(force_hash, normal_hash, "force_claim and normal claim must have different hashes");
@@ -6597,7 +6845,7 @@ mod tests {
 
         let (_, penalty) = force_claim(
             &mut store, &relay_pubkey(), &sid, nonce, &tip,
-            0, 0, clock, last_act, net_act, &client_x(),
+            0, 0, clock, last_act, net_act, &client_x(), 0, 0,
         ).unwrap();
 
         assert_eq!(penalty, 0, "zero-byte claim has zero penalty");
@@ -6614,7 +6862,7 @@ mod tests {
 
         let result = force_claim(
             &mut store, &relay_pubkey(), &sid, nonce, &tip,
-            5_000, 1, clock_ts, last_activity_ts, session_updated_at, &client_x(),
+            5_000, 1, clock_ts, last_activity_ts, session_updated_at, &client_x(), 0, 0,
         );
 
         // Gate 2 must fire even though gate 1 would pass.
@@ -6634,7 +6882,7 @@ mod tests {
 
         let result = force_claim(
             &mut store, &relay_pubkey(), &sid, nonce, &tip,
-            20_000, 10, clock_ts, last_activity_ts, session_updated_at, &client_x(),
+            20_000, 10, clock_ts, last_activity_ts, session_updated_at, &client_x(), 0, 0,
         );
 
         assert!(result.is_ok(), "3-day-offline client should allow force_claim: {result:?}");
@@ -6747,6 +6995,9 @@ mod tests {
             status:           ClaimStatus::Pending,
             is_force_claim:   false,
             user:             Some(client_x()),
+            bytes_routed:     0,
+            bytes_seeded:     0,
+            uptime_seconds:   0,
         };
         let encoded = borsh::to_vec(&claim).unwrap();
         let decoded: PendingClaim = borsh::from_slice(&encoded).unwrap();
@@ -6769,6 +7020,9 @@ mod tests {
             status:           ClaimStatus::Pending,
             is_force_claim:   false,
             user:             None, // legacy
+            bytes_routed:     0,
+            bytes_seeded:     0,
+            uptime_seconds:   0,
         };
         let encoded = borsh::to_vec(&claim).unwrap();
         let decoded: PendingClaim = borsh::from_slice(&encoded).unwrap();
