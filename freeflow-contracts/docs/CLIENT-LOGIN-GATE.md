@@ -302,32 +302,6 @@ Append every admin action to a tamper-evident log file:
 
 ## Part 3: Solana Programs
 
-### SG1: User Escrow Withdrawal
-
-**Current:** Users can fund escrow, but there's no instruction to withdraw funds back. Funds are locked until consumed by claims or burned.
-
-**What needs to change:**
-
-Add `WithdrawFromEscrow` instruction:
-- Requires user signature
-- Transfers specified amount from UserEscrow token account back to user wallet
-- Fails if withdrawal would bring balance below a minimum reserve (e.g., enough for 1 claim)
-
-**Files to modify:**
-- `freeflow-contracts/programs/user_escrow/src/lib.rs` — add `withdraw_from_escrow` instruction
-
-### SG2: Escrow Balance Cap Per User
-
-**Current:** No limit on how much a single user can hold in escrow.
-
-**What needs to change:**
-
-Add `MAX_ESCROW_BALANCE` constant (or PDA-configurable) to `purchase_and_escrow`. Reject purchases that would push user's escrow balance above the cap.
-
-This prevents a single user from locking up a disproportionate share of the $FLOW supply.
-
-**Files to modify:**
-- `freeflow-contracts/programs/user_escrow/src/lib.rs` — add balance cap check to `purchase_and_escrow`
 
 ### SG3: Reward Rate Fix
 
@@ -335,11 +309,8 @@ This prevents a single user from locking up a disproportionate share of the $FLO
 
 **What needs to change:**
 
-Either:
-- **Option A:** Bump the hardcoded constants in `rewards/lib.rs` to match the on-chain PDA values (routing=1,000,000/MB, uptime=10,000,000,000/hr)
-- **Option B:** Wire `process_claim()` to read from `RewardRatesAccount` PDA and use those values
+-  Wire `process_claim()` to read from `RewardRatesAccount` PDA and use those values
 
-Option A is simpler and doesn't change the PDA interface. Option B is more flexible long-term (rates adjustable without redeploy). Recommend **Option A first, Option B later**.
 
 Also fix the integer division bug: `uptime_seconds / 3600` → use floating point or accumulate uptime across claims.
 

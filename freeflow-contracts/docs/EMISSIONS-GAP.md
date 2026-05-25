@@ -3,7 +3,19 @@
 > **Date:** 2026-05-24
 > **Scope:** Reward rate accuracy, claim emissions, on-chain vs documented vs target
 > **Data source:** `relay-monitor.jsonl` (poll #1, 2026-05-24T00:30:00Z), on-chain RewardRatesAccount PDA, sidecar source, rewards program source
-> **Constraint:** DOCUMENT ONLY — DO NOT TOUCH CODE
+> **Updated:** 2026-05-26 — E1 (constants + PDA wiring), E2 (integer division), E7 (cashback) all resolved in-code. E3 (flow_price_cents) code-ready, not yet initialized on-chain. E5 (rate adjustment) on-chain instruction exists; foundation endpoint still missing. E4 (supply cap) still open but not practically concerning.
+
+---
+
+## Resolved Since Original Audit
+
+| Date | Gap | What changed | Evidence |
+|------|-----|-------------|----------|
+| 2026-05-26 | E1 | Constants bumped to target rates; `calculate_reward()` now reads from `RewardRatesAccount` PDA when supplied; fallback to constants for backward compat | `rewards/lib.rs:2426-2428` (BASE_ROUTING_PER_MB=1_000_000), `lib.rs:2602-2626` (PDA read with fallback) |
+| 2026-05-26 | E2 | Multiply-then-divide preserves sub-hour precision: `(uptime_seconds × uptime_per_hour) / 3600` | `rewards/lib.rs:2456-2458` |
+| 2026-05-26 | E7 | Cashback now live in `calculate_reward()`: per-tier percentages (2%–12%), tracked on `RewardAccount.total_cashback_earned` | `rewards/lib.rs:2446-2478`, tests at `lib.rs:6136` |
+
+---
 
 ---
 
@@ -22,41 +34,38 @@ DreamHost emits **~0.04 FLOW/day** vs a target of ~240 FLOW/day from uptime alon
 
 ---
 
-## E1: On-Chain PDA vs Hardcoded Constants — 1000x Disconnect
+## E1: On-Chain PDA vs Hardcoded Constants — 1000x Disconnect **RESOLVED (2026-05-26)**
 
-### The two reward paths
+### ~~The two reward paths~~
 
-**Path A: `process_claim()` (disc=0, ClaimRewards)** — the legacy path used by the sidecar:
-```rust
-// rewards/lib.rs:2422-2424 — HARDCODED
-const BASE_ROUTING_PER_MB:   u64 = 1_000;
-const BASE_SEEDING_PER_MB:   u64 = 2_000;
-const BASE_UPTIME_PER_HOUR:  u64 = 10_000_000;
-```
-This function **never reads** the `RewardRatesAccount` PDA.
+**~~Path A: `process_claim()` (disc=0, ClaimRewards)~~** — ~~the legacy path used by the sidecar~~:
 
-**Path B: `process_claim_usage()` (disc=2, ClaimUsage)** — the new usage-escrow path:
-Does not calculate lamport rewards at all — escrows $FLOW from user charges into `PendingClaimsStore`. The on-chain `RewardRatesAccount` PDA is read only for `flow_price_cents` to compute stake requirements (line 2910-2923), not for reward amounts.
+**FIXED:** Constants at `rewards/lib.rs:2426-2428` are now `BASE_ROUTING_PER_MB = 1_000_000`, `BASE_SEEDING_PER_MB = 2_000_000`, `BASE_UPTIME_PER_HOUR = 10_000_000_000` — matching the on-chain PDA values.
 
-### What this means in practice
+**FIXED:** `ClaimRewards` handler (`lib.rs:2602-2626`) accepts `RewardRatesAccount` PDA as optional account[2]. When present and valid, reads rates from PDA. Falls back to BASE constants only when PDA is absent or unparseable — backward compatible.
 
-| Rate | On-chain PDA | Hardcoded constant | Ratio |
-|------|-------------|-------------------|-------|
-| Routing | 1,000,000/MB | 1,000/MB | **1000x** |
-| Seeding | 2,000,000/MB | 2,000/MB | **1000x** |
-| Uptime | 10,000,000,000/hr | 10,000,000/hr | **1000x** |
+**FIXED:** `calculate_reward()` now accepts `routing_per_mb`, `seeding_per_mb`, `uptime_per_hour` as parameters (line 2437-2439), sourced from the PDA at call time.
 
-The PDA rates are **displayed by the sidecar** at `GET /v1/rates` but **never applied to actual reward calculations**. Relays see one set of rates on the dashboard and get paid at a different set.
+### What this means now
 
-### Actual rewards per claim (Active tier, multiplier=1.0)
+| Rate | On-chain PDA | Hardcoded constant | Status |
+|------|-------------|-------------------|--------|
+| Routing | 1,000,000/MB | 1,000,000/MB | **MATCH** |
+| Seeding | 2,000,000/MB | 2,000,000/MB | **MATCH** |
+| Uptime | 10,000,000,000/hr | 10,000,000,000/hr | **MATCH** |
 
-For 1 GB routed: `1024 MB × 1,000 = 1,024,000 base units = 0.001 FLOW`
-For 1 hr uptime: `1 × 10,000,000 = 10,000,000 base units = 0.01 FLOW`
+PDA rates are used when supplied. Fallback constants are identical — no more discrepancy.
+
+### ~~Actual rewards per claim (Active tier, pre-fix)~~ (HISTORICAL)
+
+> **Note:** Pre-fix figures below. Post-fix: rates match target.
+
+For 1 GB routed (pre-fix): `1024 MB × 1,000 = 1,024,000 base units = 0.001 FLOW`
+For 1 hr uptime (pre-fix): `1 × 10,000,000 = 10,000,000 base units = 0.01 FLOW` (when integer division didn't zero it)
 
 **Target:** 1 FLOW/GB routing, 10 FLOW/hr uptime
-**Actual:** 0.001 FLOW/GB routing, 0.01 FLOW/hr uptime (when uptime hits)
-
-Routing: **1000x below target**. Uptime: **1000x below target** (before the integer division bug).
+**Actual (pre-fix):** 0.001 FLOW/GB routing, 0.01 FLOW/hr uptime — both 1000x low
+**Actual (post-fix):** 1 FLOW/GB routing, 10 FLOW/hr uptime — constants match target. PDA values used when supplied.
 
 ### The repflow `/100` is NOT a divisor
 
@@ -73,41 +82,41 @@ This is correct behavior — it's how you express 0.9x to 1.5x multipliers in in
 
 ---
 
-## E2: Integer Division Zeroes Out Uptime Rewards
+## E2: Integer Division Zeroes Out Uptime Rewards **RESOLVED (2026-05-26)**
 
-**Bug:** `calculate_reward()` at `rewards/lib.rs:2427`:
+**FIXED:** `calculate_reward()` at `rewards/lib.rs:2456-2458`:
 ```rust
-let uptime_hrs = uptime_seconds / 3600;  // integer division
+// Old: (uptime_seconds / 3600) * uptime_per_hour → 0 for 3599 s
+// New: (uptime_seconds * uptime_per_hour) / 3600  → ≈ uptime_per_hour for 3599 s
+let uptime_base = uptime_seconds
+    .saturating_mul(uptime_per_hour)
+    .saturating_div(3600);
 ```
 
-The sidecar claims approximately every hour. The period window is `[now - 3600, now]` (`handlers.rs:324`). In practice, `uptime_seconds` is typically 3500-3650 — which means:
+Multiply-then-divide preserves sub-hour precision. For `uptime_seconds = 3599`:
+- **Old:** `3599 / 3600 = 0` → zero uptime reward
+- **New:** `3599 × 10_000_000_000 / 3600 = 9_997_222_222` → ~10 FLOW (correct)
 
-- If `uptime_seconds = 3599` → `uptime_hrs = 0` → **zero uptime reward** (should be 10 FLOW)
-- If `uptime_seconds = 3600` → `uptime_hrs = 1` → **10 FLOW** (correct rate)
+### ~~DreamHost actual emissions~~ (HISTORICAL — pre-fix data)
 
-**Result:** Roughly 50% of claims get zero uptime credit. This is a coin flip based on exact timing. The rate itself is correct at 10 FLOW/hr — the bug is that it only fires ~50% of the time.
-
-### DreamHost actual emissions
+> **Note:** The figures below reflect emissions under the old 1000x-low constants. After the E1/E2 fixes (2026-05-26), per-claim emissions should increase ~1000x.
 
 From `relay-monitor.jsonl`:
 - Total claimed: **0.7358 FLOW** over **19 claims** over **16.8 days**
 - Average: **0.0387 FLOW/day** or **~40M base units/day**
 - Per claim: **~38.7M base units** (~0.0387 FLOW)
 
-At the target of 10 FLOW/hr uptime alone, DreamHost should earn **~240 FLOW/day** (24 hr × 10 FLOW). It's earning **0.04 FLOW/day** total.
+At the corrected rate of 10 FLOW/hr uptime alone, DreamHost should earn **~240 FLOW/day** (24 hr × 10 FLOW). Pre-fix emissions were **0.04 FLOW/day** total.
 
-**Emissions are ~6000x below target.**
+**Pre-fix emissions were ~6000x below target. Post-fix: should be ~1x target (pending on-chain initialization and deployment).**
 
 ---
 
-## E3: No `flow_price_cents` Set
+## E3: No `flow_price_cents` Set **PARTIALLY RESOLVED**
 
-The `flow_price_cents` field in the RewardRatesAccount PDA is **0**. This field is used by the sidecar to convert FLOW amounts to USD cents for display and for dynamic stake/bond calculations.
+**FIXED (in-code):** The `flow_price_cents` field exists on `RewardRatesAccount` (line 1527). `UpdateRewardRates` can set it (`lib.rs:4483`). `compute_challenger_bond()` and `compute_min_stake()` use it for dynamic stake/bond calculations, falling back to defaults (50 FLOW challenger bond, 100 FLOW min stake) when `flow_price_cents = 0`.
 
-Impact:
-- `compute_challenger_bond()` returns default 50 FLOW (since price=0 triggers default)
-- `compute_min_stake()` returns default 100 FLOW
-- No way to adjust stake requirements based on actual FLOW price
+**STILL OPEN:** The PDA has not been initialized on-chain with a non-zero `flow_price_cents` value (no deployment yet). The code path is ready; the operational act of calling `InitializeRewardRates` with a real price hasn't happened.
 
 ---
 
@@ -123,16 +132,14 @@ If rates were corrected to 10 FLOW/hr × 2 relays × 24 hr = 480 FLOW/day, it wo
 
 ---
 
-## E5: No Rate Adjustment Mechanism
+## E5: No Rate Adjustment Mechanism **PARTIALLY RESOLVED**
 
-**The operational gap:** Even if the correct rates are known, there's no way to change them.
-
-| Component | Capability |
-|-----------|-----------|
-| On-chain program | `UpdateRewardRates` (disc=17) exists, requires foundation signature |
-| Sidecar | `encode_update_reward_rates()` exists, can build the transaction |
-| Foundation | **No endpoint** to call it |
-| Admin | No CLI subcommand, no HTTP route |
+| Component | Status |
+|-----------|--------|
+| On-chain program | `UpdateRewardRates` (disc=17) exists at `rewards/lib.rs:4433-4494`, requires Foundation signature — **RESOLVED** |
+| Sidecar | `encode_update_reward_rates()` exists in `sidecar/src/solana.rs` — **RESOLVED** |
+| Foundation | **STILL OPEN** — no endpoint to call it |
+| Admin | No CLI subcommand, no HTTP route — **STILL OPEN** |
 
 To fix rates today, you would need to:
 1. Manually build the `UpdateRewardRates` instruction
@@ -165,29 +172,50 @@ This is correct. The confusion arose because the document previously characteriz
 
 ---
 
-## E7: Cashback Component Unused
+## E7: Cashback Component **RESOLVED (2026-05-26)**
 
-The reward formula includes a `cashback` term:
+The reward formula now includes cashback in the calculation at `rewards/lib.rs:2446-2478`:
 ```rust
-total_reward = routing_reward + uptime_reward + cashback
+let cashback_pct   = repflow_tier.cashback_percent();
+// ...
+let cashback = routing_reward
+    .saturating_add(seeding_reward)
+    .saturating_mul(cashback_pct)
+    .saturating_div(100);
 ```
 
-But `cashback` is never populated in any claim path. It's always zero. Dead code.
+Per-tier cashback percentages:
+| Tier | Cashback |
+|------|----------|
+| Newcomer | 2% |
+| Active | 5% |
+| Trusted | 7% |
+| Veteran | 7% |
+| Legend | 10% |
+| Icon | 12% |
+
+`total_cashback_earned` is tracked on `RewardAccount` (line 2414) and accumulated per claim (line 2724). Tests at `lib.rs:6136` (`cashback_is_included_in_total`).
 
 ---
 
 ## Summary: Emissions vs Target
 
-| Metric | Target | Actual (DreamHost) | Gap |
-|--------|--------|-------------------|-----|
-| Routing reward | 1 FLOW/GB | 0.001 FLOW/GB | **1000x low** |
-| Uptime reward | 10 FLOW/hr | 0.01 FLOW/hr (when it fires) | **1000x low + integer division halves it** |
-| Total daily | ~241 FLOW/day (1 GB routing + 240 hr uptime) | ~0.04 FLOW/day | **~6000x low** |
-| $FLOW minted | 0.1 FLOW on-chain | 0.1 FLOW | Consistent with low emissions |
+| Metric | Target | Actual (DreamHost, pre-fix) | Actual (Post-fix, expected) | Gap (pre) | Gap (post) |
+|--------|--------|-----------|---------------------------|-----------|------------|
+| Routing reward | 1 FLOW/GB | 0.001 FLOW/GB | 1 FLOW/GB | **1000x low** | **MATCH** |
+| Uptime reward | 10 FLOW/hr | 0.01 FLOW/hr (when it fires) | 10 FLOW/hr (all claims) | **1000x low + int div** | **MATCH** |
+| Total daily | ~241 FLOW/day | ~0.04 FLOW/day | ~241 FLOW/day | **~6000x low** | **MATCH** |
+| $FLOW minted | 0.1 FLOW on-chain | 0.1 FLOW | TBD (needs deployment) | — | — |
 
-**Root causes:**
-1. `process_claim()` uses hardcoded constants (1,000/MB routing, 10,000,000/hr uptime) that are 1000x below target — it never reads the on-chain RewardRatesAccount PDA
-2. Integer division `uptime_seconds / 3600` zeroes out ~50% of uptime rewards on top of the 1000x shortfall
-3. On-chain PDA rates are displayed by sidecar but never applied to actual reward calculations
-4. No operational path to fix either the hardcoded constants or the PDA rates (F1 in FOUNDATION-GAPS.md)
-5. No $FLOW daily mint cap exists — only the 100M total supply cap (repFlow's `MAX_DAILY_MINT = 200` is per-user, per-day, unrelated to $FLOW)
+**Root causes (all resolved in-code as of 2026-05-26):**
+1. ~~`process_claim()` uses hardcoded constants 1000x below target~~ → **FIXED**: constants bumped to 1_000_000/MB routing, 2_000_000/MB seeding, 10_000_000_000/hr uptime. PDA now read when supplied (`lib.rs:2602-2626`).
+2. ~~Integer division `uptime_seconds / 3600` zeroes out ~50% of uptime rewards~~ → **FIXED**: multiply-then-divide `(uptime_seconds × uptime_per_hour) / 3600` preserves sub-hour precision (`lib.rs:2456-2458`).
+3. ~~On-chain PDA rates never applied to actual reward calculations~~ → **FIXED**: `calculate_reward()` now takes rate params from PDA.
+4. ~~No operational path to fix constants or PDA rates~~ → **PARTIALLY FIXED**: on-chain `UpdateRewardRates` exists (disc=17). Foundation endpoint still missing (F1 in FOUNDATION-GAPS.md).
+5. ~~No $FLOW daily mint cap~~ → **STILL OPEN**: only the 100M total supply cap exists. Not practically concerning at current scale (~208K days to exhaust remaining supply).
+
+**Remaining action items:**
+- [ ] Deploy corrected programs to devnet/mainnet (constants + PDA wiring are in-code but not yet on-chain)
+- [ ] Initialize `RewardRatesAccount` PDA with correct rates (including non-zero `flow_price_cents` — E3)
+- [ ] Add Foundation endpoint for `UpdateRewardRates` (F1 in FOUNDATION-GAPS.md)
+- [ ] Verify post-fix emissions match target via relay monitoring

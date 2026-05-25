@@ -21,7 +21,7 @@
 | 2026-05-24 | G7 | `LatencyMonitor` with 60s baseline, 5x spike, dual-trigger policy | `hopper.rs:79-162` |
 | 2026-05-24 | G12 | `MetricsSnapshot` + tamper-evident periodic persistence | `metrics.rs`, `persistence.rs`, `node.rs:1001` |
 | 2026-05-24 | G17 | `UpdateRewardRates` disc=17 exists on-chain, no foundation endpoint | (open) |
-| 2026-05-25 | G17 | E1/E2 fixed in rewards program: PDA rates read by process_claim, integer division fixed | triton a3e1885, contracts 270b174 |
+| 2026-05-25 | G17 | E1/E2/E7 fixed in rewards program: constants bumped, PDA wired, integer division fixed, cashback live | triton a3e1885, contracts 270b174 |
 | 2026-05-25 | G17 | E5 fixed: `scripts/update-reward-rates.ts` CLI tool created | contracts 270b174 |
 | 2026-05-26 | F1  | `GET /v1/admin/rates` proxies to sidecar `/v1/relay/rates` | triton e2cc421 |
 | 2026-05-26 | F3  | `compute_flush_eta()` replaces hardcoded 3600/86400 stubs | triton e2cc421 |
