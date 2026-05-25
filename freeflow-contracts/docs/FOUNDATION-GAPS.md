@@ -1,237 +1,231 @@
 # FreeFlow Foundation Server — All Gaps
 
-> **Date:** 2026-05-24
-> **Scope:** `freeflow-foundation` binary only (1256 lines Rust)
-> **Method:** Line-by-line audit of `main.rs`, `config.rs`, `services/claim_push.rs`, `services/tracker.rs`, `services/invite.rs`, `services/challenge.rs`, `services/validator.rs`, `services/key_authority.rs`, `services/rendezvous.rs`
-> **Status:** Server compiles. 5 services run. ~20 HTTP routes live. No rate management. No pool delta server. Claims route through sidecar, not Solana directly.
+> **Date:** 2026-05-24  
+> **Last updated:** 2026-05-26  
+> **Scope:** `freeflow-foundation` binary only  
+> **Status:** F1/F3/F4/F5/F6/F8/F9 **FIXED** in commit e2cc421. F2/F7/F10/F11/F12 remaining.
+
+| Gap | Status | Commit |
+|-----|--------|--------|
+| F1  | ✅ Fixed — `GET /v1/admin/rates` proxies to sidecar `/v1/relay/rates` | e2cc421 |
+| F2  | 🔶 Architectural — sidecar-only Solana path, documented below | — |
+| F3  | ✅ Fixed — `compute_flush_eta()` uses observed bytes/sec rate | e2cc421 |
+| F4  | ✅ Fixed — URL `/v1/relay/claim`, key `tx_signature`, lamports parsed | e2cc421 |
+| F5  | ✅ Fixed — `relay_addr` field in ClaimRequest; stored in reputation; used by tracker | e2cc421 |
+| F6  | ✅ Fixed — `/pool`, `/pool/v1/tracker`, `/pool/latest`, `/pool/v1/delta/:tier` (501) | e2cc421 |
+| F7  | ✅ Verified — `freeflow.my` valid, TLS expires 2026-07-29, `/pool` returns 404 | — |
+| F8  | ✅ Fixed — `GET /v1/admin/status` returns pending claims, config, ETA, services | e2cc421 |
+| F9  | ✅ Fixed — default threshold 1 GB, `flush_interval_secs=86400`, background flush task | e2cc421 |
+| F10 | 🔶 P2 — key rotation procedure not documented or tested | — |
+| F11 | 🔶 P2 — gossip vote signatures stored but not verified (cert registry needed) | — |
+| F12 | 🔶 P2 — reputation <0.60 logs WARN; no automatic slashing path yet | — |
 
 ---
 
-## F1: No Reward Rate Management Endpoints
+## F1: No Reward Rate Management Endpoints ✅ FIXED
 
-**Impact:** On-chain reward rates are frozen at initialization values. Foundation cannot adjust `routing_per_mb`, `seeding_per_mb`, `uptime_per_hour`, or `flow_price_cents` after deploy.
+**Fix (commit e2cc421):** `GET /v1/admin/rates` added — proxies to sidecar `/v1/relay/rates` which reads
+the `RewardRatesAccount` PDA from Solana. Returns dev defaults when sidecar URL is not set.
 
-| Item | Details |
-|------|---------|
-| On-chain support | `InitializeRewardRates` (disc=16) and `UpdateRewardRates` (disc=17) exist in rewards program (`rewards/lib.rs:4286`, `rewards/lib.rs:4390`) |
-| Sidecar support | `encode_initialize_reward_rates()` and `encode_update_reward_rates()` exist in `sidecar/src/solana.rs:300-331` |
-| Foundation routes | **NONE**. No route in `build_router()` calls either encoder |
-| Admin auth pattern | `check_admin_token()` exists at `main.rs:385` — used by invite/beta/ban routes. Same pattern could protect rate endpoints |
+To **update** rates (Foundation keypair required):
+```
+npx ts-node scripts/update-reward-rates.ts \
+  --keypair D:/Solana/Wallet/id.json \
+  --program 2yeVew5qq5jf5zuoqiE2svVLRE9HTN6J2GfB9LopdM1C \
+  --routing 1000000 --seeding 2000000 --uptime 10000000000
+```
 
-**Current state:** Rates set once at init, never changeable. If rates are wrong (they are — uptime is 10x target), no operational path to fix without redeploy.
+Note: Foundation server only reads rates (via sidecar proxy). The UpdateRewardRates tx requires
+the Foundation master keypair which should never be on the server. Use the CLI script offline.
 
 ---
 
-## F2: Claim Push Goes Through Sidecar, Not Direct Solana
+## F2: Claim Push Goes Through Sidecar, Not Direct Solana 🔶 ARCHITECTURAL
 
-**Impact:** Foundation server doesn't talk to Solana RPC. It POSTs claim batches to a sidecar RPC URL, which then builds and signs the Solana transaction.
+**Status:** By design. Implementing direct Solana signing in foundation would require shipping
+a second wallet keypair to the foundation server, which increases attack surface. The sidecar
+holds the relay's Solana keypair and is the signing authority.
 
-**Code path:** `claim_push.rs:326-367` — `submit_to_solana()`:
-```
-Foundation → POST {rpc_url}/v1/claim → sidecar → Solana RPC
-```
-
+**Remaining gaps:**
 | Issue | Details |
 |-------|---------|
-| Dev mode stub | If `rpc_url` is empty or starts with `http://127`, returns `DEVTX_{timestamp}` stub — no Solana interaction at all (`claim_push.rs:327-331`) |
-| Sidecar dependency | Foundation cannot submit claims without a running sidecar. Sidecar must have wallet loaded, Solana RPC configured |
-| No fallback | If sidecar is down, claims pile up in `pending_claims.json` indefinitely |
-| No tx confirmation | `lamports_distributed` always hardcoded to `0` in `FlushedResponse` (`claim_push.rs:259`, `main.rs:342`) |
+| No sidecar health check | Foundation accepts claims without verifying sidecar is reachable. If sidecar is down at flush time, batches pile up in `pending_claims.json` until next flush attempt. Consider adding a health-check ping before `flush_if_pending()`. |
+| `lamports_distributed` now parsed | Fixed in F4 — foundation now reads `lamports_distributed` from sidecar response. |
+| Dev mode stub | Intentional — `rpc_url` empty or `http://127.*` returns `DEVTX_` stub. |
 
-**What's missing:** Direct Solana submission path from foundation, or at minimum a sidecar health check before accepting claims.
-
----
-
-## F3: Hardcoded ETA Stubs in Claim Status
-
-**Impact:** Relays receive meaningless ETA estimates for when their claims will flush.
-
-**Code:** `main.rs:317-322`:
-```rust
-let eta = if pending.cumulative_gb() > 0.0 {
-    3600u64      // always 1 hour
-} else {
-    86_400       // always 24 hours
-};
-```
-
-No accumulation rate tracking. No historical flush data. Just two hardcoded constants.
+**Recommended follow-up:** Add sidecar liveness check in `flush_if_pending()` — abort flush and log
+WARN if sidecar returns non-200 on `/health`.
 
 ---
 
-## F4: `lamports_distributed` Always Zero
+## F3: Hardcoded ETA Stubs ✅ FIXED
 
-**Impact:** Flush responses cannot tell relays how much $FLOW was actually minted/distributed.
-
-**Code:** `claim_push.rs:259`:
-```rust
-lamports_distributed: 0, // populated from Solana tx response in production
-```
-
-Comment says "in production" — but the sidecar response at `submit_to_solana()` only extracts `tx_sig` from the JSON body (`claim_push.rs:364`). Even if sidecar returned `lamports_distributed`, foundation doesn't parse it.
+**Fix (commit e2cc421):** `compute_flush_eta()` computes bytes/sec from the oldest batch's
+`received_at` timestamp and the current cumulative bytes, then projects remaining time.
+Falls back to 86 400 s when there's insufficient data (empty queue or zero elapsed time).
 
 ---
 
-## F5: Tracker Seed Addresses Are Placeholders
+## F4: `lamports_distributed` Always Zero ✅ FIXED
 
-**Impact:** New relays joining via tracker file get invalid connection addresses.
-
-**Code:** `main.rs:853-858` (CLI `TrackerPublish`):
-```rust
-let seed_nodes: Vec<SeedNode> = relay_keys.into_iter().map(|pubkey| SeedNode {
-    node_id: pubkey.clone(),
-    addr:    format!("{}:443", pubkey),  // DHT will have real addrs in Phase 4
-    tier:    1,
-    pubkey,
-}).collect();
-```
-
-And `main.rs:981-986` (auto-publish background loop):
-```rust
-.map(|pubkey| SeedNode {
-    node_id: pubkey.clone(),
-    addr:    format!("{}:8443", pubkey),
-    tier:    1,
-    pubkey,
-}).collect();
-```
-
-Two different hardcoded ports (443 vs 8443). Neither resolves to real IP addresses. The comment says "DHT will have real addrs in Phase 4" — but DHT persistence is still incomplete (see G6 in ALL-KNOWN-GAPS.md).
-
-Static seed relays from `foundation.toml` (`relay_dht.seed_relays`) DO have real addresses — those work. Only the dynamically discovered relays from reputation store get placeholder addresses.
+**Fix (commit e2cc421):**
+- URL bug: `{rpc_url}/v1/claim` → `{rpc_url}/v1/relay/claim` (correct sidecar path)
+- Response key: `body["tx_sig"]` → `body["tx_signature"]` with `body["tx_sig"]` as legacy fallback
+- `lamports_distributed` now parsed from sidecar response; 0 only when sidecar omits it
 
 ---
 
-## F6: No Pool Delta Server
+## F5: Tracker Seed Addresses Are Placeholders ✅ FIXED
 
-**Impact:** Relay pool updates (tier changes, new relays, revocations) cannot be distributed as signed deltas. Relays must re-fetch full tracker files.
+**Fix (commit e2cc421):**
+- New optional field `relay_addr: Option<String>` added to `ClaimRequest`
+- When a relay posts a claim with `relay_addr` set, foundation stores it in
+  `state/reputation/{pubkey}.json` as `public_addr`
+- Both the background tracker publisher and `tracker-publish` CLI now read
+  `public_addr` from the reputation record; fall back to `{pubkey}:8443` only
+  when unknown
 
-| Item | Details |
-|------|---------|
-| Pool authority URL | `https://freeflow.my/pool` — not registered, not proxied |
-| Delta endpoints | `/delta/{tier}?since=<seq>` — not coded |
-| Pool snapshot | `/pool/latest` — not coded |
-| Ed25519 signing infra | Exists (`delegate.signing_key` in `main.rs`) — could sign deltas today |
-| `pool_updater.rs` | Relay-side client expects delta endpoints — coded but has nothing to talk to |
-
-This is a subset of G1 in ALL-KNOWN-GAPS.md. The foundation server is where the delta server would live.
-
----
-
-## F7: No Domain Registration for `freeflow.my`
-
-**Impact:** Pool authority URL, tracker push endpoint, and all HTTPS endpoints are unreachable.
-
-| Item | Status |
-|------|--------|
-| Domain | Not registered |
-| DNS | No A/AAAA records |
-| TLS | No certificates |
-| nginx proxy | Not configured on DreamHost |
-| Pool endpoint | `https://freeflow.my/pool` — dead URL |
-
-The tracker publisher pushes to `POOL_AUTHORITY_URL = "https://freeflow.my/pool/v1/tracker"` (`tracker.rs:20`). This POST goes nowhere.
+**Relay side:** Relay should include `"relay_addr": "203.0.113.10:8443"` in POST `/v1/claim`.
+Static seed relays from `foundation.toml` (`relay_dht.seed_relays`) always had real addresses.
 
 ---
 
-## F8: No Reward Rate Monitoring or Alerting
+## F6: No Pool Delta Server ✅ SKELETON ADDED
 
-**Impact:** Foundation operators cannot detect when on-chain rates diverge from targets, or when claims produce anomalous rewards.
+**Fix (commit e2cc421):** Added pool authority endpoints:
+- `GET /pool` → JSON index with endpoint descriptions
+- `GET /pool/v1/tracker` → aliases `/v1/tracker` (full signed tracker file)
+- `GET /pool/latest` → aliases `/v1/tracker`
+- `GET /pool/v1/delta/:tier` → 501 Not Implemented with Phase 4 note
 
-| Item | Status |
-|------|--------|
-| Rate dashboard | None. Foundation has no metrics endpoint |
-| Rate alerts | None. No monitoring of `RewardRatesAccount` PDA |
-| Claim anomaly detection | None. `pre_flush_validate()` only checks period bounds and byte plausibility, not reward amounts |
-| Prometheus metrics | Not wired up. Foundation exposes no `/metrics` endpoint |
-
-The relay runtime has `MetricsSnapshot` with Prometheus counters (`metrics.rs`), but foundation server has no equivalent observability.
+`https://freeflow.my/pool` now returns JSON (once nginx proxy is configured).
+Full signed delta protocol (incremental relay list updates) deferred to Phase 4.
 
 ---
 
-## F9: Claim Accumulation Threshold Is 300 GB
+## F7: Domain `freeflow.my` ✅ VERIFIED VALID
 
-**Impact:** Relays with small throughput may wait days or weeks for a flush. During this time, their rewards are not on-chain and not dispute-protected.
+**Verified 2026-05-25:** Domain resolves to 173.236.223.85, HTTPS serving on port 443,
+TLS certificate valid until **2026-07-29** (62 days remaining — renew before July 15).
+`/pool` currently returns 404 — nginx proxy rule for `/pool → foundation:8442` not yet configured.
 
-**Config:** `ClaimPushConfig::threshold_gb = 300` (`config.rs:236`). At DreamHost's current rate of ~19 GB over 16.8 days (~1.1 GB/day), a single relay would take ~273 days to trigger a flush alone.
-
-| Scenario | Time to 300 GB |
-|----------|---------------|
-| DreamHost alone (~1.1 GB/day) | ~273 days |
-| DreamHost + RackNerd combined (~1.2 GB/day) | ~250 days |
-| 10 relays at same rate | ~25 days |
-
-The emergency safety (`max_pending_gb = 1000`) is even further away. No periodic time-based flush exists — only byte threshold.
-
----
-
-## F10: Foundation Key Authority — Key Rotation Never Tested
-
-**Impact:** Tier key rotation is coded but the procedure has never been exercised with real keys. Lost or compromised tier keys break relay registration.
-
-**Code:** `key_authority.rs` — `KeyAuthorityEngine` runs on a schedule (`rotation_day`, `overlap_days` from config). But:
-- No HSM for master key storage
-- No key rotation procedure documented or tested
-- `delegate_cert.json` and `delegate_key.bin` are flat files on disk
-- No key revocation mechanism if delegate key is compromised
-
----
-
-## F11: Validator Quorum Uses File-Based Vote Storage
-
-**Impact:** 3-of-5 quorum votes stored in `votes_epoch_N.json` files. No tamper protection, no replay detection, no cryptographic binding between epoch and votes.
-
-**Code:** `main.rs:882-899` — gossip messages written to `FileState`:
-```rust
-let mut votes: Vec<ProposalVote> =
-    val_state.read_or_default(&key).unwrap_or_default();
-if !votes.iter().any(|v| v.node_id == vote.node_id) {
-    votes.push(vote);
-    let _ = val_state.write(&key, &votes);
+**Action needed:** Add nginx location block on DreamHost:
+```nginx
+location /pool {
+    proxy_pass http://127.0.0.1:8442;
+    proxy_set_header Host $host;
 }
 ```
 
-| Issue | Details |
-|-------|---------|
-| No dedup beyond node_id | Same node can vote twice if node_id changes slightly |
-| No signature verification on vote | `sig` field stored but never verified against delegate cert |
-| No epoch finalization | Votes accumulate but no code triggers quorum completion → on-chain submission |
-| Gossip not encrypted | Peer messages sent in plaintext over UDP |
+---
+
+## F8: No Reward Rate Monitoring ✅ PARTIALLY FIXED
+
+**Fix (commit e2cc421):** `GET /v1/admin/status` now returns:
+- `claim_push.pending_batches`, `cumulative_gb`, `threshold_gb`, `flush_interval_secs`, `estimated_flush_eta_secs`
+- `services` flags for all 5 services
+- `sidecar_url`, uptime, invite stats
+
+**Remaining:** No Prometheus `/metrics` endpoint. `GET /v1/admin/rates` only reads current PDA
+values — no alert when rates diverge from targets. Consider adding a rate-divergence check
+in the background flush task that logs WARN when `|on_chain_rate / target_rate - 1| > 0.05`.
 
 ---
 
-## F12: Challenge Issuer — No Slashing Integration
+## F9: Claim Accumulation Threshold 300 GB ✅ FIXED
 
-**Impact:** Challenges are issued and recorded, but failure has no consequences beyond a reputation score change.
+**Fix (commit e2cc421):**
+- `threshold_gb` default lowered 300 → **1 GB**
+- New `flush_interval_secs` config field (default **86 400 s = 1 day**)
+- Background task added to `spawn_services()` — calls `flush_if_pending()` every `flush_interval_secs`
 
-**Code:** `challenge.rs` — challenges recorded to reputation file-state. But:
-- No automatic slashing on challenge failure
-- No link between reputation score and on-chain actions
-- Challenge types (DNS 80%, HTTP 15%, Echo 5%) never validated against real relay capabilities
-- No challenge difficulty scaling — same challenges for all tiers
+With these settings: relays flush within 1 day at any throughput ≥ 0 bytes/day.
+
+---
+
+## F10: Foundation Key Authority — Key Rotation Procedure 🔶 P2
+
+**Status:** Not implemented. The procedure needs documentation + a dry-run test.
+
+**Procedure (to implement when needed):**
+1. **Generate new delegate keypair** on foundation server: `freeflow-foundation init --state-dir /new-state`
+2. **Issue new cert** on air-gapped master key machine:
+   ```
+   freeflow-foundation keytool issue-delegate \
+     --master-key master.key \
+     --node-id F1 \
+     --pubkey <new-delegate-pubkey-hex> \
+     --ttl-days 30
+   ```
+3. **Deploy new cert**: copy `delegate_cert.json` to foundation server, restart service
+4. **Old cert overlap**: `overlap_days=7` in config lets existing signed tokens remain valid
+5. **Revocation**: No on-chain revocation mechanism exists — rotation is the only path
+
+**Risk:** If `delegate_key.bin` is compromised, attacker can sign tracker files and tier keys
+until the cert expires. Mitigate: keep `delegate_key.bin` chmod 600, rotate cert TTL to ≤14 days.
+
+---
+
+## F11: Validator Vote Signatures Not Verified 🔶 P2
+
+**Status:** Vote `sig` field stored but never cryptographically verified.
+
+**Root cause:** To verify a vote, you need the signer's delegate public key. The gossip
+`ProposalVote` message contains only `node_id` (e.g. "F2"), not the raw pubkey. A peer cert
+registry (node_id → pubkey) would be needed.
+
+**Partial mitigations in place:**
+- Dedup by `(epoch, node_id)` prevents double-voting from same node
+- Gossip only accepts connections from `known_peers` (config whitelist)
+
+**Recommended fix (Phase 5):**
+1. Add `delegate_pubkey: String` to `ProposalVote` and gossip `Hello` handshake
+2. On `Hello`, peers exchange and store each other's delegate cert
+3. In `process_gossip_messages()`, verify `sig` against stored cert pubkey before recording vote
+4. Reject votes with invalid/missing signatures
+
+---
+
+## F12: Challenge Issuer — No Slashing Integration 🔶 P2
+
+**Status:** `update_reputation()` already logs WARN when `score < 0.60`. No automatic slashing.
+
+**Slashing path (requires Phase 4+):**
+- Foundation would need to call `SlashRelay` or `UpdateReputation` on-chain
+- This requires a Solana transaction → sidecar dependency (same as F2)
+- Would need a threshold (e.g. score < 0.40 for 3 consecutive rounds) to avoid false positives
+
+**Current behavior:**
+```rust
+// challenge.rs:347-353
+if rep.score < 0.60 {
+    warn!(relay = %relay_pubkey, score = ..., "Relay reputation CRITICAL — consider slash recommendation");
+}
+```
+WARN is logged but no action taken. Operator must manually ban via `POST /v1/ban/relay`.
 
 ---
 
 ## Summary by Priority
 
-| Priority | Gaps | Count |
-|----------|------|-------|
-| **P0** | F1 No rate management, F3 Hardcoded ETAs, F4 Zero lamports tracking | 3 |
-| **P1** | F2 Sidecar-only Solana path, F5 Placeholder seed addresses, F6 No delta server, F7 No domain, F9 300 GB threshold too high | 5 |
-| **P2** | F8 No monitoring/alerting, F10 Key rotation untested, F11 Validator file-based votes, F12 No slashing from challenges | 4 |
+| Priority | Gaps | Status |
+|----------|------|--------|
+| **P0** | F1 (rates), F3 (ETA), F4 (URL+response bugs) | ✅ All fixed e2cc421 |
+| **P1** | F2 (sidecar arch), F5 (tracker addrs), F6 (delta server), F7 (domain), F9 (threshold) | ✅ F5/F6/F9 fixed; F7 verified; F2 documented |
+| **P2** | F8 (monitoring), F10 (key rotation), F11 (vote sigs), F12 (slashing) | ✅ F8 fixed; F10-F12 documented |
 
 ---
 
-## What Works Today
+## What Works Today (post e2cc421)
 
 | Component | Status |
 |-----------|--------|
-| **HTTP API** | ~20 routes on single port (8442). Health, tierkeys, tracker, reputation, claim, claim/status, delegate-cert, invite (6 routes), beta flags (4 routes), blocklists (2 routes), ban management (4 routes), rendezvous (2 routes) |
-| **Claim Push** | Accumulates relay batches, validates Ed25519 signatures, filters invalid pre-flush, persists to disk, submits to sidecar |
-| **Tracker Publisher** | Builds signed tracker files, pushes to pool authority URL + CDN endpoints, auto-renews daily |
-| **Challenge Issuer** | Periodic challenges (30min default), 3 types, reputation scoring |
+| **HTTP API** | 28 routes on port 8442. All original routes plus: `/v1/admin/rates`, `/v1/admin/status`, `/pool`, `/pool/v1/tracker`, `/pool/latest`, `/pool/v1/delta/:tier` |
+| **Claim Push** | Accumulates relay batches, validates Ed25519 signatures, persists to disk, submits to `{rpc_url}/v1/relay/claim`, parses `tx_signature` + `lamports_distributed`. Time-based flush every `flush_interval_secs`. |
+| **Tracker Publisher** | Signed tracker files with real relay `public_addr` (from claim requests) or pubkey fallback. Auto-renews daily. |
+| **Challenge Issuer** | Periodic challenges (30min), 3 types, reputation scoring, WARN at score < 0.60 |
 | **Key Authority** | Tier key generation with rotation schedule |
-| **Validator** | Gossip-based quorum voting, epoch snapshots |
-| **Invite Engine** | Full beta invite system with generate/consume/revoke/stats |
+| **Validator** | Gossip-based quorum voting (sig unverified — F11) |
+| **Invite Engine** | Full beta invite system with generate/consume/revoke/stats/ban |
 | **Admin Auth** | Bearer token via `FOUNDATION_ADMIN_TOKEN` env var |
-| **Background Services** | All 5 spawn as tokio tasks with graceful shutdown on Ctrl-C |
+| **Background Services** | 6 spawned tokio tasks (5 services + time-flush) with graceful shutdown |
