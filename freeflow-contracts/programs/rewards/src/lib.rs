@@ -3,7 +3,7 @@
 //! Reward formula (repFlow-based, replacing old tier multipliers):
 //!   routing_reward = routing_mb × BASE_ROUTING_PER_MB × repflow_multiplier_bps / 100
 //!   seeding_reward = seeding_mb × BASE_SEEDING_PER_MB × repflow_multiplier_bps / 100
-//!   uptime_reward  = uptime_hrs × BASE_UPTIME_PER_HOUR
+//!   uptime_reward  = uptime_seconds × uptime_per_hour / 3600    (sub-hour precision)
 //!   cashback       = (routing + seeding) × repflow_cashback_pct / 100
 //!   total          = routing + seeding + uptime + cashback
 //!
@@ -1537,12 +1537,12 @@ impl RewardRatesAccount {
     /// Byte size for account allocation: 32 + 8*5 + 8 + 8 + 1 = 89 bytes.
     pub const SIZE: usize = 32 + 8 + 8 + 8 + 8 + 8 + 8 + 1;
 
-    /// Default routing reward per megabyte (matches hardcoded relay constant).
-    pub const DEFAULT_ROUTING_PER_MB:  u64 = 1_000;
-    /// Default seeding reward per megabyte (matches hardcoded relay constant).
-    pub const DEFAULT_SEEDING_PER_MB:  u64 = 2_000;
-    /// Default uptime reward per hour (matches hardcoded relay constant).
-    pub const DEFAULT_UPTIME_PER_HOUR: u64 = 10_000_000;
+    /// Default routing reward per megabyte (target: 1 FLOW/GB).
+    pub const DEFAULT_ROUTING_PER_MB:  u64 = 1_000_000;
+    /// Default seeding reward per megabyte (target: 2 FLOW/GB).
+    pub const DEFAULT_SEEDING_PER_MB:  u64 = 2_000_000;
+    /// Default uptime reward per hour (target: 10 FLOW/hr).
+    pub const DEFAULT_UPTIME_PER_HOUR: u64 = 10_000_000_000;
 }
 
 // ─── TreasuryConfig ───────────────────────────────────────────────────────────
@@ -2419,9 +2419,13 @@ impl RewardAccount {
         32 + 8 + 8 + 8 + 8 + 8 + 8 + 1 + 1
         + 8 + 1 + 8;
 
-    const BASE_ROUTING_PER_MB:   u64 = 1_000;
-    const BASE_SEEDING_PER_MB:   u64 = 2_000;
-    const BASE_UPTIME_PER_HOUR:  u64 = 10_000_000;
+    // Target emission rates (E1 fix — previously 1000× below on-chain PDA values).
+    // Routing:  1 FLOW/GB  = 10^9 base units / 1024 MB ≈ 1_000_000 base units/MB
+    // Seeding:  2 FLOW/GB  ≈ 2_000_000 base units/MB
+    // Uptime:   10 FLOW/hr = 10 × 10^9 = 10_000_000_000 base units/hr
+    const BASE_ROUTING_PER_MB:   u64 = 1_000_000;
+    const BASE_SEEDING_PER_MB:   u64 = 2_000_000;
+    const BASE_UPTIME_PER_HOUR:  u64 = 10_000_000_000;
     const MIN_CLAIM_INTERVAL:    i64 = 86_400;
 
     pub fn calculate_reward(
@@ -2430,18 +2434,28 @@ impl RewardAccount {
         bytes_seeded:    u64,
         uptime_seconds:  u64,
         repflow_balance: u64,
+        routing_per_mb:  u64,   // from RewardRatesAccount PDA; use BASE_ROUTING_PER_MB as default
+        seeding_per_mb:  u64,   // from RewardRatesAccount PDA; use BASE_SEEDING_PER_MB as default
+        uptime_per_hour: u64,   // from RewardRatesAccount PDA; use BASE_UPTIME_PER_HOUR as default
     ) -> u64 {
-        let routing_mb = bytes_routed   / (1024 * 1024);
-        let seeding_mb = bytes_seeded   / (1024 * 1024);
-        let uptime_hrs = uptime_seconds / 3600;
+        let routing_mb = bytes_routed / (1024 * 1024);
+        let seeding_mb = bytes_seeded / (1024 * 1024);
 
         let repflow_tier   = RepFlowTier::from_balance(repflow_balance);
         let multiplier_bps = repflow_tier.reward_multiplier_bps();
         let cashback_pct   = repflow_tier.cashback_percent();
 
-        let routing_base = routing_mb * Self::BASE_ROUTING_PER_MB;
-        let seeding_base = seeding_mb * Self::BASE_SEEDING_PER_MB;
-        let uptime_base  = uptime_hrs * Self::BASE_UPTIME_PER_HOUR;
+        let routing_base = routing_mb.saturating_mul(routing_per_mb);
+        let seeding_base = seeding_mb.saturating_mul(seeding_per_mb);
+
+        // E2 fix: multiply-then-divide to preserve sub-hour precision.
+        // Old: (uptime_seconds / 3600) * uptime_per_hour → 0 for 3599 s
+        // New: (uptime_seconds * uptime_per_hour) / 3600  → ≈ uptime_per_hour for 3599 s
+        // Note: uptime_per_hour = 10_000_000_000 fits in u64; uptime_seconds ≤ 172_800 (48h cap).
+        // Max product: 172_800 × 10_000_000_000 = 1.728×10^15 < u64::MAX (1.84×10^19) — safe.
+        let uptime_base = uptime_seconds
+            .saturating_mul(uptime_per_hour)
+            .saturating_div(3600);
 
         // H-01: Use saturating arithmetic to prevent silent integer overflow
         // when bytes_routed or bytes_seeded are abnormally large. Saturating at
@@ -2585,6 +2599,32 @@ fn process_claim(
     let relay_wallet   = next_account_info(accounts_iter)?;
     let reward_account = next_account_info(accounts_iter)?;
 
+    // account[2] (optional, readonly): RewardRatesAccount PDA [b"reward_rates"]
+    // When present and valid, live PDA rates are used for reward calculation (E1 fix).
+    // When absent or unparseable, falls back to BASE_* constants (backward compatible).
+    let reward_rates_ai = accounts_iter.next();
+    let (routing_per_mb, seeding_per_mb, uptime_per_hour) = match reward_rates_ai {
+        Some(ai) if ai.lamports() > 0 && ai.data_len() >= RewardRatesAccount::SIZE => {
+            match RewardRatesAccount::try_from_slice(&ai.try_borrow_data()?) {
+                Ok(rr) => {
+                    msg!(
+                        "ClaimRewards: PDA rates routing={}/MB seeding={}/MB uptime={}/hr",
+                        rr.routing_per_mb, rr.seeding_per_mb, rr.uptime_per_hour
+                    );
+                    (rr.routing_per_mb, rr.seeding_per_mb, rr.uptime_per_hour)
+                }
+                Err(_) => {
+                    msg!("ClaimRewards: reward_rates PDA parse failed — using fallback constants");
+                    (RewardAccount::BASE_ROUTING_PER_MB, RewardAccount::BASE_SEEDING_PER_MB, RewardAccount::BASE_UPTIME_PER_HOUR)
+                }
+            }
+        }
+        _ => {
+            msg!("ClaimRewards: no reward_rates PDA supplied — using fallback constants");
+            (RewardAccount::BASE_ROUTING_PER_MB, RewardAccount::BASE_SEEDING_PER_MB, RewardAccount::BASE_UPTIME_PER_HOUR)
+        }
+    };
+
     if !relay_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -2642,7 +2682,10 @@ fn process_claim(
         }
     }
 
-    let reward = state.calculate_reward(bytes_routed, bytes_seeded, uptime_seconds, repflow_balance);
+    let reward = state.calculate_reward(
+        bytes_routed, bytes_seeded, uptime_seconds, repflow_balance,
+        routing_per_mb, seeding_per_mb, uptime_per_hour,
+    );
     if reward == 0 {
         msg!("No rewards to claim");
         return Err(ProgramError::InvalidInstructionData);
@@ -2652,13 +2695,13 @@ fn process_claim(
     let cashback_pct  = repflow_tier.cashback_percent();
     let routing_mb    = bytes_routed / (1024 * 1024);
     let seeding_mb    = bytes_seeded / (1024 * 1024);
-    // H-01: Use saturating arithmetic throughout — mirrors calculate_reward().
+    // H-01: Use saturating arithmetic throughout — mirrors calculate_reward() with PDA rates.
     let routing_r     = routing_mb
-        .saturating_mul(RewardAccount::BASE_ROUTING_PER_MB)
+        .saturating_mul(routing_per_mb)
         .saturating_mul(repflow_tier.reward_multiplier_bps())
         .saturating_div(100);
     let seeding_r     = seeding_mb
-        .saturating_mul(RewardAccount::BASE_SEEDING_PER_MB)
+        .saturating_mul(seeding_per_mb)
         .saturating_mul(repflow_tier.reward_multiplier_bps())
         .saturating_div(100);
     let cashback      = routing_r
@@ -6067,14 +6110,23 @@ mod tests {
         assert_eq!(tier.reward_multiplier_bps(), 100, "Active: 1.0× (no change)");
     }
 
+    // Helper: return current BASE_* constants as a rate tuple so tests
+    // don't need to repeat the three constant names.
+    fn default_rates() -> (u64, u64, u64) {
+        (RewardAccount::BASE_ROUTING_PER_MB,
+         RewardAccount::BASE_SEEDING_PER_MB,
+         RewardAccount::BASE_UPTIME_PER_HOUR)
+    }
+
     #[test]
     fn icon_earns_more_than_newcomer() {
+        let (r, s, u) = default_rates();
         let bytes  = 100 * 1024 * 1024 * 1024_u64;
         let uptime = 3600_u64;
-        let icon    = make_account(100_000);
+        let icon     = make_account(100_000);
         let newcomer = make_account(0);
-        let icon_r   = icon.calculate_reward(bytes, bytes, uptime, 100_000);
-        let newc_r   = newcomer.calculate_reward(bytes, bytes, uptime, 0);
+        let icon_r   = icon.calculate_reward(bytes, bytes, uptime, 100_000, r, s, u);
+        let newc_r   = newcomer.calculate_reward(bytes, bytes, uptime, 0, r, s, u);
         assert!(icon_r > newc_r);
         let ratio = icon_r as f64 / newc_r as f64;
         assert!(ratio > 1.5, "Icon/Newcomer ratio must exceed 1.5× (got {ratio:.2}×)");
@@ -6082,11 +6134,12 @@ mod tests {
 
     #[test]
     fn cashback_is_included_in_total() {
+        let (r, s, u) = default_rates();
         let routing_mb = 1024u64;
         let bytes      = routing_mb * 1024 * 1024;
         let icon       = make_account(100_000);
-        let total      = icon.calculate_reward(bytes, 0, 0, 100_000);
-        let base       = routing_mb * RewardAccount::BASE_ROUTING_PER_MB;
+        let total      = icon.calculate_reward(bytes, 0, 0, 100_000, r, s, u);
+        let base       = routing_mb * r;
         let multiplied = base * 150 / 100;
         let cashback   = multiplied * 12 / 100;
         let expected   = multiplied + cashback;
@@ -6095,23 +6148,26 @@ mod tests {
 
     #[test]
     fn uptime_reward_not_multiplied() {
+        let (r, s, u) = default_rates();
         let uptime_hrs = 24u64;
         let uptime_s   = uptime_hrs * 3600;
-        let icon    = make_account(100_000);
+        let icon     = make_account(100_000);
         let newcomer = make_account(0);
-        let uptime_expected = uptime_hrs * RewardAccount::BASE_UPTIME_PER_HOUR;
-        assert_eq!(icon.calculate_reward(0, 0, uptime_s, 100_000), uptime_expected);
-        assert_eq!(newcomer.calculate_reward(0, 0, uptime_s, 0),    uptime_expected);
+        // With full hours the new formula gives the same result as the old one.
+        let uptime_expected = uptime_hrs * u;
+        assert_eq!(icon.calculate_reward(0, 0, uptime_s, 100_000, r, s, u), uptime_expected);
+        assert_eq!(newcomer.calculate_reward(0, 0, uptime_s, 0, r, s, u),   uptime_expected);
     }
 
     #[test]
     fn rewards_calculation_with_repflow_veteran() {
+        let (r, s, u) = default_rates();
         let routing_mb   = 1024u64;
         let bytes_routed = routing_mb * 1024 * 1024;
         let repflow_bal  = 15_000;
         let acct         = make_account(repflow_bal);
-        let total        = acct.calculate_reward(bytes_routed, 0, 0, repflow_bal);
-        let base         = routing_mb * RewardAccount::BASE_ROUTING_PER_MB;
+        let total        = acct.calculate_reward(bytes_routed, 0, 0, repflow_bal, r, s, u);
+        let base         = routing_mb * r;
         let mult         = base * 130 / 100;
         let cashback     = mult * 7 / 100;
         assert_eq!(total, mult + cashback);
@@ -6119,8 +6175,56 @@ mod tests {
 
     #[test]
     fn zero_activity_zero_reward() {
+        let (r, s, u) = default_rates();
         let acct = make_account(5_000);
-        assert_eq!(acct.calculate_reward(0, 0, 0, 5_000), 0);
+        assert_eq!(acct.calculate_reward(0, 0, 0, 5_000, r, s, u), 0);
+    }
+
+    // ─── E2 regression: partial-hour uptime earns proportional reward ────────
+
+    #[test]
+    fn uptime_partial_hour_earns_proportional_reward() {
+        // E2 fix: 3599 s should earn almost 1 full hour — NOT zero.
+        // Old formula: (3599 / 3600) * rate = 0  (integer division truncates)
+        // New formula: (3599 * rate) / 3600     ≈ rate (99.97% of 1 hr)
+        let (r, s, u) = default_rates();
+        let acct     = make_account(2_000); // Active tier, 1.0× multiplier
+        let uptime_s = 3599_u64;
+
+        let actual   = acct.calculate_reward(0, 0, uptime_s, 2_000, r, s, u);
+        let expected = uptime_s.saturating_mul(u).saturating_div(3600);
+
+        assert!(expected > 0, "3599 s must yield non-zero uptime reward");
+        assert_eq!(actual, expected, "actual must equal multiply-then-divide formula");
+        // Must be ≥ 99 % of 1 full-hour reward.
+        assert!(actual >= u * 99 / 100,
+            "3599 s should earn ≥99%% of 1 hr reward; got {actual}, 1hr reward={u}");
+    }
+
+    // ─── E1 regression: 1000× higher rates produce 1000× reward ────────────
+
+    #[test]
+    fn higher_rates_yield_proportionally_higher_rewards() {
+        // Shape of E1: PDA stores 1_000_000/MB; old hardcoded = 1_000/MB (1000× gap).
+        // Verify calculate_reward() scales linearly with the rate parameters.
+        let acct     = make_account(2_000); // Active tier, 1.0× (no mult effect)
+        let bytes    = 1024u64 * 1024 * 1024; // 1 GB
+        let uptime_s = 3600_u64;             // exact 1 hour so both formulas agree
+
+        // Old constants (pre-fix fallback)
+        let reward_old = acct.calculate_reward(
+            bytes, 0, uptime_s, 2_000,
+            1_000, 2_000, 10_000_000,
+        );
+        // Target rates (what the PDA already stores)
+        let reward_new = acct.calculate_reward(
+            bytes, 0, uptime_s, 2_000,
+            1_000_000, 2_000_000, 10_000_000_000,
+        );
+
+        assert!(reward_old > 0, "old-rate reward must be non-zero");
+        assert_eq!(reward_new, reward_old * 1_000,
+            "1000× rates must produce 1000× reward (got old={reward_old} new={reward_new})");
     }
 
     // ─── Append-Only Chain validation tests ─────────────────────────────────
