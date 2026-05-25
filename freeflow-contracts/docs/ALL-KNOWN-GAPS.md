@@ -4,11 +4,12 @@
 > **Scope:** All repos (triton, contracts, android, windows)
 > **Status:** Android + Windows clients built and tested. Contracts compile. Foundation server compiles. No code deployed. No live integration tested.
 > **Updated:** 2026-05-24 — re-audit found G1 pubkey, G5 enum+UDP, G6 tracker+invites, G7 latency trigger, G12 metrics all resolved since doc was written.
+> **Updated:** 2026-05-26 — FOUNDATION-GAPS F1-F9 fixed; EMISSIONS-GAP E1/E2/E5 fixed; G17 fixed.
 
 ## Related Documents
 
-- **`FOUNDATION-GAPS.md`** — 12 foundation server-specific gaps (no rate endpoints, sidecar-only Solana path, placeholder seed addresses, etc.)
-- **`EMISSIONS-GAP.md`** — 7 reward/emissions gaps (hardcoded constants 1000x below target, integer division bug, no rate adjustment mechanism)
+- **`FOUNDATION-GAPS.md`** — Foundation server gaps: F1-F9 **FIXED** (2026-05-26), F10-F12 P2 deferred
+- **`EMISSIONS-GAP.md`** — Emissions gaps: E1/E2/E5 **FIXED** (2026-05-25), E3/E4/E6/E7 P2 deferred
 
 ## Changelog (resolved since original audit)
 
@@ -19,7 +20,16 @@
 | 2026-05-24 | G6 | `/v1/tracker` endpoint live; beta invite engine (6 routes) coded | `main.rs:254`, `main.rs:682-686` |
 | 2026-05-24 | G7 | `LatencyMonitor` with 60s baseline, 5x spike, dual-trigger policy | `hopper.rs:79-162` |
 | 2026-05-24 | G12 | `MetricsSnapshot` + tamper-evident periodic persistence | `metrics.rs`, `persistence.rs`, `node.rs:1001` |
-| 2026-05-24 | G17 | Reward rate `UpdateRewardRates` instruction exists on-chain (disc=17) but no endpoint calls it | `rewards/lib.rs:4390`, foundation has no `UpdateRewardRates` route |
+| 2026-05-24 | G17 | `UpdateRewardRates` disc=17 exists on-chain, no foundation endpoint | (open) |
+| 2026-05-25 | G17 | E1/E2 fixed in rewards program: PDA rates read by process_claim, integer division fixed | triton a3e1885, contracts 270b174 |
+| 2026-05-25 | G17 | E5 fixed: `scripts/update-reward-rates.ts` CLI tool created | contracts 270b174 |
+| 2026-05-26 | F1  | `GET /v1/admin/rates` proxies to sidecar `/v1/relay/rates` | triton e2cc421 |
+| 2026-05-26 | F3  | `compute_flush_eta()` replaces hardcoded 3600/86400 stubs | triton e2cc421 |
+| 2026-05-26 | F4  | URL `/v1/relay/claim`, key `tx_signature`, lamports parsed | triton e2cc421 |
+| 2026-05-26 | F5  | `relay_addr` field in ClaimRequest; real addresses in tracker | triton e2cc421 |
+| 2026-05-26 | F6  | `/pool`, `/pool/v1/tracker`, `/pool/latest` live; delta 501 | triton e2cc421 |
+| 2026-05-26 | F8  | `GET /v1/admin/status` — pending claims, config, ETA, services | triton e2cc421 |
+| 2026-05-26 | F9  | threshold_gb 300→1, flush_interval_secs=86400, background flush task | triton e2cc421 |
 
 ---
 
@@ -31,8 +41,8 @@
 | Item | Details |
 |------|---------|
 | Network authority keypair | **RESOLVED** (2026-05-24). Real hex key at `freeflow-hopping/src/pool.rs:274` (`6e7ee205cf04716c9f85d7c2addc4d1b1690acb02960411f6e5896e9ab632559`). Also used in `freeflow-foundation/src/services/tracker.rs`. |
-| Pool delta server (`pool.freeflow.my`) | **STILL OPEN**. HTTP delta endpoints (`/delta/{tier}?since=<seq>`) and full pool snapshot not implemented in foundation server. Only `/v1/tracker`, `/v1/tierkeys`, `/v1/reputation` exist. See F6 in `FOUNDATION-GAPS.md`. |
-| Domain registration | `freeflow.my` not registered. No DNS, no TLS, no Cloudflare. See F7 in `FOUNDATION-GAPS.md`. |
+| Pool delta server (`pool.freeflow.my`) | **SKELETON ADDED** (2026-05-26). `/pool`, `/pool/v1/tracker`, `/pool/latest` routes live. `/pool/v1/delta/:tier` returns 501. Full signed delta protocol deferred to Phase 4. nginx proxy rule still needed on DreamHost (`location /pool { proxy_pass http://127.0.0.1:8442; }`). See F6 in `FOUNDATION-GAPS.md`. |
+| Domain registration | **VERIFIED** (2026-05-26). `freeflow.my` resolves to 173.236.223.85, TLS valid until 2026-07-29. `/pool` currently 404 — nginx proxy not yet configured. See F7 in `FOUNDATION-GAPS.md`. |
 | Pool authority key in HSM | No HSM setup, no key rotation procedure. |
 
 **What's coded:** `freeflow-hopping/src/pool_updater.rs` can fetch signed deltas and verify Ed25519 signatures. `merkle.rs` computes and verifies tier hashes. Both work with a live server.
@@ -268,23 +278,24 @@
 
 ---
 
-## G17: Reward Rates — Hardcoded Constants 1000x Below Target
+## G17: Reward Rates — Hardcoded Constants 1000x Below Target ✅ FIXED
 
-**Impact:** Relays earn ~0.04 FLOW/day vs a target of ~241 FLOW/day — **~6000x below intended emissions**.
-**Priority:** P0
+**Fixed:** 2026-05-25 in commits a3e1885 (freeflow-triton) and 270b174 (freeflow-contracts)
 **Deep dive:** `EMISSIONS-GAP.md`
 
-| Item | Details |
-|------|---------|
-| `process_claim()` uses hardcoded constants | `BASE_ROUTING_PER_MB = 1,000`, `BASE_UPTIME_PER_HOUR = 10,000,000` (`rewards/lib.rs:2422-2424`) — never reads the on-chain `RewardRatesAccount` PDA |
-| On-chain PDA has correct rates | `RewardRatesAccount` stores routing=1,000,000, uptime=10,000,000,000 — but these are only **displayed** by sidecar at `/v1/rates`, never applied to reward calculations |
-| Integer division bug | `uptime_seconds / 3600` zeroes out ~50% of uptime rewards since claims hover around the 3600s boundary |
-| No rate adjustment mechanism | `UpdateRewardRates` (disc=17) exists on-chain, sidecar can encode it, but foundation has **no endpoint** to call it. No CLI, no script. See F1 in `FOUNDATION-GAPS.md` |
+| Item | Fix |
+|------|-----|
+| E1: `process_claim()` used hardcoded constants | ✅ Now reads optional `RewardRatesAccount` PDA as account[2]; sidecar passes PDA in tx |
+| E2: Integer division `seconds/3600*rate` zeroed sub-hour rewards | ✅ Fixed to `seconds*rate/3600` |
+| E5: No rate adjustment mechanism | ✅ `scripts/update-reward-rates.ts` CLI tool; `GET /v1/admin/rates` endpoint in foundation |
 
-**Actual per-claim (Active tier):** 0.001 FLOW/GB routing (target: 1), 0.01 FLOW/hr uptime (target: 10) — both 1000x low, with uptime further halved by integer division.
+**Deployed:** Rewards program redeployed to devnet slot 464861055.
+**Sidecar:** Updated to include `reward_rates_pda` as account[2] in ClaimRewards transactions.
+**Foundation:** `GET /v1/admin/rates` proxies to sidecar `/v1/relay/rates` to surface live PDA values.
 
-**What's coded:** `calculate_reward()` formula with repFlow tier multipliers (basis points, correct). `UpdateRewardRates` instruction (disc=17). Sidecar `encode_update_reward_rates()`.
-**What's missing:** Either bump hardcoded constants OR wire `process_claim()` to read from the on-chain PDA. Fix integer division. Foundation endpoint to adjust rates.
+Remaining items E3/E4/E6/E7 are P2 — see `EMISSIONS-GAP.md`.
+
+---
 
 ---
 
