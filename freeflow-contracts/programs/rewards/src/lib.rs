@@ -4071,6 +4071,63 @@ fn process_force_resolve_ix(
     Ok(())
 }
 
+/// Parsed account references for `process_release_rewards_ix` (22 accounts).
+struct ParsedReleaseAccounts<'s, 'info: 's> {
+    relay_wallet:             &'s AccountInfo<'info>,
+    reward_account:           &'s AccountInfo<'info>,
+    pending_claims_ai:        &'s AccountInfo<'info>,
+    reservation_ai:           Option<&'s AccountInfo<'info>>,
+    user_escrow_state_ai:     Option<&'s AccountInfo<'info>>,
+    mint_authority_ai:        Option<&'s AccountInfo<'info>>,
+    token_mint_ai:            Option<&'s AccountInfo<'info>>,
+    relay_token_ai:           Option<&'s AccountInfo<'info>>,
+    treasury_token_ai:        Option<&'s AccountInfo<'info>>,
+    user_escrow_token_ai:     Option<&'s AccountInfo<'info>>,
+    user_wallet_ai:           Option<&'s AccountInfo<'info>>,
+    spender_registry_ai:      Option<&'s AccountInfo<'info>>,
+    user_escrow_prog_ai:      Option<&'s AccountInfo<'info>>,
+    token_program_ai:         Option<&'s AccountInfo<'info>>,
+    treasury_config_ai:       Option<&'s AccountInfo<'info>>,
+    fund_hold_rr_ai:          Option<&'s AccountInfo<'info>>,
+    repflow_program_rr_ai:    Option<&'s AccountInfo<'info>>,
+    repflow_config_rr_ai:     Option<&'s AccountInfo<'info>>,
+    repflow_user_rr_ai:       Option<&'s AccountInfo<'info>>,
+    repflow_mint_rr_ai:       Option<&'s AccountInfo<'info>>,
+    repflow_relay_ata_rr_ai:  Option<&'s AccountInfo<'info>>,
+    repflow_token_prog_rr_ai: Option<&'s AccountInfo<'info>>,
+}
+
+#[inline(never)]
+fn parse_release_accounts<'s, 'info: 's>(
+    accounts: &'s [AccountInfo<'info>],
+) -> Result<ParsedReleaseAccounts<'s, 'info>, ProgramError> {
+    let iter = &mut accounts.iter();
+    Ok(ParsedReleaseAccounts {
+        relay_wallet:             next_account_info(iter)?,
+        reward_account:           next_account_info(iter)?,
+        pending_claims_ai:        next_account_info(iter)?,
+        reservation_ai:           iter.next(),
+        user_escrow_state_ai:     iter.next(),
+        mint_authority_ai:        iter.next(),
+        token_mint_ai:            iter.next(),
+        relay_token_ai:           iter.next(),
+        treasury_token_ai:        iter.next(),
+        user_escrow_token_ai:     iter.next(),
+        user_wallet_ai:           iter.next(),
+        spender_registry_ai:      iter.next(),
+        user_escrow_prog_ai:      iter.next(),
+        token_program_ai:         iter.next(),
+        treasury_config_ai:       iter.next(),
+        fund_hold_rr_ai:          iter.next(),
+        repflow_program_rr_ai:    iter.next(),
+        repflow_config_rr_ai:     iter.next(),
+        repflow_user_rr_ai:       iter.next(),
+        repflow_mint_rr_ai:       iter.next(),
+        repflow_relay_ata_rr_ai:  iter.next(),
+        repflow_token_prog_rr_ai: iter.next(),
+    })
+}
+
 /// Process a ReleaseRewards instruction.
 ///
 /// Releases escrowed rewards to the relay after the dispute window expires.
@@ -4103,36 +4160,30 @@ fn process_release_rewards_ix(
     accounts:   &[AccountInfo],
     claim_hash: [u8; 32],
 ) -> ProgramResult {
-    let accounts_iter       = &mut accounts.iter();
-    let relay_wallet        = next_account_info(accounts_iter)?;
-    let reward_account      = next_account_info(accounts_iter)?;
-    let pending_claims_ai   = next_account_info(accounts_iter)?;
-    let reservation_ai      = accounts_iter.next();
-    let user_escrow_state_ai = accounts_iter.next();
-
-    // CPI bridge accounts (all optional).
-    let mint_authority_ai    = accounts_iter.next();
-    let token_mint_ai        = accounts_iter.next();
-    let relay_token_ai       = accounts_iter.next();
-    let treasury_token_ai    = accounts_iter.next();
-    let user_escrow_token_ai = accounts_iter.next();
-    let user_wallet_ai       = accounts_iter.next();
-    let spender_registry_ai  = accounts_iter.next();
-    let user_escrow_prog_ai  = accounts_iter.next();
-    let token_program_ai     = accounts_iter.next();
-    // Account 14 (mandatory when CPI bridge active): TreasuryConfig PDA.
-    let treasury_config_ai   = accounts_iter.next();
-    // Account 15 (optional): FundHold PDA — activates burn_held_funds path.
-    let fund_hold_rr_ai      = accounts_iter.next();
-
-    // ── repFlow accounts (all optional; accounts 16-21) ───────────────────────
-    // When all 6 are present and claim.bytes_routed > 0, mints bandwidth repFlow to relay.
-    let repflow_program_rr_ai    = accounts_iter.next(); // 16: repflow-token program
-    let repflow_config_rr_ai     = accounts_iter.next(); // 17: RepFlowConfig PDA
-    let repflow_user_rr_ai       = accounts_iter.next(); // 18: relay's RepFlowUser PDA (writable)
-    let repflow_mint_rr_ai       = accounts_iter.next(); // 19: repFlow SPL mint (writable)
-    let repflow_relay_ata_rr_ai  = accounts_iter.next(); // 20: relay's repFlow ATA (writable)
-    let repflow_token_prog_rr_ai = accounts_iter.next(); // 21: Token-2022 program
+    let ParsedReleaseAccounts {
+        relay_wallet,
+        reward_account,
+        pending_claims_ai,
+        reservation_ai,
+        user_escrow_state_ai,
+        mint_authority_ai,
+        token_mint_ai,
+        relay_token_ai,
+        treasury_token_ai,
+        user_escrow_token_ai,
+        user_wallet_ai,
+        spender_registry_ai,
+        user_escrow_prog_ai,
+        token_program_ai,
+        treasury_config_ai,
+        fund_hold_rr_ai,
+        repflow_program_rr_ai,
+        repflow_config_rr_ai,
+        repflow_user_rr_ai,
+        repflow_mint_rr_ai,
+        repflow_relay_ata_rr_ai,
+        repflow_token_prog_rr_ai,
+    } = parse_release_accounts(accounts)?;
 
     if !relay_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
