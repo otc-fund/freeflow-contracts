@@ -3774,6 +3774,61 @@ fn process_resolve_relay_slashed_ix(
     Ok(())
 }
 
+/// Parsed account references for `process_resolve_challenger_slashed_ix` (21 accounts).
+struct ParsedResolveChallengerSlashedAccounts<'s, 'info: 's> {
+    relay_wallet:             &'s AccountInfo<'info>,
+    pending_claims_ai:        &'s AccountInfo<'info>,
+    reservation_ai:           Option<&'s AccountInfo<'info>>,
+    user_escrow_state_ai:     Option<&'s AccountInfo<'info>>,
+    mint_authority_ai:        Option<&'s AccountInfo<'info>>,
+    token_mint_ai:            Option<&'s AccountInfo<'info>>,
+    relay_token_ai:           Option<&'s AccountInfo<'info>>,
+    treasury_token_ai:        Option<&'s AccountInfo<'info>>,
+    user_escrow_token_ai:     Option<&'s AccountInfo<'info>>,
+    user_wallet_ai:           Option<&'s AccountInfo<'info>>,
+    spender_registry_ai:      Option<&'s AccountInfo<'info>>,
+    user_escrow_prog_ai:      Option<&'s AccountInfo<'info>>,
+    token_program_ai:         Option<&'s AccountInfo<'info>>,
+    treasury_config_cs_ai:    Option<&'s AccountInfo<'info>>,
+    fund_hold_cs_ai:          Option<&'s AccountInfo<'info>>,
+    repflow_program_cs_ai:    Option<&'s AccountInfo<'info>>,
+    repflow_config_cs_ai:     Option<&'s AccountInfo<'info>>,
+    repflow_user_cs_ai:       Option<&'s AccountInfo<'info>>,
+    repflow_mint_cs_ai:       Option<&'s AccountInfo<'info>>,
+    repflow_relay_ata_cs_ai:  Option<&'s AccountInfo<'info>>,
+    repflow_token_prog_cs_ai: Option<&'s AccountInfo<'info>>,
+}
+
+#[inline(never)]
+fn parse_resolve_challenger_slashed_accounts<'s, 'info: 's>(
+    accounts: &'s [AccountInfo<'info>],
+) -> Result<ParsedResolveChallengerSlashedAccounts<'s, 'info>, ProgramError> {
+    let iter = &mut accounts.iter();
+    Ok(ParsedResolveChallengerSlashedAccounts {
+        relay_wallet:             next_account_info(iter)?,
+        pending_claims_ai:        next_account_info(iter)?,
+        reservation_ai:           iter.next(),
+        user_escrow_state_ai:     iter.next(),
+        mint_authority_ai:        iter.next(),
+        token_mint_ai:            iter.next(),
+        relay_token_ai:           iter.next(),
+        treasury_token_ai:        iter.next(),
+        user_escrow_token_ai:     iter.next(),
+        user_wallet_ai:           iter.next(),
+        spender_registry_ai:      iter.next(),
+        user_escrow_prog_ai:      iter.next(),
+        token_program_ai:         iter.next(),
+        treasury_config_cs_ai:    iter.next(),
+        fund_hold_cs_ai:          iter.next(),
+        repflow_program_cs_ai:    iter.next(),
+        repflow_config_cs_ai:     iter.next(),
+        repflow_user_cs_ai:       iter.next(),
+        repflow_mint_cs_ai:       iter.next(),
+        repflow_relay_ata_cs_ai:  iter.next(),
+        repflow_token_prog_cs_ai: iter.next(),
+    })
+}
+
 /// Process ResolveDisputeChallengerSlashed — relay proved signature valid, challenger slashed.
 ///
 /// P1: calls `settle_reservation` (Rule 1, Rule 4, Rule 8).
@@ -3803,35 +3858,29 @@ fn process_resolve_challenger_slashed_ix(
     accounts:   &[AccountInfo],
     claim_hash: [u8; 32],
 ) -> ProgramResult {
-    let accounts_iter        = &mut accounts.iter();
-    let relay_wallet         = next_account_info(accounts_iter)?;
-    let pending_claims_ai    = next_account_info(accounts_iter)?;
-    let reservation_ai       = accounts_iter.next();
-    let user_escrow_state_ai = accounts_iter.next();
-
-    // CPI bridge accounts.
-    let mint_authority_ai    = accounts_iter.next();
-    let token_mint_ai        = accounts_iter.next();
-    let relay_token_ai       = accounts_iter.next();
-    let treasury_token_ai    = accounts_iter.next();
-    let user_escrow_token_ai = accounts_iter.next();
-    let user_wallet_ai       = accounts_iter.next();
-    let spender_registry_ai  = accounts_iter.next();
-    let user_escrow_prog_ai  = accounts_iter.next();
-    let token_program_ai     = accounts_iter.next();
-    // Account 13 (mandatory when CPI bridge active): TreasuryConfig PDA.
-    let treasury_config_cs_ai = accounts_iter.next();
-    // Account 14 (optional): FundHold PDA — activates burn_held_funds path.
-    let fund_hold_cs_ai      = accounts_iter.next();
-
-    // ── repFlow accounts (all optional; accounts 15-20) ───────────────────────
-    // When all 6 are present and claim.bytes_routed > 0, mints bandwidth repFlow to relay.
-    let repflow_program_cs_ai    = accounts_iter.next(); // 15: repflow-token program
-    let repflow_config_cs_ai     = accounts_iter.next(); // 16: RepFlowConfig PDA
-    let repflow_user_cs_ai       = accounts_iter.next(); // 17: relay's RepFlowUser PDA (writable)
-    let repflow_mint_cs_ai       = accounts_iter.next(); // 18: repFlow SPL mint (writable)
-    let repflow_relay_ata_cs_ai  = accounts_iter.next(); // 19: relay's repFlow ATA (writable)
-    let repflow_token_prog_cs_ai = accounts_iter.next(); // 20: Token-2022 program
+    let ParsedResolveChallengerSlashedAccounts {
+        relay_wallet,
+        pending_claims_ai,
+        reservation_ai,
+        user_escrow_state_ai,
+        mint_authority_ai,
+        token_mint_ai,
+        relay_token_ai,
+        treasury_token_ai,
+        user_escrow_token_ai,
+        user_wallet_ai,
+        spender_registry_ai,
+        user_escrow_prog_ai,
+        token_program_ai,
+        treasury_config_cs_ai,
+        fund_hold_cs_ai,
+        repflow_program_cs_ai,
+        repflow_config_cs_ai,
+        repflow_user_cs_ai,
+        repflow_mint_cs_ai,
+        repflow_relay_ata_cs_ai,
+        repflow_token_prog_cs_ai,
+    } = parse_resolve_challenger_slashed_accounts(accounts)?;
 
     if !relay_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
