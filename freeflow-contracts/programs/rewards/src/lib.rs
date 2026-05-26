@@ -806,6 +806,50 @@ fn cpi_mint_repflow<'a>(
     })
 }
 
+/// Shared repFlow CPI helper used by all four claim-resolution handlers.
+///
+/// Computes `bytes_routed / 1_073_741_824` (1 repFlow per GB), then fires
+/// `cpi_mint_repflow` if and only if all 6 optional repFlow accounts are present.
+/// Returns `Ok(())` immediately if any account is absent or `bytes_routed == 0`.
+///
+/// Extracted from nested `if let` blocks to give the inner bindings their own
+/// call frame, shrinking the calling handler's frame by ~288 bytes.
+#[inline(never)]
+fn maybe_mint_repflow_for_claim<'a>(
+    bytes_routed:       u64,
+    activity_code:      u8,
+    rewards_authority:  &AccountInfo<'a>,
+    bump:               u8,
+    repflow_program:    Option<&AccountInfo<'a>>,
+    repflow_config:     Option<&AccountInfo<'a>>,
+    repflow_user:       Option<&AccountInfo<'a>>,
+    repflow_mint:       Option<&AccountInfo<'a>>,
+    repflow_ata:        Option<&AccountInfo<'a>>,
+    repflow_token_prog: Option<&AccountInfo<'a>>,
+) -> ProgramResult {
+    let amount = bytes_routed / 1_073_741_824;
+    if let (
+        Some(rfp_ai), Some(rfc_ai), Some(rfu_ai),
+        Some(rfm_ai), Some(rfata_ai), Some(rftp_ai),
+    ) = (
+        repflow_program, repflow_config, repflow_user,
+        repflow_mint, repflow_ata, repflow_token_prog,
+    ) {
+        cpi_mint_repflow(
+            rfp_ai, rfc_ai, rfu_ai, rfm_ai, rfata_ai,
+            rewards_authority, rftp_ai,
+            amount, activity_code, bump,
+        )?;
+        if amount > 0 {
+            msg!(
+                "repFlow CPI: {} repFlow ({}B, activity={})",
+                amount, bytes_routed, activity_code,
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn process_instruction(
     program_id: &Pubkey,
     accounts:   &[AccountInfo],
@@ -3562,31 +3606,11 @@ fn process_resolve_relay_slashed_ix(
         );
 
         // ── repFlow CPI: challenger earns DisputeWin repFlow ─────────────────
-        // Challenger earns 1 repFlow per GB of the fraudulently-claimed traffic.
-        // Uses rel_mint_authority_ai (ma_ai) as the rewards_authority PDA signer.
-        let repflow_dispute_win = claim_bytes_routed_rs / 1_073_741_824;
-        if let (
-            Some(rfp_ai), Some(rfc_ai), Some(rfcu_ai),
-            Some(rfm_ai), Some(rfcata_ai), Some(rftp_ai),
-        ) = (
+        maybe_mint_repflow_for_claim(
+            claim_bytes_routed_rs, 6 /* DisputeWin */, ma_ai, bump,
             repflow_program_rs_ai, repflow_config_rs_ai, repflow_chal_user_rs_ai,
             repflow_mint_rs_ai, repflow_chal_ata_rs_ai, repflow_token_prog_rs_ai,
-        ) {
-            cpi_mint_repflow(
-                rfp_ai, rfc_ai, rfcu_ai, rfm_ai, rfcata_ai,
-                ma_ai,  // rel_mint_authority — rewards_authority PDA signer
-                rftp_ai,
-                repflow_dispute_win,
-                6, // DisputeWin activity code
-                bump,
-            )?;
-            if repflow_dispute_win > 0 {
-                msg!(
-                    "ResolveRelaySlashed repFlow: {} repFlow to challenger (DisputeWin)",
-                    repflow_dispute_win
-                );
-            }
-        }
+        )?;
     }
 
     // ── Phase 6: CPI slash to staking program ────────────────────────────────
@@ -3825,30 +3849,11 @@ fn process_resolve_challenger_slashed_ix(
         );
 
         // ── repFlow CPI: bandwidth repFlow for relay (relay won the dispute) ──
-        // Relay earns repFlow for the bandwidth it legitimately routed.
-        let repflow_bandwidth_cs = claim_bytes_routed_cs / 1_073_741_824;
-        if let (
-            Some(rfp_ai), Some(rfc_ai), Some(rfu_ai),
-            Some(rfm_ai), Some(rfata_ai), Some(rftp_ai),
-        ) = (
+        maybe_mint_repflow_for_claim(
+            claim_bytes_routed_cs, 2 /* Bandwidth */, ma_ai, bump,
             repflow_program_cs_ai, repflow_config_cs_ai, repflow_user_cs_ai,
             repflow_mint_cs_ai, repflow_relay_ata_cs_ai, repflow_token_prog_cs_ai,
-        ) {
-            cpi_mint_repflow(
-                rfp_ai, rfc_ai, rfu_ai, rfm_ai, rfata_ai,
-                ma_ai,  // rewards_authority (PDA signer)
-                rftp_ai,
-                repflow_bandwidth_cs,
-                2, // Bandwidth activity code
-                bump,
-            )?;
-            if repflow_bandwidth_cs > 0 {
-                msg!(
-                    "ResolveDisputeChallengerSlashed repFlow: {} repFlow to relay",
-                    repflow_bandwidth_cs
-                );
-            }
-        }
+        )?;
     }
 
     if let DisputeOutcome::ChallengerSlashed { burned, .. } = &outcome {
@@ -4009,29 +4014,11 @@ fn process_force_resolve_ix(
         );
 
         // ── repFlow CPI: bandwidth repFlow for relay (relay wins by inaction) ──
-        let repflow_bandwidth_fr = claim_bytes_routed_fr / 1_073_741_824;
-        if let (
-            Some(rfp_ai), Some(rfc_ai), Some(rfu_ai),
-            Some(rfm_ai), Some(rfata_ai), Some(rftp_ai),
-        ) = (
+        maybe_mint_repflow_for_claim(
+            claim_bytes_routed_fr, 2 /* Bandwidth */, ma_ai, bump,
             repflow_program_fr_ai, repflow_config_fr_ai, repflow_user_fr_ai,
             repflow_mint_fr_ai, repflow_relay_ata_fr_ai, repflow_token_prog_fr_ai,
-        ) {
-            cpi_mint_repflow(
-                rfp_ai, rfc_ai, rfu_ai, rfm_ai, rfata_ai,
-                ma_ai,  // rewards_authority (PDA signer)
-                rftp_ai,
-                repflow_bandwidth_fr,
-                2, // Bandwidth activity code
-                bump,
-            )?;
-            if repflow_bandwidth_fr > 0 {
-                msg!(
-                    "ForceResolve repFlow: {} repFlow minted to relay",
-                    repflow_bandwidth_fr
-                );
-            }
-        }
+        )?;
     }
 
     if let DisputeOutcome::ChallengerSlashed { burned, .. } = &outcome {
@@ -4261,32 +4248,11 @@ fn process_release_rewards_ix(
         );
 
         // ── repFlow CPI: bandwidth repFlow for relay ──────────────────────────
-        // Activated when all 6 repFlow accounts (16-21) are present.
-        // Rate: 1 repFlow per GB (1_073_741_824 bytes) of claim.bytes_routed.
-        // `ma_ai` is reused as `rewards_authority` — the same PDA signs both CPIs.
-        let repflow_bandwidth = claim_bytes_routed / 1_073_741_824;
-        if let (
-            Some(rfp_ai), Some(rfc_ai), Some(rfu_ai),
-            Some(rfm_ai), Some(rfata_ai), Some(rftp_ai),
-        ) = (
+        maybe_mint_repflow_for_claim(
+            claim_bytes_routed, 2 /* Bandwidth */, ma_ai, bump,
             repflow_program_rr_ai, repflow_config_rr_ai, repflow_user_rr_ai,
             repflow_mint_rr_ai, repflow_relay_ata_rr_ai, repflow_token_prog_rr_ai,
-        ) {
-            cpi_mint_repflow(
-                rfp_ai, rfc_ai, rfu_ai, rfm_ai, rfata_ai,
-                ma_ai,   // rewards_authority (PDA signer, reused from $FLOW CPI block)
-                rftp_ai,
-                repflow_bandwidth,
-                2,       // Bandwidth activity code
-                bump,
-            )?;
-            if repflow_bandwidth > 0 {
-                msg!(
-                    "ReleaseRewards repFlow: {} repFlow minted to relay ({}GB bandwidth)",
-                    repflow_bandwidth, claim_bytes_routed / 1_073_741_824
-                );
-            }
-        }
+        )?;
     }
 
     // Credit released amount to the relay's aggregate reward account.
