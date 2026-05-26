@@ -2683,6 +2683,7 @@ fn write_store(ai: &AccountInfo, store: &PendingClaimsStore) -> Result<(), Progr
 // ── Instruction processors ────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 fn process_claim(
     program_id:      &Pubkey,
     accounts:        &[AccountInfo],
@@ -2835,6 +2836,7 @@ fn process_claim(
     Ok(())
 }
 
+#[inline(never)]
 fn process_record_bytes(
     _program_id:  &Pubkey,
     _accounts:    &[AccountInfo],
@@ -2887,6 +2889,7 @@ fn process_record_bytes(
 ///
 /// All records in a batch must be for the SAME client. To claim for multiple
 /// clients, submit multiple transactions.
+#[inline(never)]
 fn process_claim_usage(
     program_id: &Pubkey,
     accounts:   &[AccountInfo],
@@ -3295,6 +3298,7 @@ fn process_claim_usage(
 ///   --- Optional Phase 5 dynamic bond accounts ---
 ///   2: bond_config       — BondConfig PDA [b"bond_config"] (readable, optional)
 ///   3: reward_rates      — RewardRatesAccount PDA [b"reward_rates"] (readable, optional)
+#[inline(never)]
 fn process_dispute_claim(
     program_id:      &Pubkey,
     accounts:        &[AccountInfo],
@@ -3441,6 +3445,7 @@ fn process_dispute_claim(
 ///  12: relay_escrow_ata       — relay's $FLOW escrow ATA in staking program (writable)
 ///  13: staking_treasury_ata   — treasury's $FLOW ATA (writable; receives slashed tokens)
 ///  14: staking_token_program  — SPL Token program (read-only)
+#[inline(never)]
 fn process_resolve_relay_slashed_ix(
     program_id:  &Pubkey,
     accounts:    &[AccountInfo],
@@ -3677,6 +3682,7 @@ fn process_resolve_relay_slashed_ix(
 ///  12: token_program     — SPL Token program
 ///  13: fund_hold         — FundHold PDA (optional; activates burn_held_funds path)
 ///                          When present, calls burn_held_funds instead of spend_from_escrow.
+#[inline(never)]
 fn process_resolve_challenger_slashed_ix(
     program_id: &Pubkey,
     accounts:   &[AccountInfo],
@@ -3872,6 +3878,7 @@ fn process_resolve_challenger_slashed_ix(
 ///  11: spender_registry  — AuthorizedSpenderRegistry PDA
 ///  12: user_escrow_prog  — user-escrow program (for CPI)
 ///  13: token_program     — SPL Token program
+#[inline(never)]
 fn process_force_resolve_ix(
     program_id: &Pubkey,
     accounts:   &[AccountInfo],
@@ -4059,6 +4066,7 @@ fn process_force_resolve_ix(
 ///  14: fund_hold             — FundHold PDA (optional; activates burn_held_funds path)
 ///                              When present, calls burn_held_funds (decrements held+balance)
 ///                              instead of spend_from_escrow (legacy path).
+#[inline(never)]
 fn process_release_rewards_ix(
     program_id: &Pubkey,
     accounts:   &[AccountInfo],
@@ -4305,6 +4313,7 @@ fn process_release_rewards_ix(
 ///   0: foundation     (signer — Foundation multisig)
 ///   1: rewards_config (RewardsConfig PDA [b"rewards_config"], writable — will be created)
 ///   2: system_program (SystemProgram)
+#[inline(never)]
 fn process_initialize_rewards_config(
     program_id: &Pubkey,
     accounts:   &[AccountInfo],
@@ -4382,6 +4391,7 @@ fn process_initialize_rewards_config(
 /// Account layout:
 ///   0: payer         (signer)
 ///   1: reservation   (UserEscrowReservation PDA, writable — pre-created)
+#[inline(never)]
 fn process_initialize_reservation(
     _program_id:      &Pubkey,
     accounts:         &[AccountInfo],
@@ -4437,6 +4447,7 @@ fn process_initialize_reservation(
 /// Account layout:
 ///   0: foundation    (signer — Foundation multisig)
 ///   1: rewards_config (RewardsConfig PDA, writable)
+#[inline(never)]
 fn process_set_migration_mode(
     _program_id:  &Pubkey,
     accounts:     &[AccountInfo],
@@ -4491,6 +4502,7 @@ fn process_set_migration_mode(
 ///   3: token_mint       ($FLOW SPL mint, writable)
 ///   4: foundation_token (Foundation's $FLOW token account, writable)
 ///   5: token_program    (SPL Token program)
+#[inline(never)]
 fn process_pre_mint_foundation(
     program_id: &Pubkey,
     accounts:   &[AccountInfo],
@@ -4572,6 +4584,7 @@ fn process_pre_mint_foundation(
 ///   0: foundation    (signer, writable — pays for PDA creation)
 ///   1: reward_rates  (RewardRatesAccount PDA [b"reward_rates"], writable)
 ///   2: system_program (readonly)
+#[inline(never)]
 fn process_initialize_reward_rates(
     program_id:       &Pubkey,
     accounts:         &[AccountInfo],
@@ -4676,6 +4689,7 @@ fn process_initialize_reward_rates(
 /// Account layout:
 ///   0: foundation    (signer — must equal FOUNDATION_PUBKEY)
 ///   1: reward_rates  (RewardRatesAccount PDA [b"reward_rates"], writable)
+#[inline(never)]
 fn process_update_reward_rates(
     program_id:       &Pubkey,
     accounts:         &[AccountInfo],
@@ -4756,6 +4770,7 @@ fn process_update_reward_rates(
 ///   0: foundation      (signer — must equal FOUNDATION_PUBKEY, writable — pays rent)
 ///   1: treasury_config (TreasuryConfig PDA [b"treasury_config"], writable — will be created)
 ///   2: system_program  (readonly)
+#[inline(never)]
 fn process_initialize_treasury_config_ix(
     program_id: &Pubkey,
     accounts:   &[AccountInfo],
@@ -4853,6 +4868,7 @@ fn process_initialize_treasury_config_ix(
 /// Account layout:
 ///   0: foundation      (signer — must equal FOUNDATION_PUBKEY)
 ///   1: treasury_config (TreasuryConfig PDA [b"treasury_config"], writable)
+#[inline(never)]
 fn process_update_treasury_pool_ix(
     program_id:           &Pubkey,
     accounts:             &[AccountInfo],
@@ -4940,6 +4956,7 @@ fn process_update_treasury_pool_ix(
 ///   0: foundation    — signer, writable (payer)
 ///   1: bond_config   — BondConfig PDA [b"bond_config"], writable (will be created)
 ///   2: system_program
+#[inline(never)]
 fn process_initialize_bond_config_ix(
     program_id:            &Pubkey,
     accounts:              &[AccountInfo],
@@ -5041,6 +5058,7 @@ fn process_initialize_bond_config_ix(
 /// Accounts:
 ///   0: foundation   — signer (must equal FOUNDATION_PUBKEY)
 ///   1: bond_config  — BondConfig PDA [b"bond_config"], writable
+#[inline(never)]
 fn process_update_bond_config_ix(
     program_id:            &Pubkey,
     accounts:              &[AccountInfo],
@@ -5181,6 +5199,7 @@ fn validate_treasury_token(
 ///  10: spender_registry   — AuthorizedSpenderRegistry PDA (read-only)
 ///  11: user_escrow_program — user-escrow program (for CPI)
 ///  12: token_program      — SPL Token program
+#[inline(never)]
 fn process_sweep_expired_escrow_ix(
     program_id: &Pubkey,
     accounts:   &[AccountInfo],
@@ -5371,6 +5390,7 @@ fn process_sweep_expired_escrow_ix(
 /// Account layout:
 ///   0: foundation       (signer — Foundation multisig)
 ///   1: reconcile_intent (ReconcileIntent PDA, writable — pre-created)
+#[inline(never)]
 fn process_request_reconciliation(
     _program_id:  &Pubkey,
     accounts:     &[AccountInfo],
@@ -5415,6 +5435,7 @@ fn process_request_reconciliation(
 ///   0: executor         (signer — anyone after timelock)
 ///   1: reconcile_intent (ReconcileIntent PDA, writable)
 ///   2: reservation      (UserEscrowReservation PDA, writable)
+#[inline(never)]
 fn process_execute_reconciliation(
     _program_id: &Pubkey,
     accounts:    &[AccountInfo],
@@ -5484,6 +5505,7 @@ fn process_execute_reconciliation(
 /// Account layout:
 ///   0: foundation       (signer — Foundation multisig)
 ///   1: reconcile_intent (ReconcileIntent PDA, writable)
+#[inline(never)]
 fn process_cancel_reconciliation(
     _program_id: &Pubkey,
     accounts:    &[AccountInfo],
