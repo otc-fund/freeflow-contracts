@@ -136,11 +136,20 @@ async function main() {
     console.log(`   ✓ Mint created: ${mintKeypair.publicKey.toBase58()}`);
     console.log(`   ✓ Transfer hook: REJECT ALL (non-transferable)`);
 
-    // ── 3. Initialise the repFlow program config ───────────────────────────────
-    console.log("\n⚙️  Initialising repFlow config...");
+    // ── 3. Initialise config PDA + ExtraAccountMetaList atomically ───────────
+    //
+    // C-2 FIX: Both initializations are bundled into a single transaction to
+    // eliminate the window during which repFlow is freely transferable.
+    //
+    // Without this atomicity:
+    //   Tx A: initialize config PDA (mint authority created)
+    //   GAP:  repFlow is mintable but the transfer hook is not yet active
+    //   Tx B: initialize ExtraAccountMetaList (hook activated)
+    //
+    // With this fix both instructions are in a single Tx, so there is no gap.
+    console.log("\n⚙️  Initialising repFlow config and transfer hook PDA (atomic)...");
 
     // Governance council minters (3-of-5 multisig in production via Squads Protocol).
-    // 5 keys stored on-chain; Squads enforces the 3-of-5 threshold before sending the tx.
     // For deployment, we use the admin key as the initial minter.
     const minters = [admin.publicKey];
     const burners = [admin.publicKey];
@@ -150,18 +159,77 @@ async function main() {
     console.log(`   Burners: ${burners.map(b => b.toBase58().slice(0, 8) + "...").join(", ")}`);
     console.log(`   ⚠️  IMPORTANT: Replace admin with 3-of-5 governance multisig (5 keys) before mainnet!`);
 
+    // Load the Anchor IDL and build an Anchor Program client.
+    const idlPath = path.resolve(__dirname, "../../../target/idl/repflow_token.json");
+    if (!fs.existsSync(idlPath)) {
+        throw new Error(
+            `IDL not found at ${idlPath}. Run \`anchor build\` first.`
+        );
+    }
+    const idl      = JSON.parse(fs.readFileSync(idlPath, "utf8"));
+    const provider = new anchor.AnchorProvider(
+        conn,
+        new anchor.Wallet(admin),
+        { commitment: net.commitment as anchor.web3.Commitment },
+    );
+    const program  = new anchor.Program(idl, provider);
+
+    // Derive the ExtraAccountMetaList PDA — standard SPL Token-2022 seeds.
+    const [extraAccountMetaListPDA] = PublicKey.findProgramAddressSync(
+        [Buffer.from("extra-account-metas"), mintKeypair.publicKey.toBuffer()],
+        programId,
+    );
+
+    // Build a single transaction with both init instructions.
+    const initTx = new Transaction();
+
+    // Instruction 1: Initialize the RepFlowConfig PDA.
+    initTx.add(
+        await (program.methods as any)
+            .initialize(minters, burners)
+            .accounts({
+                config:        configPDA,
+                admin:         admin.publicKey,
+                systemProgram: SystemProgram.programId,
+            })
+            .instruction()
+    );
+
+    // Instruction 2: Initialize the ExtraAccountMetaList PDA.
+    // Bundled in the same Tx — activates the transfer hook atomically with config init.
+    initTx.add(
+        await (program.methods as any)
+            .initializeExtraAccountMetaList()
+            .accounts({
+                mint:                 mintKeypair.publicKey,
+                extraAccountMetaList: extraAccountMetaListPDA,
+                payer:                admin.publicKey,
+                systemProgram:        SystemProgram.programId,
+            })
+            .instruction()
+    );
+
+    const initSig = await conn.sendTransaction(initTx, [admin]);
+    await conn.confirmTransaction(initSig);
+
+    console.log(`   ✓ Config PDA initialized: ${configPDA.toBase58()}`);
+    console.log(`   ✓ ExtraAccountMetaList PDA initialized: ${extraAccountMetaListPDA.toBase58()}`);
+    console.log(`   ✓ Transfer hook ACTIVE — repFlow is now soulbound from this block forward`);
+
     // ── 4. Write deployment record ────────────────────────────────────────────
     const deployRecord = {
-        network:       NETWORK,
-        programId:     programId.toBase58(),
-        mintAddress:   mintKeypair.publicKey.toBase58(),
-        configPDA:     configPDA.toBase58(),
-        admin:         admin.publicKey.toBase58(),
-        minters:       minters.map(m => m.toBase58()),
-        burners:       burners.map(b => b.toBase58()),
-        decimals:      REPFLOW_DECIMALS,
-        deployedAt:    new Date().toISOString(),
+        network:                 NETWORK,
+        programId:               programId.toBase58(),
+        mintAddress:             mintKeypair.publicKey.toBase58(),
+        configPDA:               configPDA.toBase58(),
+        extraAccountMetaListPDA: extraAccountMetaListPDA.toBase58(),
+        admin:                   admin.publicKey.toBase58(),
+        minters:                 minters.map(m => m.toBase58()),
+        burners:                 burners.map(b => b.toBase58()),
+        decimals:                REPFLOW_DECIMALS,
+        deployedAt:              new Date().toISOString(),
         mintSig,
+        initSig,
     };
 
     const recordPath = path.resolve(__dirname, `../../../.repflow-deploy-${NETWORK}.json`);
@@ -176,8 +244,9 @@ async function main() {
     console.log(`   4. Run integration tests: anchor test --provider.cluster ${NETWORK}`);
     console.log(`   5. Verify non-transferability: attempt a transfer and confirm rejection`);
     console.log(`\n🏆 repFlow token deployed successfully!`);
-    console.log(`   Mint:    ${mintKeypair.publicKey.toBase58()}`);
-    console.log(`   Program: ${programId.toBase58()}`);
+    console.log(`   Mint:              ${mintKeypair.publicKey.toBase58()}`);
+    console.log(`   Program:           ${programId.toBase58()}`);
+    console.log(`   ExtraAccountMetas: ${extraAccountMetaListPDA.toBase58()}`);
 }
 
 main().catch(err => {

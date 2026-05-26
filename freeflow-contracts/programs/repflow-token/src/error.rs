@@ -67,4 +67,14 @@ pub enum RepFlowError {
     /// Valid codes: 1=Uptime, 2=Bandwidth, 6=DisputeWin.
     #[msg("Unknown activity code — valid codes: 1=Uptime, 2=Bandwidth, 6=DisputeWin")]
     InvalidActivityCode,
+
+    /// C-2: The ExtraAccountMetaList PDA for the transfer hook has not been initialized.
+    ///
+    /// Until this PDA exists the SPL Token-2022 runtime cannot locate the hook's
+    /// account list, which means the transfer hook is inactive and repFlow is freely
+    /// transferable — defeating the soulbound property.
+    ///
+    /// Fix: call `initialize_extra_account_meta_list` before any mint operation.
+    #[msg("Transfer hook ExtraAccountMetaList not initialized — repFlow is not yet soulbound")]
+    TransferHookNotInitialized,
 }

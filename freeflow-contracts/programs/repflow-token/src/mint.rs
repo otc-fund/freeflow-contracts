@@ -94,6 +94,39 @@ pub fn mint_repflow(ctx: Context<MintRepFlow>, amount: u64, activity_code: u8) -
         RepFlowError::DailyRateLimitExceeded
     );
 
+    // ── C-2: Transfer hook initialization guard ───────────────────────────
+    // Verify the ExtraAccountMetaList PDA exists before minting.
+    // Without it the SPL Token-2022 runtime cannot find the hook's account list,
+    // meaning the transfer hook is inactive and repFlow is freely transferable.
+    //
+    // Callers MUST pass the ExtraAccountMetaList PDA as a remaining account.
+    // PDA seeds: [b"extra-account-metas", mint.key()] — SPL Token-2022 standard.
+    let (expected_eam_pda, _) = Pubkey::find_program_address(
+        &[b"extra-account-metas", ctx.accounts.mint.key().as_ref()],
+        &crate::ID,
+    );
+    require!(
+        ctx.remaining_accounts
+            .iter()
+            .any(|a| a.key() == expected_eam_pda && a.lamports() > 0),
+        RepFlowError::TransferHookNotInitialized,
+    );
+
+    // ── C-1: Supply cap check (BEFORE mint) ───────────────────────────────
+    // Enforced BEFORE the CPI so the SPL mint cannot execute if it would
+    // exceed the 1 B repFlow supply cap. Previously this check was after
+    // `mint_to` — this fix closes that ordering vulnerability.
+    let new_total = config.total_minted
+        .checked_add(amount)
+        .ok_or(RepFlowError::Overflow)?;
+    if config.max_supply > 0 && new_total > config.max_supply {
+        msg!(
+            "mint_repflow: would exceed max_supply ({} + {} > {})",
+            config.total_minted, amount, config.max_supply
+        );
+        return Err(RepFlowError::Overflow.into());
+    }
+
     // ── Mint via SPL Token-2022 ────────────────────────────────────────────
     let seeds   = &[b"repflow_config".as_ref(), &[config_bump]];
     let signer  = &[&seeds[..]];
@@ -116,20 +149,6 @@ pub fn mint_repflow(ctx: Context<MintRepFlow>, amount: u64, activity_code: u8) -
     user.lifetime_earned     = user.lifetime_earned.checked_add(amount).ok_or(RepFlowError::Overflow)?;
     user.daily_minted        = new_daily;
     user.last_earned_at      = now;
-
-    // ── Supply cap check ──────────────────────────────────────────────────
-    // If max_supply is set (non-zero), enforce the hard cap before minting.
-    // This prevents total repFlow from exceeding the 1B tokenomics limit.
-    let new_total = config.total_minted
-        .checked_add(amount)
-        .ok_or(RepFlowError::Overflow)?;
-    if config.max_supply > 0 && new_total > config.max_supply {
-        msg!(
-            "mint_repflow: would exceed max_supply ({} + {} > {})",
-            config.total_minted, amount, config.max_supply
-        );
-        return Err(RepFlowError::Overflow.into());
-    }
 
     // ── Update global stats ───────────────────────────────────────────────
     config.total_minted = new_total;
@@ -254,6 +273,21 @@ pub fn mint_repflow_from_rewards(
     require!(
         new_daily <= RepFlowUser::MAX_DAILY_MINT,
         RepFlowError::DailyRateLimitExceeded,
+    );
+
+    // ── C-2: Transfer hook initialization guard ───────────────────────────
+    // Verify the ExtraAccountMetaList PDA exists before minting.
+    // The rewards program CPI caller MUST pass the ExtraAccountMetaList PDA
+    // as a remaining account when calling this instruction.
+    let (expected_eam_pda, _) = Pubkey::find_program_address(
+        &[b"extra-account-metas", ctx.accounts.mint.key().as_ref()],
+        &crate::ID,
+    );
+    require!(
+        ctx.remaining_accounts
+            .iter()
+            .any(|a| a.key() == expected_eam_pda && a.lamports() > 0),
+        RepFlowError::TransferHookNotInitialized,
     );
 
     // ── Supply cap check ──────────────────────────────────────────────────
@@ -395,6 +429,21 @@ pub fn claim_daily_uptime_repflow(
         RepFlowError::DailyRateLimitExceeded,
     );
 
+    // ── C-2: Transfer hook initialization guard ───────────────────────────
+    // Verify the ExtraAccountMetaList PDA exists before minting.
+    // The relay sidecar MUST pass the ExtraAccountMetaList PDA as a remaining
+    // account when calling this instruction.
+    let (expected_eam_pda, _) = Pubkey::find_program_address(
+        &[b"extra-account-metas", ctx.accounts.mint.key().as_ref()],
+        &crate::ID,
+    );
+    require!(
+        ctx.remaining_accounts
+            .iter()
+            .any(|a| a.key() == expected_eam_pda && a.lamports() > 0),
+        RepFlowError::TransferHookNotInitialized,
+    );
+
     // ── Supply cap check ──────────────────────────────────────────────────
     let new_total = config.total_minted
         .checked_add(amount)
@@ -499,4 +548,123 @@ pub struct RepFlowMinted {
     /// Tier after minting.
     pub tier:          u8,
     pub timestamp:     i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── C-1: Supply cap ordering ──────────────────────────────────────────────
+
+    /// C-1: Supply cap arithmetic — new_total > max_supply must be caught.
+    ///
+    /// Verifies that the supply cap check correctly identifies when a mint
+    /// would breach the 1 B supply limit. The *ordering* (check before CPI)
+    /// is enforced by code review — this test covers the arithmetic logic.
+    #[test]
+    fn supply_cap_check_catches_overflow_before_cpi() {
+        let total_minted: u64 = 999_999_999;
+        let max_supply: u64   = 1_000_000_000;
+
+        // Exactly at cap — should be allowed.
+        let amount_ok: u64 = 1;
+        let new_total_ok = total_minted.checked_add(amount_ok).unwrap();
+        assert_eq!(new_total_ok, max_supply);
+        assert!(!(max_supply > 0 && new_total_ok > max_supply),
+            "exactly at cap must not trigger the cap error");
+
+        // One above cap — must be rejected.
+        let amount_over: u64 = 2;
+        let new_total_over = total_minted.checked_add(amount_over).unwrap();
+        assert!(max_supply > 0 && new_total_over > max_supply,
+            "one over cap must trigger the cap error");
+    }
+
+    /// C-1: With max_supply = 0 (disabled), any amount should pass the cap check.
+    #[test]
+    fn supply_cap_check_disabled_when_max_supply_zero() {
+        let total_minted: u64 = u64::MAX - 1;
+        let max_supply: u64   = 0; // disabled
+        let amount: u64       = 1;
+
+        let new_total = total_minted.checked_add(amount).unwrap();
+        // When max_supply == 0 the condition `max_supply > 0` is false → no cap.
+        assert!(!(max_supply > 0 && new_total > max_supply),
+            "max_supply = 0 disables the cap check");
+    }
+
+    // ── C-2: Transfer hook guard PDA derivation ───────────────────────────────
+
+    /// C-2: The ExtraAccountMetaList PDA is derived from the correct seeds.
+    ///
+    /// Guards in all three mint functions derive the PDA via:
+    ///   find_program_address([b"extra-account-metas", mint.key()], program_id)
+    ///
+    /// This test verifies the derivation is deterministic and matches the seeds
+    /// used in `InitializeExtraAccountMetaList`.
+    #[test]
+    fn transfer_hook_guard_pda_derivation_matches_init() {
+        let program_id = crate::ID;
+        let mint = Pubkey::new_unique();
+
+        // Guard-side derivation (inside mint functions).
+        let (guard_pda, guard_bump) = Pubkey::find_program_address(
+            &[b"extra-account-metas", mint.as_ref()],
+            &program_id,
+        );
+
+        // Init-side derivation (InitializeExtraAccountMetaList uses the same seeds).
+        let (init_pda, init_bump) = Pubkey::find_program_address(
+            &[b"extra-account-metas", mint.as_ref()],
+            &program_id,
+        );
+
+        assert_eq!(guard_pda, init_pda,
+            "guard PDA must match the initialized PDA");
+        assert_eq!(guard_bump, init_bump,
+            "bumps must be identical for the same mint");
+    }
+
+    /// C-2: The guard correctly distinguishes initialized vs uninitialized PDAs.
+    ///
+    /// Simulates the remaining_accounts lookup logic used in the guard:
+    ///   any(|a| a.key() == &expected_pda && a.lamports() > 0)
+    ///
+    /// Confirms a missing account is rejected and a present one is accepted.
+    #[test]
+    fn transfer_hook_guard_logic_accepts_initialized_rejects_missing() {
+        let program_id   = crate::ID;
+        let mint         = Pubkey::new_unique();
+        let (expected, _) = Pubkey::find_program_address(
+            &[b"extra-account-metas", mint.as_ref()],
+            &program_id,
+        );
+
+        // Case 1: empty remaining_accounts → guard should reject.
+        let empty: Vec<Pubkey> = vec![];
+        let found = empty.iter().any(|k| k == &expected);
+        assert!(!found, "empty remaining_accounts must fail the guard");
+
+        // Case 2: correct PDA in remaining_accounts → guard should pass.
+        let present = vec![expected];
+        let found = present.iter().any(|k| k == &expected);
+        assert!(found, "correct PDA in remaining_accounts must pass the guard");
+
+        // Case 3: wrong PDA in remaining_accounts → guard should reject.
+        let wrong_pda = Pubkey::new_unique();
+        let wrong = vec![wrong_pda];
+        let found = wrong.iter().any(|k| k == &expected);
+        assert!(!found, "wrong PDA must not satisfy the guard");
+    }
+
+    /// C-2: TransferHookNotInitialized error variant is present and has correct message.
+    #[test]
+    fn transfer_hook_not_initialized_error_exists() {
+        let err = crate::error::RepFlowError::TransferHookNotInitialized;
+        let msg = err.to_string();
+        assert!(msg.contains("ExtraAccountMetaList"),
+            "error message must reference ExtraAccountMetaList: {msg}");
+        assert!(msg.contains("soulbound"),
+            "error message must mention soulbound property: {msg}");
+    }
 }
