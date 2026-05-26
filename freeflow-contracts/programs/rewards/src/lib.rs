@@ -2907,6 +2907,57 @@ fn process_record_bytes(
     Err(ProgramError::InvalidInstructionData)
 }
 
+/// Parsed account references for `process_claim_usage`.
+/// `'s` = slice/reference lifetime; `'info` = AccountInfo inner data lifetime.
+/// Field names match the original local variable names — handler body unchanged.
+struct ParsedClaimUsageAccounts<'s, 'info: 's> {
+    relay_wallet:             &'s AccountInfo<'info>,
+    reward_account_ai:        &'s AccountInfo<'info>,
+    claim_state_ai:           &'s AccountInfo<'info>,
+    pending_claims_ai:        Option<&'s AccountInfo<'info>>,
+    rewards_config_ai:        Option<&'s AccountInfo<'info>>,
+    reservation_ai:           Option<&'s AccountInfo<'info>>,
+    user_escrow_ai:           Option<&'s AccountInfo<'info>>,
+    hold_user_escrow_prog_ai: Option<&'s AccountInfo<'info>>,
+    hold_mint_authority_ai:   Option<&'s AccountInfo<'info>>,
+    hold_user_ai:             Option<&'s AccountInfo<'info>>,
+    fund_hold_ai:             Option<&'s AccountInfo<'info>>,
+    hold_spender_registry_ai: Option<&'s AccountInfo<'info>>,
+    hold_system_program_ai:   Option<&'s AccountInfo<'info>>,
+    repflow_user_ai:          Option<&'s AccountInfo<'info>>,
+    stake_account_ai:         Option<&'s AccountInfo<'info>>,
+    bond_config_ai:           Option<&'s AccountInfo<'info>>,
+    reward_rates_ai:          Option<&'s AccountInfo<'info>>,
+}
+
+/// Walk the accounts iterator for `process_claim_usage`.
+/// Runs in its own call frame so all iterator state is freed before the handler runs.
+#[inline(never)]
+fn parse_claim_usage_accounts<'s, 'info: 's>(
+    accounts: &'s [AccountInfo<'info>],
+) -> Result<ParsedClaimUsageAccounts<'s, 'info>, ProgramError> {
+    let iter = &mut accounts.iter();
+    Ok(ParsedClaimUsageAccounts {
+        relay_wallet:             next_account_info(iter)?,
+        reward_account_ai:        next_account_info(iter)?,
+        claim_state_ai:           next_account_info(iter)?,
+        pending_claims_ai:        iter.next(),
+        rewards_config_ai:        iter.next(),
+        reservation_ai:           iter.next(),
+        user_escrow_ai:           iter.next(),
+        hold_user_escrow_prog_ai: iter.next(),
+        hold_mint_authority_ai:   iter.next(),
+        hold_user_ai:             iter.next(),
+        fund_hold_ai:             iter.next(),
+        hold_spender_registry_ai: iter.next(),
+        hold_system_program_ai:   iter.next(),
+        repflow_user_ai:          iter.next(),
+        stake_account_ai:         iter.next(),
+        bond_config_ai:           iter.next(),
+        reward_rates_ai:          iter.next(),
+    })
+}
+
 /// Process a ClaimUsage instruction — enforces per-(client,relay) sequence numbers.
 ///
 /// P1 update: checks `UserEscrowReservation` before escrowing. Blocks during
@@ -2945,38 +2996,25 @@ fn process_claim_usage(
     accounts:   &[AccountInfo],
     records:    Vec<UsageRecordOnChain>,
 ) -> ProgramResult {
-    let accounts_iter     = &mut accounts.iter();
-    let relay_wallet      = next_account_info(accounts_iter)?;
-    let reward_account_ai = next_account_info(accounts_iter)?;
-    let claim_state_ai    = next_account_info(accounts_iter)?;
-    let pending_claims_ai = accounts_iter.next();
-    let rewards_config_ai = accounts_iter.next();
-    let reservation_ai    = accounts_iter.next();
-    let user_escrow_ai    = accounts_iter.next();
-
-    // Optional hold-CPI accounts (all 6 must be present to activate the hold path).
-    //  7: user_escrow_program — user-escrow program (for CPI)
-    //  8: mint_authority      — rewards mint_authority PDA ["mint_authority"] (PDA signer)
-    //  9: hold_user           — user wallet (non-signer; PDA seed in user-escrow)
-    // 10: fund_hold           — FundHold PDA (init, writable)
-    // 11: hold_spender_reg    — AuthorizedSpenderRegistry PDA
-    // 12: hold_system_program — System Program (for FundHold rent)
-    let hold_user_escrow_prog_ai = accounts_iter.next();
-    let hold_mint_authority_ai   = accounts_iter.next();
-    let hold_user_ai             = accounts_iter.next();
-    let fund_hold_ai             = accounts_iter.next();
-    let hold_spender_registry_ai = accounts_iter.next();
-    let hold_system_program_ai   = accounts_iter.next();
-
-    // Optional RepFlow-Bond gate accounts (Phase 2, backward compatible).
-    // 13: relay_repflow_user  — RepFlowUser PDA from repflow-token program
-    // 14: relay_stake_account — StakeAccount PDA from staking program
-    // 15: bond_config         — BondConfig PDA [b"bond_config"]
-    // 16: reward_rates        — RewardRatesAccount PDA [b"reward_rates"]
-    let repflow_user_ai   = accounts_iter.next();
-    let stake_account_ai  = accounts_iter.next();
-    let bond_config_ai    = accounts_iter.next();
-    let reward_rates_ai   = accounts_iter.next();
+    let ParsedClaimUsageAccounts {
+        relay_wallet,
+        reward_account_ai,
+        claim_state_ai,
+        pending_claims_ai,
+        rewards_config_ai,
+        reservation_ai,
+        user_escrow_ai,
+        hold_user_escrow_prog_ai,
+        hold_mint_authority_ai,
+        hold_user_ai,
+        fund_hold_ai,
+        hold_spender_registry_ai,
+        hold_system_program_ai,
+        repflow_user_ai,
+        stake_account_ai,
+        bond_config_ai,
+        reward_rates_ai,
+    } = parse_claim_usage_accounts(accounts)?;
 
     if !relay_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
