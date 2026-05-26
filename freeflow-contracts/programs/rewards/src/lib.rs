@@ -437,6 +437,7 @@ fn verify_and_get_mint_authority_bump(
 /// For sweep operations, the treasury token account (authority = treasury wallet) plays the
 /// role of `relay_token`, and `treasury_wallet` plays `relay_wallet`.
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 fn cpi_burn_from_escrow<'a>(
     user_escrow_program_ai: &AccountInfo<'a>,
     mint_authority_ai:      &AccountInfo<'a>,  // service_authority (PDA signer)
@@ -509,6 +510,7 @@ fn cpi_burn_from_escrow<'a>(
 ///   spender_registry  — AuthorizedSpenderRegistry PDA
 ///   system_program    — 11111…
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 fn cpi_hold_client_funds<'a>(
     user_escrow_program_ai: &AccountInfo<'a>,
     mint_authority_ai:      &AccountInfo<'a>,  // service_authority (PDA signer)
@@ -574,6 +576,7 @@ fn cpi_hold_client_funds<'a>(
 ///   user_escrow       — UserEscrow PDA (writable)
 ///   fund_hold         — FundHold PDA (writable, must be Active)
 ///   spender_registry  — AuthorizedSpenderRegistry PDA
+#[inline(never)]
 fn cpi_release_funds<'a>(
     user_escrow_program_ai: &AccountInfo<'a>,
     mint_authority_ai:      &AccountInfo<'a>,
@@ -630,6 +633,7 @@ fn cpi_release_funds<'a>(
 ///   token_mint         — $FLOW mint (writable — burn reduces supply)
 ///   token_program      — SPL Token program
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 fn cpi_burn_held_funds<'a>(
     user_escrow_program_ai: &AccountInfo<'a>,
     mint_authority_ai:      &AccountInfo<'a>,
@@ -704,6 +708,7 @@ fn cpi_burn_held_funds<'a>(
 /// are atomic, a failure in either CPI reverts the entire transaction — the
 /// `settle_reservation` decrement, the burn, and the mint are all undone together.
 /// There is no partial-execution window that could leave `reserved` or supply inconsistent.
+#[inline(never)]
 fn cpi_mint_to<'a>(
     token_program_ai:    &AccountInfo<'a>,
     token_mint_ai:       &AccountInfo<'a>,
@@ -740,6 +745,7 @@ fn cpi_mint_to<'a>(
 /// Activity codes: 1 = Uptime, 2 = Bandwidth (1 repFlow/GB), 6 = DisputeWin.
 ///
 /// Returns `Ok(())` immediately if `amount == 0` (no-op, no CPI needed).
+#[inline(never)]
 fn cpi_mint_repflow<'a>(
     repflow_program_ai: &AccountInfo<'a>,
     repflow_config_ai:  &AccountInfo<'a>,
