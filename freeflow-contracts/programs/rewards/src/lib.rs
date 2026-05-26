@@ -3508,6 +3508,61 @@ fn process_dispute_claim(
     Ok(())
 }
 
+/// Parsed account references for `process_resolve_relay_slashed_ix` (21 accounts).
+struct ParsedResolveRelaySlashedAccounts<'s, 'info: 's> {
+    challenger:               &'s AccountInfo<'info>,
+    pending_claims_ai:        &'s AccountInfo<'info>,
+    reservation_ai:           Option<&'s AccountInfo<'info>>,
+    user_escrow_ai:           Option<&'s AccountInfo<'info>>,
+    rel_user_escrow_prog_ai:  Option<&'s AccountInfo<'info>>,
+    rel_mint_authority_ai:    Option<&'s AccountInfo<'info>>,
+    rel_user_ai:              Option<&'s AccountInfo<'info>>,
+    rel_fund_hold_ai:         Option<&'s AccountInfo<'info>>,
+    rel_spender_registry_ai:  Option<&'s AccountInfo<'info>>,
+    staking_program_ai:       Option<&'s AccountInfo<'info>>,
+    slash_authority_ai:       Option<&'s AccountInfo<'info>>,
+    relay_stake_account_ai:   Option<&'s AccountInfo<'info>>,
+    relay_escrow_ata_ai:      Option<&'s AccountInfo<'info>>,
+    staking_treasury_ata_ai:  Option<&'s AccountInfo<'info>>,
+    staking_token_program_ai: Option<&'s AccountInfo<'info>>,
+    repflow_program_rs_ai:    Option<&'s AccountInfo<'info>>,
+    repflow_config_rs_ai:     Option<&'s AccountInfo<'info>>,
+    repflow_chal_user_rs_ai:  Option<&'s AccountInfo<'info>>,
+    repflow_mint_rs_ai:       Option<&'s AccountInfo<'info>>,
+    repflow_chal_ata_rs_ai:   Option<&'s AccountInfo<'info>>,
+    repflow_token_prog_rs_ai: Option<&'s AccountInfo<'info>>,
+}
+
+#[inline(never)]
+fn parse_resolve_relay_slashed_accounts<'s, 'info: 's>(
+    accounts: &'s [AccountInfo<'info>],
+) -> Result<ParsedResolveRelaySlashedAccounts<'s, 'info>, ProgramError> {
+    let iter = &mut accounts.iter();
+    Ok(ParsedResolveRelaySlashedAccounts {
+        challenger:               next_account_info(iter)?,
+        pending_claims_ai:        next_account_info(iter)?,
+        reservation_ai:           iter.next(),
+        user_escrow_ai:           iter.next(),
+        rel_user_escrow_prog_ai:  iter.next(),
+        rel_mint_authority_ai:    iter.next(),
+        rel_user_ai:              iter.next(),
+        rel_fund_hold_ai:         iter.next(),
+        rel_spender_registry_ai:  iter.next(),
+        staking_program_ai:       iter.next(),
+        slash_authority_ai:       iter.next(),
+        relay_stake_account_ai:   iter.next(),
+        relay_escrow_ata_ai:      iter.next(),
+        staking_treasury_ata_ai:  iter.next(),
+        staking_token_program_ai: iter.next(),
+        repflow_program_rs_ai:    iter.next(),
+        repflow_config_rs_ai:     iter.next(),
+        repflow_chal_user_rs_ai:  iter.next(),
+        repflow_mint_rs_ai:       iter.next(),
+        repflow_chal_ata_rs_ai:   iter.next(),
+        repflow_token_prog_rs_ai: iter.next(),
+    })
+}
+
 /// Process ResolveDisputeRelaySlashed — challenger proved forgery, relay is slashed.
 ///
 /// P1: calls `settle_reservation` (Rule 1, Rule 4, Rule 8).
@@ -3539,37 +3594,29 @@ fn process_resolve_relay_slashed_ix(
     accounts:    &[AccountInfo],
     claim_hash:  [u8; 32],
 ) -> ProgramResult {
-    let accounts_iter     = &mut accounts.iter();
-    let challenger        = next_account_info(accounts_iter)?;
-    let pending_claims_ai = next_account_info(accounts_iter)?;
-    let reservation_ai    = accounts_iter.next();
-    let user_escrow_ai    = accounts_iter.next();
-
-    // Release-CPI accounts (all optional; all 5 must be provided together).
-    let rel_user_escrow_prog_ai  = accounts_iter.next();
-    let rel_mint_authority_ai    = accounts_iter.next();
-    let rel_user_ai              = accounts_iter.next();
-    let rel_fund_hold_ai         = accounts_iter.next();
-    let rel_spender_registry_ai  = accounts_iter.next();
-
-    // Phase 6: Staking CPI accounts (all optional; all 5 must be provided together).
-    let staking_program_ai       = accounts_iter.next();
-    let slash_authority_ai       = accounts_iter.next();
-    let relay_stake_account_ai   = accounts_iter.next();
-    let relay_escrow_ata_ai      = accounts_iter.next();
-    let staking_treasury_ata_ai  = accounts_iter.next();
-    let staking_token_program_ai = accounts_iter.next();
-
-    // ── repFlow accounts (all optional; accounts 15-20) ───────────────────────
-    // Challenger earns repFlow for policing the network (DisputeWin activity).
-    // Rate: 1 repFlow per GB of the disputed traffic (same as bandwidth rate).
-    // Uses rel_mint_authority_ai (account 5) as rewards_authority for signing.
-    let repflow_program_rs_ai      = accounts_iter.next(); // 15: repflow-token program
-    let repflow_config_rs_ai       = accounts_iter.next(); // 16: RepFlowConfig PDA
-    let repflow_chal_user_rs_ai    = accounts_iter.next(); // 17: challenger's RepFlowUser PDA (writable)
-    let repflow_mint_rs_ai         = accounts_iter.next(); // 18: repFlow SPL mint (writable)
-    let repflow_chal_ata_rs_ai     = accounts_iter.next(); // 19: challenger's repFlow ATA (writable)
-    let repflow_token_prog_rs_ai   = accounts_iter.next(); // 20: Token-2022 program
+    let ParsedResolveRelaySlashedAccounts {
+        challenger,
+        pending_claims_ai,
+        reservation_ai,
+        user_escrow_ai,
+        rel_user_escrow_prog_ai,
+        rel_mint_authority_ai,
+        rel_user_ai,
+        rel_fund_hold_ai,
+        rel_spender_registry_ai,
+        staking_program_ai,
+        slash_authority_ai,
+        relay_stake_account_ai,
+        relay_escrow_ata_ai,
+        staking_treasury_ata_ai,
+        staking_token_program_ai,
+        repflow_program_rs_ai,
+        repflow_config_rs_ai,
+        repflow_chal_user_rs_ai,
+        repflow_mint_rs_ai,
+        repflow_chal_ata_rs_ai,
+        repflow_token_prog_rs_ai,
+    } = parse_resolve_relay_slashed_accounts(accounts)?;
 
     if !challenger.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
