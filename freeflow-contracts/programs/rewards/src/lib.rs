@@ -98,6 +98,13 @@ pub const TREASURY_SHARE_BPS: u64 = 8_000;
 /// Burn share of swept rewards in basis points (20%).
 pub const BURN_SHARE_BPS: u64 = 2_000;
 
+/// Default client signature expiry window: 7 days from claim submission.
+///
+/// Signatures older than this cannot be disputed, preventing indefinite replay
+/// of unused client signatures (H-2 fix). Matches the dispute window duration
+/// so that every disputable claim has a valid signature throughout the window.
+pub const SIGNATURE_EXPIRY_SECS: i64 = 604_800; // 7 days
+
 // ─── Append-Only Chain constants ─────────────────────────────────────────────
 
 /// Timeout before a relay may submit a force_claim (24 hours = 86 400 seconds).
@@ -312,6 +319,9 @@ pub enum DisputeError {
     ReconcileTimelockNotElapsed,
     /// No pending reconcile intent found for this user.
     ReconcileIntentNotFound,
+    /// Dispute or resolution attempted on a claim whose client signature has expired.
+    /// Code 121. Expiry = submitted_at + SIGNATURE_EXPIRY_SECS (7 days).
+    SignatureExpired,
 }
 
 impl From<DisputeError> for ProgramError {
@@ -339,6 +349,7 @@ impl From<DisputeError> for ProgramError {
             DisputeError::ClaimUnderDispute              => 118,
             DisputeError::ReconcileTimelockNotElapsed    => 119,
             DisputeError::ReconcileIntentNotFound        => 120,
+            DisputeError::SignatureExpired               => 121,
         };
         ProgramError::Custom(code)
     }
@@ -1487,6 +1498,12 @@ pub struct PendingClaim {
     /// Reserved for Approach 1 (uptime-on-release). Currently always 0.
     /// Uptime repFlow is claimed via `claim_daily_uptime_repflow` (Approach 2).
     pub uptime_seconds:   u64,
+    /// Client signature expiry timestamp: submitted_at + SIGNATURE_EXPIRY_SECS (7 days).
+    ///
+    /// H-2 fix: disputes and resolutions are rejected after this timestamp,
+    /// preventing indefinite replay of unused client signatures.
+    /// The expiry is committed to by the claim hash (baked into `compute_claim_hash`).
+    pub expiry_ts:        i64,
 }
 
 /// Monotonically increasing nonce per escrow PDA for dispute replay protection.
@@ -2109,6 +2126,7 @@ pub fn compute_claim_hash(
     session_id:   &[u8; 16],
     tip_nonce:    u64,
     tip_hash:     &[u8; 32],
+    expiry_ts:    i64,
 ) -> [u8; 32] {
     use solana_program::hash::hashv;
     hashv(&[
@@ -2117,6 +2135,7 @@ pub fn compute_claim_hash(
         session_id,
         &tip_nonce.to_le_bytes(),
         tip_hash,
+        &expiry_ts.to_le_bytes(),
     ]).to_bytes()
 }
 
@@ -2142,7 +2161,8 @@ pub fn submit_claim_with_bond(
     bytes_routed: u64,
     bytes_seeded: u64,
 ) -> [u8; 32] {
-    let claim_hash = compute_claim_hash(relay_pubkey, session_id, tip_nonce, tip_hash);
+    let expiry_ts  = clock_ts.saturating_add(SIGNATURE_EXPIRY_SECS);
+    let claim_hash = compute_claim_hash(relay_pubkey, session_id, tip_nonce, tip_hash, expiry_ts);
 
     let claim = PendingClaim {
         relay:            *relay_pubkey,
@@ -2158,6 +2178,7 @@ pub fn submit_claim_with_bond(
         bytes_routed,
         bytes_seeded,
         uptime_seconds:   0, // Approach 2: uptime repFlow claimed separately
+        expiry_ts,
     };
     store.claims.push(claim);
     claim_hash
@@ -2225,7 +2246,8 @@ pub fn force_claim(
     }
 
     // Both gates passed — client is truly absent from the entire network.
-    let claim_hash = compute_claim_hash(relay_pubkey, session_id, tip_nonce, tip_hash);
+    let expiry_ts  = clock_ts.saturating_add(SIGNATURE_EXPIRY_SECS);
+    let claim_hash = compute_claim_hash(relay_pubkey, session_id, tip_nonce, tip_hash, expiry_ts);
 
     // Penalty is 20% of total_amount (deducted at release time, not now).
     let penalty = total_amount
@@ -2246,6 +2268,7 @@ pub fn force_claim(
         bytes_routed,
         bytes_seeded,
         uptime_seconds:   0,
+        expiry_ts,
     };
     store.claims.push(claim);
 
@@ -2294,6 +2317,14 @@ pub fn dispute_claim(
     // Dispute must arrive within the 7-day window.
     if clock_ts > claim.dispute_deadline {
         return Err(DisputeError::DisputeWindowExpired);
+    }
+
+    // H-2: Reject disputes on claims with expired client signatures.
+    // expiry_ts = submitted_at + SIGNATURE_EXPIRY_SECS (7 days).
+    // In normal submissions both windows are equal, so this fires only when
+    // a claim was injected with a shorter expiry (e.g., already-expired on arrival).
+    if clock_ts > claim.expiry_ts {
+        return Err(DisputeError::SignatureExpired);
     }
 
     claim.status = ClaimStatus::Disputed;
@@ -3359,9 +3390,10 @@ fn process_claim_usage(
         u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]])
     } else {
         // No pending_claims account — stub mode.
-        let tip      = &records[records.len() - 1];
-        let tip_hash = compute_record_hash_onchain(tip);
-        let h = compute_claim_hash(&relay_pubkey_bytes, &tip.session_id, tip.nonce, &tip_hash);
+        let tip        = &records[records.len() - 1];
+        let tip_hash   = compute_record_hash_onchain(tip);
+        let expiry_ts  = clock.unix_timestamp.saturating_add(SIGNATURE_EXPIRY_SECS);
+        let h = compute_claim_hash(&relay_pubkey_bytes, &tip.session_id, tip.nonce, &tip_hash, expiry_ts);
         u32::from_le_bytes([h[0], h[1], h[2], h[3]])
     };
 
@@ -3640,6 +3672,11 @@ fn process_resolve_relay_slashed_ix(
         if claim.status.is_terminal() {
             return Err(DisputeError::ClaimAlreadySettled.into());
         }
+        // H-2: Reject resolution on claims with expired client signatures.
+        let clock = Clock::get()?;
+        if clock.unix_timestamp > claim.expiry_ts {
+            return Err(DisputeError::SignatureExpired.into());
+        }
         (claim.total_amount, claim.bytes_routed)
     };
 
@@ -3904,6 +3941,11 @@ fn process_resolve_challenger_slashed_ix(
         if claim.status.is_terminal() {
             return Err(DisputeError::ClaimAlreadySettled.into());
         }
+        // H-2: Reject resolution on claims with expired client signatures.
+        let clock = Clock::get()?;
+        if clock.unix_timestamp > claim.expiry_ts {
+            return Err(DisputeError::SignatureExpired.into());
+        }
         (claim.total_amount, claim.bytes_routed)
     };
 
@@ -4131,6 +4173,10 @@ fn process_force_resolve_ix(
             .ok_or::<ProgramError>(DisputeError::ClaimNotFound.into())?;
         if claim.status.is_terminal() {
             return Err(DisputeError::ClaimAlreadySettled.into());
+        }
+        // H-2: Reject resolution on claims with expired client signatures.
+        if clock.unix_timestamp > claim.expiry_ts {
+            return Err(DisputeError::SignatureExpired.into());
         }
         (claim.total_amount, claim.bytes_routed)
     };
@@ -6186,8 +6232,9 @@ mod tests {
         let session_id = [0u8; 16];
         let tip_nonce  = 3u64;
         let tip_hash   = [0xAAu8; 32];
-        let h1 = compute_claim_hash(&relay, &session_id, tip_nonce, &tip_hash);
-        let h2 = compute_claim_hash(&relay, &session_id, tip_nonce, &tip_hash);
+        let expiry_ts  = now_ts() + SIGNATURE_EXPIRY_SECS;
+        let h1 = compute_claim_hash(&relay, &session_id, tip_nonce, &tip_hash, expiry_ts);
+        let h2 = compute_claim_hash(&relay, &session_id, tip_nonce, &tip_hash, expiry_ts);
         assert_eq!(h1, h2, "Hash must be deterministic");
     }
 
@@ -6197,8 +6244,9 @@ mod tests {
         let relay      = relay_pubkey();
         let session_id = [0u8; 16];
         let tip_hash   = [0xAAu8; 32];
-        let h1 = compute_claim_hash(&relay, &session_id, 1, &tip_hash);
-        let h2 = compute_claim_hash(&relay, &session_id, 2, &tip_hash);
+        let expiry_ts  = now_ts() + SIGNATURE_EXPIRY_SECS;
+        let h1 = compute_claim_hash(&relay, &session_id, 1, &tip_hash, expiry_ts);
+        let h2 = compute_claim_hash(&relay, &session_id, 2, &tip_hash, expiry_ts);
         assert_ne!(h1, h2, "Different tip_nonce must produce different hash");
     }
 
@@ -6208,7 +6256,8 @@ mod tests {
         let relay      = relay_pubkey();
         let session_id = [0u8; 16];
         let tip_hash   = [0x00u8; 32];
-        let h = compute_claim_hash(&relay, &session_id, 1, &tip_hash);
+        let expiry_ts  = now_ts() + SIGNATURE_EXPIRY_SECS;
+        let h = compute_claim_hash(&relay, &session_id, 1, &tip_hash, expiry_ts);
         // Must not be all zeros (i.e., the domain label influences the hash).
         assert_ne!(h, [0u8; 32]);
     }
@@ -6220,9 +6269,74 @@ mod tests {
         let relay_b    = [0xBBu8; 32];
         let session_id = [0u8; 16];
         let tip_hash   = [0xCCu8; 32];
-        let h1 = compute_claim_hash(&relay_a, &session_id, 1, &tip_hash);
-        let h2 = compute_claim_hash(&relay_b, &session_id, 1, &tip_hash);
+        let expiry_ts  = now_ts() + SIGNATURE_EXPIRY_SECS;
+        let h1 = compute_claim_hash(&relay_a, &session_id, 1, &tip_hash, expiry_ts);
+        let h2 = compute_claim_hash(&relay_b, &session_id, 1, &tip_hash, expiry_ts);
         assert_ne!(h1, h2, "Different relay must produce different hash");
+    }
+
+    #[test]
+    fn expiry_baked_into_hash_prevents_replay() {
+        // A signature computed with one expiry produces a different hash than the
+        // same claim with a different expiry — old signatures without expiry are
+        // automatically invalid because they hash to a different value.
+        let relay      = relay_pubkey();
+        let session_id = [0u8; 16];
+        let tip_hash   = [0xDDu8; 32];
+        let ts         = now_ts();
+        let expiry_a   = ts + SIGNATURE_EXPIRY_SECS;      // valid window
+        let expiry_b   = ts + SIGNATURE_EXPIRY_SECS * 2;  // different window
+        let h1 = compute_claim_hash(&relay, &session_id, 1, &tip_hash, expiry_a);
+        let h2 = compute_claim_hash(&relay, &session_id, 1, &tip_hash, expiry_b);
+        assert_ne!(h1, h2, "Different expiry_ts must produce different claim hash");
+    }
+
+    #[test]
+    fn expired_signature_rejected_on_dispute() {
+        // H-2: A claim whose expiry_ts is in the past must be rejected with
+        // SignatureExpired even when the dispute window is still open.
+        //
+        // We manually inject a PendingClaim with expiry_ts = ts - 1 (already
+        // expired) but dispute_deadline = ts + DISPUTE_WINDOW_SECONDS (still open)
+        // to isolate the expiry check from the window check.
+        let mut store = PendingClaimsStore::default();
+        let ts        = now_ts();
+        let records   = make_batch(1, 1);
+        let tip       = records.last().unwrap();
+        let tip_hash  = compute_record_hash_onchain(tip);
+
+        // Craft a claim hash with an already-expired expiry (1 second in the past).
+        let expired_expiry = ts - 1;
+        let claim_hash = compute_claim_hash(
+            &relay_pubkey(), &tip.session_id, tip.nonce, &tip_hash, expired_expiry,
+        );
+
+        // Directly insert the claim with expired expiry_ts but open dispute_deadline.
+        store.claims.push(PendingClaim {
+            relay:            relay_pubkey(),
+            claim_hash,
+            total_amount:     records.iter().map(|r| r.charge_flow).sum(),
+            record_count:     records.len() as u32,
+            submitted_at:     ts,
+            dispute_deadline: ts + DISPUTE_WINDOW_SECONDS, // window still open
+            bond:             RELAY_BOND_FLOW,
+            status:           ClaimStatus::Pending,
+            is_force_claim:   false,
+            user:             Some(records[0].user),
+            bytes_routed:     records.iter().map(|r| r.bytes).sum(),
+            bytes_seeded:     0,
+            uptime_seconds:   0,
+            expiry_ts:        expired_expiry, // signature already expired
+        });
+
+        // Dispute at ts (within the 7-day dispute window, but after expiry_ts).
+        let result = dispute_claim(
+            &mut store, claim_hash, 0, records[0].clone(),
+            challenger_pubkey(), ts, [0u8; 32],
+            DEFAULT_CHALLENGER_BOND_FLOW,
+        );
+        assert_eq!(result, Err(DisputeError::SignatureExpired),
+            "Dispute on a claim with expired signature must return SignatureExpired");
     }
 
     // ── dispute_claim ────────────────────────────────────────────────────────
@@ -7213,13 +7327,14 @@ mod tests {
 
     #[test]
     fn pending_claim_borsh_roundtrip_with_user() {
+        let ts    = now_ts();
         let claim = PendingClaim {
             relay:            relay_pubkey(),
             claim_hash:       [0x01u8; 32],
             total_amount:     5_000,
             record_count:     3,
-            submitted_at:     now_ts(),
-            dispute_deadline: now_ts() + DISPUTE_WINDOW_SECONDS,
+            submitted_at:     ts,
+            dispute_deadline: ts + DISPUTE_WINDOW_SECONDS,
             bond:             RELAY_BOND_FLOW,
             status:           ClaimStatus::Pending,
             is_force_claim:   false,
@@ -7227,24 +7342,27 @@ mod tests {
             bytes_routed:     0,
             bytes_seeded:     0,
             uptime_seconds:   0,
+            expiry_ts:        ts + SIGNATURE_EXPIRY_SECS,
         };
         let encoded = borsh::to_vec(&claim).unwrap();
         let decoded: PendingClaim = borsh::from_slice(&encoded).unwrap();
         assert_eq!(decoded.user, Some(client_x()));
         assert_eq!(decoded.total_amount, 5_000);
+        assert_eq!(decoded.expiry_ts, ts + SIGNATURE_EXPIRY_SECS);
     }
 
     #[test]
     fn pending_claim_borsh_backward_compat_no_user_field() {
         // Simulate old on-chain data without the user field.
         // Serialize a claim with user=None, then deserialize — should yield None.
+        let ts    = now_ts();
         let claim = PendingClaim {
             relay:            relay_pubkey(),
             claim_hash:       [0x02u8; 32],
             total_amount:     1_000,
             record_count:     1,
-            submitted_at:     now_ts(),
-            dispute_deadline: now_ts() + DISPUTE_WINDOW_SECONDS,
+            submitted_at:     ts,
+            dispute_deadline: ts + DISPUTE_WINDOW_SECONDS,
             bond:             RELAY_BOND_FLOW,
             status:           ClaimStatus::Pending,
             is_force_claim:   false,
@@ -7252,6 +7370,7 @@ mod tests {
             bytes_routed:     0,
             bytes_seeded:     0,
             uptime_seconds:   0,
+            expiry_ts:        ts + SIGNATURE_EXPIRY_SECS,
         };
         let encoded = borsh::to_vec(&claim).unwrap();
         let decoded: PendingClaim = borsh::from_slice(&encoded).unwrap();

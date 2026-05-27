@@ -365,9 +365,10 @@ fn process_slash(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    if cfg!(not(feature = "devnet-permissive")) {
-        // Derive the rewards program's slash_authority PDA — this is what the rewards
-        // program passes (and signs via invoke_signed) when CPI-ing into Slash.
+    // H-3: Always require authorization — either governance multisig or rewards
+    // program's slash_authority PDA (via CPI). No compile-time feature can bypass
+    // this check.
+    {
         let (slash_authority_pda, _) = solana_program::pubkey::Pubkey::find_program_address(
             &[b"slash_authority"],
             &REWARDS_PROGRAM_PUBKEY,
