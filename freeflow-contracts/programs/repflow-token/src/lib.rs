@@ -114,6 +114,29 @@ pub mod repflow_token {
         mint::initialize_user(ctx)
     }
 
+    // ── Proof-of-Service (bootstrap path) ──────────────────────────────
+
+    /// Submit a daily Proof-of-Service attestation for a relay.
+    ///
+    /// Call this before `claim_daily_uptime_repflow` to prove the relay served
+    /// real client traffic. After the Stage 2 transition window, this is required.
+    ///
+    /// `date_bucket` must equal `unix_timestamp / 86_400` from the on-chain clock.
+    /// The accounts constraint enforces this — callers cannot target a different day.
+    pub fn submit_proof_of_service(
+        ctx:          Context<SubmitProofOfService>,
+        client_count: u32,
+        bytes_routed: u64,
+        period_start: i64,
+        period_end:   i64,
+        date_bucket:  i64,
+    ) -> Result<()> {
+        // date_bucket is validated in the accounts constraint.
+        // It is not passed to the handler (the handler re-derives it from the clock).
+        let _ = date_bucket;
+        mint::submit_proof_of_service(ctx, client_count, bytes_routed, period_start, period_end)
+    }
+
     // ── Minting (earning) ───────────────────────────────────────────────────
 
     /// Mint repFlow to a user (authorised minters only).

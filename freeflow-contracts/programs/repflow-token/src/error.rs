@@ -77,4 +77,55 @@ pub enum RepFlowError {
     /// Fix: call `initialize_extra_account_meta_list` before any mint operation.
     #[msg("Transfer hook ExtraAccountMetaList not initialized — repFlow is not yet soulbound")]
     TransferHookNotInitialized,
+
+    // ── Stage 2: Proof-of-Service ──────────────────────────────────────────────
+
+    /// The Proof-of-Service PDA address does not match the expected derivation, or
+    /// the relay_pubkey field does not match the relay_wallet signer.
+    ///
+    /// Expected seeds: [b"proof_of_service", relay_wallet, &date_bucket.to_le_bytes()]
+    /// where date_bucket = on-chain unix_timestamp / 86_400.
+    #[msg("Proof-of-Service PDA address mismatch or wrong relay")]
+    InvalidProofOfService,
+
+    /// The Proof-of-Service attestation was submitted more than 48 hours ago.
+    ///
+    /// Submit a fresh attestation for today's date bucket before claiming.
+    #[msg("Proof-of-Service attestation too old (submitted > 48h ago)")]
+    ProofOfServiceTooOld,
+
+    /// The Proof-of-Service attestation records zero unique client sessions.
+    ///
+    /// The relay must have served at least one client session to claim uptime repFlow.
+    #[msg("Proof-of-Service: no client sessions recorded")]
+    NoClientSessions,
+
+    /// The Proof-of-Service attestation records zero bytes routed.
+    ///
+    /// The relay must have routed traffic to claim uptime repFlow.
+    #[msg("Proof-of-Service: no traffic routed")]
+    NoTrafficRouted,
+
+    /// The Proof-of-Service attestation has already been consumed by a previous claim.
+    ///
+    /// A consumed PDA cannot be reused. Submit a new attestation for the next day bucket.
+    #[msg("Proof-of-Service attestation already consumed")]
+    ProofOfServiceConsumed,
+
+    /// Proof-of-Service period_end must be strictly after period_start.
+    #[msg("Proof-of-Service period_end must be after period_start")]
+    InvalidPeriod,
+
+    /// Proof-of-Service period_end is more than 1 hour in the future.
+    ///
+    /// Relays must submit attestations for already-elapsed time windows, not future windows.
+    /// A 1-hour tolerance is allowed for clock skew between the relay and the chain.
+    #[msg("Proof-of-Service period_end is too far in the future (max 1h clock skew)")]
+    PeriodInFuture,
+
+    /// Proof-of-Service period_start is more than 24 hours in the past.
+    ///
+    /// Only attestations from the current 24-hour window are accepted.
+    #[msg("Proof-of-Service period_start is too old (> 24h ago)")]
+    PeriodTooOld,
 }

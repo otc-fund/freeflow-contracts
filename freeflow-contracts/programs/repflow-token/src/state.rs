@@ -217,6 +217,50 @@ impl RepFlowTierCode {
     }
 }
 
+/// Proof-of-Service attestation — submitted by relay sidecar, consumed by uptime claim.
+///
+/// Proves a relay served real client traffic in a given day. Tied to a daily bucket
+/// so replay across days is impossible and a consumed attestation cannot be reused.
+///
+/// PDA seeds: [b"proof_of_service", relay_pubkey, &date_bucket.to_le_bytes()]
+/// where date_bucket = Clock::get()?.unix_timestamp / 86_400
+#[account]
+#[derive(Debug)]
+pub struct ProofOfService {
+    /// Relay wallet pubkey that submitted this attestation.
+    pub relay_pubkey:  [u8; 32],
+    /// Number of unique client sessions served in the period.
+    pub client_count:  u32,
+    /// Total bytes routed to clients in the period.
+    pub bytes_routed:  u64,
+    /// Unix timestamp of measurement period start.
+    pub period_start:  i64,
+    /// Unix timestamp of measurement period end.
+    pub period_end:    i64,
+    /// Unix timestamp when this attestation was submitted on-chain.
+    pub submitted_at:  i64,
+    /// True if this attestation has been consumed by a repFlow uptime claim.
+    /// A consumed PDA cannot be overwritten (VULN-2).
+    pub consumed:      bool,
+    /// PDA bump seed.
+    pub bump:          u8,
+}
+
+impl ProofOfService {
+    // relay_pubkey(32) + client_count(4) + bytes_routed(8) + period_start(8)
+    // + period_end(8) + submitted_at(8) + consumed(1) + bump(1) = 70 bytes
+    pub const SIZE: usize = 32 + 4 + 8 + 8 + 8 + 8 + 1 + 1;
+
+    // Byte offsets within the Anchor account data (after 8-byte discriminator).
+    pub const OFFSET_RELAY_PUBKEY:  usize = 8;        // [8..40]
+    pub const OFFSET_CLIENT_COUNT:  usize = 8 + 32;   // [40..44]
+    pub const OFFSET_BYTES_ROUTED:  usize = 8 + 36;   // [44..52]
+    pub const OFFSET_SUBMITTED_AT:  usize = 8 + 60;   // [68..76]
+    pub const OFFSET_CONSUMED:      usize = 8 + 68;   // [76]
+
+    pub const TOTAL_SIZE: usize = 8 + Self::SIZE; // discriminator + fields
+}
+
 /// Pending slash record — stores evidence and enforces the 72-hour appeal window.
 ///
 /// PDA seeds: [b"slash_record", wallet_pubkey, &slash_id.to_le_bytes()]
