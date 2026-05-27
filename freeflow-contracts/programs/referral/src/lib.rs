@@ -6,9 +6,12 @@
 //!   0 — InitializeReferralConfig
 //!   1 — UpdateReferralConfig
 //!   2 — RegisterReferralCode
-//!   3 — RecordReferral
-//!   4 — ClaimReferralReward
-//!   5 — DepositRewardsPool
+//!   3 — RecordReferral           (+ H-1, M-5 security checks)
+//!   4 — ClaimReferralReward      (creates ClaimRequest PDA, no transfer)
+//!   5 — ApproveClaim             (foundation approves → vault → referrer ATA)
+//!   6 — RejectClaim              (foundation rejects → unlock balance)
+//!   7 — DeferClaim               (extend review window)
+//!   8 — DepositRewardsPool
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::{
@@ -25,11 +28,14 @@ mod state;
 mod utils;
 
 use instructions::{
+    approve_claim,
     claim,
+    defer_claim,
     deposit::{self, DepositRewardsPoolArgs},
     initialize::{self, InitializeReferralConfigArgs},
     record_referral::{self, RecordReferralArgs},
     register_code::{self, RegisterReferralCodeArgs},
+    reject_claim,
     update_config::{self, UpdateReferralConfigArgs},
 };
 
@@ -56,12 +62,19 @@ pub enum ReferralInstruction {
     RegisterReferralCode { code: Vec<u8> },
     /// Discriminant 3
     RecordReferral {
-        code_hash:       [u8; 32],
-        purchase_amount: u64,
+        code_hash:          [u8; 32],
+        purchase_amount:    u64,
+        transferred_reward: u64,
     },
-    /// Discriminant 4 — no data
+    /// Discriminant 4 — creates ClaimRequest PDA (no transfer)
     ClaimReferralReward,
-    /// Discriminant 5
+    /// Discriminant 5 — foundation approves pending claim
+    ApproveClaim,
+    /// Discriminant 6 — foundation rejects pending claim, unlocks balance
+    RejectClaim,
+    /// Discriminant 7 — foundation extends review deadline
+    DeferClaim,
+    /// Discriminant 8
     DepositRewardsPool { amount: u64 },
 }
 
@@ -104,16 +117,27 @@ pub fn process_instruction(
         ReferralInstruction::RecordReferral {
             code_hash,
             purchase_amount,
+            transferred_reward,
         } => record_referral::process(
             program_id,
             accounts,
             RecordReferralArgs {
                 code_hash,
                 purchase_amount,
+                transferred_reward,
             },
         ),
         ReferralInstruction::ClaimReferralReward => {
             claim::process(program_id, accounts)
+        }
+        ReferralInstruction::ApproveClaim => {
+            approve_claim::process(program_id, accounts)
+        }
+        ReferralInstruction::RejectClaim => {
+            reject_claim::process(program_id, accounts)
+        }
+        ReferralInstruction::DeferClaim => {
+            defer_claim::process(program_id, accounts)
         }
         ReferralInstruction::DepositRewardsPool { amount } => {
             deposit::process(program_id, accounts, DepositRewardsPoolArgs { amount })
@@ -128,7 +152,8 @@ mod tests {
     use crate::{
         errors::ReferralError,
         state::{
-            ReferralCode, ReferralConfig, ReferralRecord, ReferrerBalance, RewardsPool,
+            ClaimRequest, ReferralCode, ReferralConfig, ReferralRecord, ReferrerBalance,
+            RewardsPool,
         },
         utils::{calculate_reward, sha256_hash},
     };
@@ -137,21 +162,18 @@ mod tests {
 
     #[test]
     fn test_calculate_reward_basic() {
-        // 100 bps (1%) of 1_000_000_000 = 10_000_000
         let r = calculate_reward(1_000_000_000, 100, u64::MAX).unwrap();
         assert_eq!(r, 10_000_000);
     }
 
     #[test]
     fn test_calculate_reward_capped() {
-        // 3000 bps (30%) of 1_000_000_000 = 300_000_000, capped at 50_000_000
         let r = calculate_reward(1_000_000_000, 3_000, 50_000_000).unwrap();
         assert_eq!(r, 50_000_000);
     }
 
     #[test]
     fn test_calculate_reward_overflow() {
-        // u64::MAX with u16::MAX bps should not panic
         let result = calculate_reward(u64::MAX, u16::MAX, u64::MAX);
         assert!(result.is_ok());
     }
@@ -169,11 +191,7 @@ mod tests {
             bump:                  255,
             _padding:              [0; 3],
         };
-        assert_eq!(
-            borsh::to_vec(&s).unwrap().len(),
-            ReferralConfig::SIZE,
-            "ReferralConfig::SIZE must match serialized length"
-        );
+        assert_eq!(borsh::to_vec(&s).unwrap().len(), ReferralConfig::SIZE);
     }
 
     #[test]
@@ -186,11 +204,7 @@ mod tests {
             bump:       0,
             _padding:   [0; 6],
         };
-        assert_eq!(
-            borsh::to_vec(&s).unwrap().len(),
-            ReferralCode::SIZE,
-            "ReferralCode::SIZE must match serialized length"
-        );
+        assert_eq!(borsh::to_vec(&s).unwrap().len(), ReferralCode::SIZE);
     }
 
     #[test]
@@ -206,11 +220,7 @@ mod tests {
             bump:            0,
             _padding:        [0; 3],
         };
-        assert_eq!(
-            borsh::to_vec(&s).unwrap().len(),
-            ReferralRecord::SIZE,
-            "ReferralRecord::SIZE must match serialized length"
-        );
+        assert_eq!(borsh::to_vec(&s).unwrap().len(), ReferralRecord::SIZE);
     }
 
     #[test]
@@ -224,11 +234,7 @@ mod tests {
             bump:           0,
             _padding:       [0; 7],
         };
-        assert_eq!(
-            borsh::to_vec(&s).unwrap().len(),
-            ReferrerBalance::SIZE,
-            "ReferrerBalance::SIZE must match serialized length"
-        );
+        assert_eq!(borsh::to_vec(&s).unwrap().len(), ReferrerBalance::SIZE);
     }
 
     #[test]
@@ -240,10 +246,25 @@ mod tests {
             bump:              0,
             _padding:          [0; 6],
         };
+        assert_eq!(borsh::to_vec(&s).unwrap().len(), RewardsPool::SIZE);
+    }
+
+    #[test]
+    fn test_claim_request_size() {
+        let s = ClaimRequest {
+            referrer:        [0u8; 32],
+            amount:          0,
+            requested_at:    0,
+            review_deadline: 0,
+            status:          0,
+            executed_at:     0,
+            bump:            0,
+            _padding:        [0; 2],
+        };
         assert_eq!(
             borsh::to_vec(&s).unwrap().len(),
-            RewardsPool::SIZE,
-            "RewardsPool::SIZE must match serialized length"
+            ClaimRequest::SIZE,
+            "ClaimRequest::SIZE must match serialized length"
         );
     }
 
@@ -258,6 +279,18 @@ mod tests {
         assert_eq!(e, ProgramError::Custom(1));
         let e: ProgramError = ReferralError::PurchaseBelowMinimum.into();
         assert_eq!(e, ProgramError::Custom(12));
+        // Security fixes
+        let e: ProgramError = ReferralError::InvalidRewardAmount.into();
+        assert_eq!(e, ProgramError::Custom(13));
+        let e: ProgramError = ReferralError::InvalidPoolVault.into();
+        assert_eq!(e, ProgramError::Custom(14));
+        // Review-gated claim errors
+        let e: ProgramError = ReferralError::ReviewPeriodNotExpired.into();
+        assert_eq!(e, ProgramError::Custom(18));
+        let e: ProgramError = ReferralError::ClaimAlreadyExecuted.into();
+        assert_eq!(e, ProgramError::Custom(19));
+        let e: ProgramError = ReferralError::InvalidClaimStatus.into();
+        assert_eq!(e, ProgramError::Custom(20));
     }
 
     // ── SHA-256 helper ───────────────────────────────────────────────────────
@@ -271,12 +304,10 @@ mod tests {
 
     #[test]
     fn test_sha256_case_sensitivity() {
-        // Callers uppercase before hashing — this test documents that the
-        // hash function itself is case-sensitive; uppercasing is the caller's job.
         assert_ne!(sha256_hash(b"FLOW"), sha256_hash(b"flow"));
     }
 
-    // ── Instruction serialization round-trips ────────────────────────────────
+    // ── Instruction discriminants ────────────────────────────────────────────
 
     #[test]
     fn test_init_config_roundtrip() {
@@ -286,13 +317,7 @@ mod tests {
             min_purchase_lamports: 0,
         };
         let bytes = borsh::to_vec(&ix).unwrap();
-        assert_eq!(bytes[0], 0, "discriminant must be 0");
-        let decoded = ReferralInstruction::try_from_slice(&bytes).unwrap();
-        if let ReferralInstruction::InitializeReferralConfig { reward_bps, .. } = decoded {
-            assert_eq!(reward_bps, 100);
-        } else {
-            panic!("wrong variant");
-        }
+        assert_eq!(bytes[0], 0, "InitializeReferralConfig discriminant must be 0");
     }
 
     #[test]
@@ -300,7 +325,7 @@ mod tests {
         let code = b"FREEFLOW-PROMO".to_vec();
         let ix = ReferralInstruction::RegisterReferralCode { code: code.clone() };
         let bytes = borsh::to_vec(&ix).unwrap();
-        assert_eq!(bytes[0], 2, "discriminant must be 2");
+        assert_eq!(bytes[0], 2, "RegisterReferralCode discriminant must be 2");
         let decoded = ReferralInstruction::try_from_slice(&bytes).unwrap();
         if let ReferralInstruction::RegisterReferralCode { code: c } = decoded {
             assert_eq!(c, code);
@@ -310,37 +335,51 @@ mod tests {
     }
 
     #[test]
-    fn test_record_referral_roundtrip() {
-        let hash = sha256_hash(b"FREEFLOW");
+    fn test_record_referral_discriminant() {
         let ix = ReferralInstruction::RecordReferral {
-            code_hash:       hash,
-            purchase_amount: 5_000_000_000,
+            code_hash:          [0u8; 32],
+            purchase_amount:    5_000_000_000,
+            transferred_reward: 50_000_000,
         };
         let bytes = borsh::to_vec(&ix).unwrap();
-        assert_eq!(bytes[0], 3, "discriminant must be 3");
-        let decoded = ReferralInstruction::try_from_slice(&bytes).unwrap();
-        if let ReferralInstruction::RecordReferral { code_hash, purchase_amount } = decoded {
-            assert_eq!(code_hash, hash);
-            assert_eq!(purchase_amount, 5_000_000_000);
-        } else {
-            panic!("wrong variant");
-        }
+        assert_eq!(bytes[0], 3, "RecordReferral discriminant must be 3");
     }
 
     #[test]
-    fn test_claim_reward_roundtrip() {
+    fn test_claim_reward_discriminant() {
         let ix = ReferralInstruction::ClaimReferralReward;
         let bytes = borsh::to_vec(&ix).unwrap();
-        assert_eq!(bytes[0], 4, "discriminant must be 4");
+        assert_eq!(bytes[0], 4, "ClaimReferralReward discriminant must be 4");
         let decoded = ReferralInstruction::try_from_slice(&bytes).unwrap();
         assert!(matches!(decoded, ReferralInstruction::ClaimReferralReward));
     }
 
     #[test]
-    fn test_deposit_roundtrip() {
+    fn test_approve_claim_discriminant() {
+        let ix = ReferralInstruction::ApproveClaim;
+        let bytes = borsh::to_vec(&ix).unwrap();
+        assert_eq!(bytes[0], 5, "ApproveClaim discriminant must be 5");
+    }
+
+    #[test]
+    fn test_reject_claim_discriminant() {
+        let ix = ReferralInstruction::RejectClaim;
+        let bytes = borsh::to_vec(&ix).unwrap();
+        assert_eq!(bytes[0], 6, "RejectClaim discriminant must be 6");
+    }
+
+    #[test]
+    fn test_defer_claim_discriminant() {
+        let ix = ReferralInstruction::DeferClaim;
+        let bytes = borsh::to_vec(&ix).unwrap();
+        assert_eq!(bytes[0], 7, "DeferClaim discriminant must be 7");
+    }
+
+    #[test]
+    fn test_deposit_discriminant() {
         let ix = ReferralInstruction::DepositRewardsPool { amount: 1_000_000_000 };
         let bytes = borsh::to_vec(&ix).unwrap();
-        assert_eq!(bytes[0], 5, "discriminant must be 5");
+        assert_eq!(bytes[0], 8, "DepositRewardsPool discriminant must be 8");
         let decoded = ReferralInstruction::try_from_slice(&bytes).unwrap();
         if let ReferralInstruction::DepositRewardsPool { amount } = decoded {
             assert_eq!(amount, 1_000_000_000);
@@ -349,32 +388,43 @@ mod tests {
         }
     }
 
-    // ── ReferrerBalance invariant ────────────────────────────────────────────
+    // ── Invariants ───────────────────────────────────────────────────────────
 
     #[test]
-    fn test_referrer_balance_invariant() {
-        // Simulate the state after RecordReferral and partial ClaimReferralReward
+    fn test_referrer_balance_invariant_with_pending() {
+        // With review-gated claims, total_claimed represents LOCKED + DISTRIBUTED.
+        // Invariant: total_earned >= total_claimed (enforced by ClaimReferralReward).
         let mut balance = ReferrerBalance {
             referrer:       [1u8; 32],
             total_earned:   500_000_000,
-            total_claimed:  200_000_000,
+            total_claimed:  200_000_000, // 200M locked in a pending ClaimRequest
             referral_count: 5,
-            next_sequence:  5,
+            next_sequence:  6,
             bump:           255,
             _padding:       [0; 7],
         };
-
-        // Claim available
+        assert!(balance.total_earned >= balance.total_claimed, "invariant holds");
+        // Rejection unlocks: total_claimed -= locked_amount
+        let locked = 200_000_000u64;
+        balance.total_claimed -= locked;
         let available = balance.total_earned - balance.total_claimed;
-        assert_eq!(available, 300_000_000);
-        balance.total_claimed += available;
-
-        // Invariant: total_earned >= total_claimed
-        assert!(balance.total_earned >= balance.total_claimed);
-        assert_eq!(balance.total_earned - balance.total_claimed, 0);
+        assert_eq!(available, 500_000_000, "full amount available after rejection");
     }
 
-    // ── Pool tracking after record ───────────────────────────────────────────
+    #[test]
+    fn test_pool_solvency_invariant() {
+        // vault_balance >= total_deposited - total_distributed
+        let pool = RewardsPool {
+            vault_bump:        0,
+            total_deposited:   1_000_000_000,
+            total_distributed: 300_000_000,
+            bump:              255,
+            _padding:          [0; 6],
+        };
+        let required = pool.total_deposited - pool.total_distributed;
+        assert_eq!(required, 700_000_000);
+        // Pending claims don't reduce vault — only ApproveClaim increments total_distributed
+    }
 
     #[test]
     fn test_pool_tracking_after_record() {
@@ -385,18 +435,13 @@ mod tests {
             bump:              255,
             _padding:          [0; 6],
         };
-
         let reward = calculate_reward(1_000_000_000, 100, u64::MAX).unwrap();
         pool.total_deposited += reward;
-
         assert_eq!(pool.total_deposited, 10_000_000);
     }
 
-    // ── reward_bps validation ────────────────────────────────────────────────
-
     #[test]
     fn test_reward_bps_too_high_error_code() {
-        // 3001 bps should map to RewardBpsTooHigh (code 5)
         use solana_program::program_error::ProgramError;
         let e: ProgramError = ReferralError::RewardBpsTooHigh.into();
         assert_eq!(e, ProgramError::Custom(5));

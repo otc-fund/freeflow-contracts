@@ -1,4 +1,4 @@
-//! DepositRewardsPool — discriminant 5
+//! DepositRewardsPool — discriminant 8
 //!
 //! Allows the foundation authority to manually deposit $FLOW into the pool vault.
 //! Primary use-case: bootstrapping before the first purchases arrive.

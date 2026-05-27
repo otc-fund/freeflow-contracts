@@ -147,3 +147,35 @@ impl RewardsPool {
     /// 1 + 8 + 8 + 1 + 6 = 24
     pub const SIZE: usize = 1 + 8 + 8 + 1 + 6; // = 24
 }
+
+// ─── ClaimRequest ─────────────────────────────────────────────────────────────
+
+/// Per-claim review request PDA.
+///
+/// PDA seeds: [b"claim_request", referrer_pubkey, &sequence.to_le_bytes()]
+///
+/// Created by ClaimReferralReward (discriminant 4). The sequence comes from
+/// ReferrerBalance.next_sequence at the time of the claim request, ensuring
+/// each claim gets a unique PDA.
+///
+/// Status values: 0=Pending, 1=Approved, 2=Rejected, 3=Deferred
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct ClaimRequest {
+    pub referrer:        [u8; 32], // 32
+    pub amount:          u64,      // 8
+    pub requested_at:    i64,      // 8
+    pub review_deadline: i64,      // 8
+    pub status:          u8,       // 1
+    pub executed_at:     i64,      // 8
+    pub bump:            u8,       // 1
+    pub _padding:        [u8; 2],  // 2
+}
+
+impl ClaimRequest {
+    /// Borsh-serialized struct size.
+    /// 32 + 8 + 8 + 8 + 1 + 8 + 1 + 2 = 68
+    pub const SIZE: usize = 32 + 8 + 8 + 8 + 1 + 8 + 1 + 2; // = 68
+
+    /// Review window: 48 hours in seconds.
+    pub const REVIEW_WINDOW_SECS: i64 = 172_800;
+}

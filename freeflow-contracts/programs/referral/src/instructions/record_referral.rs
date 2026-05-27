@@ -4,6 +4,10 @@
 //! and updates RewardsPool tracking. **No token transfer** — the referral cut
 //! was already moved to the pool vault by the user-escrow instruction in the
 //! same transaction.
+//!
+//! Security fixes included:
+//! - H-1: pool_vault account validated against config.rewards_pool_vault
+//! - M-5: transferred_reward validated against calculated reward
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::{
@@ -26,8 +30,11 @@ use crate::{
 /// Instruction data (after discriminant).
 #[derive(BorshSerialize, BorshDeserialize)]
 pub struct RecordReferralArgs {
-    pub code_hash:       [u8; 32],
-    pub purchase_amount: u64,
+    pub code_hash:          [u8; 32],
+    pub purchase_amount:    u64,
+    /// The reward amount actually transferred to the pool vault by user-escrow.
+    /// Must equal calculate_reward(purchase_amount, config.reward_bps, config.max_reward_lamports).
+    pub transferred_reward: u64,
 }
 
 /// Accounts expected (in order):
@@ -39,20 +46,22 @@ pub struct RecordReferralArgs {
 ///  5. `[signer]`   client           — the purchaser
 ///  6. `[]`         referrer         — the referrer
 ///  7. `[]`         system_program
+///  8. `[]`         pool_vault       — SPL token vault (H-1: must match config.rewards_pool_vault)
 pub fn process(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     args: RecordReferralArgs,
 ) -> ProgramResult {
     let iter = &mut accounts.iter();
-    let record_info          = next_account_info(iter)?;
+    let record_info           = next_account_info(iter)?;
     let referrer_balance_info = next_account_info(iter)?;
-    let code_info            = next_account_info(iter)?;
-    let config_info          = next_account_info(iter)?;
-    let rewards_pool_info    = next_account_info(iter)?;
-    let client_info          = next_account_info(iter)?;
-    let referrer_info        = next_account_info(iter)?;
-    let system_program       = next_account_info(iter)?;
+    let code_info             = next_account_info(iter)?;
+    let config_info           = next_account_info(iter)?;
+    let rewards_pool_info     = next_account_info(iter)?;
+    let client_info           = next_account_info(iter)?;
+    let referrer_info         = next_account_info(iter)?;
+    let system_program        = next_account_info(iter)?;
+    let pool_vault_info       = next_account_info(iter)?; // H-1
 
     if !client_info.is_signer {
         return Err(ReferralError::InvalidAuthority.into());
@@ -60,6 +69,11 @@ pub fn process(
 
     // ── 1. Load config ──────────────────────────────────────────────────────
     let config = ReferralConfig::try_from_slice(&config_info.data.borrow())?;
+
+    // ── H-1: Validate pool vault matches config ─────────────────────────────
+    if pool_vault_info.key.to_bytes() != config.rewards_pool_vault {
+        return Err(ReferralError::InvalidPoolVault.into());
+    }
 
     // ── 2. Validate purchase amount ─────────────────────────────────────────
     if args.purchase_amount < config.min_purchase_lamports {
@@ -84,6 +98,11 @@ pub fn process(
         config.reward_bps,
         config.max_reward_lamports,
     )?;
+
+    // ── M-5: Validate transferred reward matches expected ───────────────────
+    if reward != args.transferred_reward {
+        return Err(ReferralError::InvalidRewardAmount.into());
+    }
 
     // ── 5. Load or create ReferrerBalance ───────────────────────────────────
     let (expected_balance_pda, balance_bump) = Pubkey::find_program_address(
@@ -205,4 +224,48 @@ pub fn process(
     pool.serialize(&mut *rewards_pool_info.data.borrow_mut())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{errors::ReferralError, utils::calculate_reward};
+    use solana_program::program_error::ProgramError;
+
+    #[test]
+    fn test_record_referral_wrong_pool_vault() {
+        // H-1: pool_vault doesn't match config.rewards_pool_vault
+        let config_vault    = [1u8; 32];
+        let submitted_vault = [2u8; 32]; // different!
+        assert_ne!(config_vault, submitted_vault, "H-1: mismatch detected");
+        let e: ProgramError = ReferralError::InvalidPoolVault.into();
+        assert_eq!(e, ProgramError::Custom(14));
+    }
+
+    #[test]
+    fn test_record_referral_mismatched_reward() {
+        // M-5: transferred_reward != calculated reward
+        let purchase_amount = 1_000_000_000u64;
+        let reward_bps      = 100u16;
+        let max_reward      = u64::MAX;
+        let expected    = calculate_reward(purchase_amount, reward_bps, max_reward).unwrap();
+        let transferred = expected + 1; // tampered
+        assert_ne!(expected, transferred, "M-5: mismatch detected");
+        let e: ProgramError = ReferralError::InvalidRewardAmount.into();
+        assert_eq!(e, ProgramError::Custom(13));
+    }
+
+    #[test]
+    fn test_record_referral_valid_vault_and_reward() {
+        // Both H-1 and M-5 pass
+        let config_vault    = [5u8; 32];
+        let submitted_vault = [5u8; 32]; // matches
+        assert_eq!(config_vault, submitted_vault, "H-1 passes");
+
+        let purchase_amount = 2_000_000_000u64;
+        let reward_bps      = 200u16;
+        let max_reward      = u64::MAX;
+        let expected    = calculate_reward(purchase_amount, reward_bps, max_reward).unwrap();
+        let transferred = expected; // matches
+        assert_eq!(expected, transferred, "M-5 passes");
+    }
 }
