@@ -1,0 +1,17 @@
+[package]
+name        = "referral"
+version     = "0.1.0"
+edition     = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+# Stub required by anchor build's IDL pipeline; this is a native (non-Anchor) program.
+[features]
+idl-build = []
+
+[dependencies]
+solana-program = { workspace = true }
+spl-token      = { workspace = true }
+borsh          = "1"
+sha2           = "0.10"

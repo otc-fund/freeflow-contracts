@@ -11,6 +11,7 @@ staking       = "7N1JRX3LY3goVAZCyaJyH7kpZ3kboZvh3jteDmCq6Dz4"
 rewards       = "2yeVew5qq5jf5zuoqiE2svVLRE9HTN6J2GfB9LopdM1C"
 registry      = "HkMhMoEv7U8VowyVsCCk9pZDkWwp18ei1BZ3Fif94DCE"
 user_escrow   = "7PzcA2sNDzrvhTNLFScWZuNKS4g7jCCghsowZA9RsZ26"
+referral      = "TBD"
 
 [programs.devnet]
 repflow_token = "8K4GhPEQ1yy9vdTaMPTL83G5qr5ZHZiBm2VBQ58jJs5w"
@@ -18,6 +19,7 @@ staking       = "7N1JRX3LY3goVAZCyaJyH7kpZ3kboZvh3jteDmCq6Dz4"
 rewards       = "2yeVew5qq5jf5zuoqiE2svVLRE9HTN6J2GfB9LopdM1C"
 registry      = "HkMhMoEv7U8VowyVsCCk9pZDkWwp18ei1BZ3Fif94DCE"
 user_escrow   = "7PzcA2sNDzrvhTNLFScWZuNKS4g7jCCghsowZA9RsZ26"
+referral      = "TBD"
 
 [programs.mainnet]
 repflow_token = "8K4GhPEQ1yy9vdTaMPTL83G5qr5ZHZiBm2VBQ58jJs5w"
@@ -25,6 +27,7 @@ staking       = "7N1JRX3LY3goVAZCyaJyH7kpZ3kboZvh3jteDmCq6Dz4"
 rewards       = "2yeVew5qq5jf5zuoqiE2svVLRE9HTN6J2GfB9LopdM1C"
 registry      = "HkMhMoEv7U8VowyVsCCk9pZDkWwp18ei1BZ3Fif94DCE"
 user_escrow   = "7PzcA2sNDzrvhTNLFScWZuNKS4g7jCCghsowZA9RsZ26"
+referral      = "TBD"
 
 [registry]
 url = "https://api.apr.dev"

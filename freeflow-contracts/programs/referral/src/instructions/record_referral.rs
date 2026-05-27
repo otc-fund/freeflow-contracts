@@ -1,0 +1,208 @@
+//! RecordReferral — discriminant 3
+//!
+//! Pure bookkeeping: creates a ReferralRecord PDA, updates ReferrerBalance,
+//! and updates RewardsPool tracking. **No token transfer** — the referral cut
+//! was already moved to the pool vault by the user-escrow instruction in the
+//! same transaction.
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    clock::Clock,
+    entrypoint::ProgramResult,
+    program::invoke_signed,
+    pubkey::Pubkey,
+    rent::Rent,
+    system_instruction,
+    sysvar::Sysvar,
+};
+
+use crate::{
+    errors::ReferralError,
+    state::{ReferralCode, ReferralConfig, ReferralRecord, ReferrerBalance, RewardsPool},
+    utils::calculate_reward,
+};
+
+/// Instruction data (after discriminant).
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct RecordReferralArgs {
+    pub code_hash:       [u8; 32],
+    pub purchase_amount: u64,
+}
+
+/// Accounts expected (in order):
+///  0. `[writable]` record           — new `ReferralRecord` PDA (will be created)
+///  1. `[writable]` referrer_balance — `ReferrerBalance` PDA (created if absent)
+///  2. `[]`         code             — `ReferralCode` PDA (must be claimed)
+///  3. `[]`         config           — `ReferralConfig` PDA
+///  4. `[writable]` rewards_pool     — `RewardsPool` PDA
+///  5. `[signer]`   client           — the purchaser
+///  6. `[]`         referrer         — the referrer
+///  7. `[]`         system_program
+pub fn process(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    args: RecordReferralArgs,
+) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let record_info          = next_account_info(iter)?;
+    let referrer_balance_info = next_account_info(iter)?;
+    let code_info            = next_account_info(iter)?;
+    let config_info          = next_account_info(iter)?;
+    let rewards_pool_info    = next_account_info(iter)?;
+    let client_info          = next_account_info(iter)?;
+    let referrer_info        = next_account_info(iter)?;
+    let system_program       = next_account_info(iter)?;
+
+    if !client_info.is_signer {
+        return Err(ReferralError::InvalidAuthority.into());
+    }
+
+    // ── 1. Load config ──────────────────────────────────────────────────────
+    let config = ReferralConfig::try_from_slice(&config_info.data.borrow())?;
+
+    // ── 2. Validate purchase amount ─────────────────────────────────────────
+    if args.purchase_amount < config.min_purchase_lamports {
+        return Err(ReferralError::PurchaseBelowMinimum.into());
+    }
+
+    // ── 3. Validate referral code ───────────────────────────────────────────
+    let code = ReferralCode::try_from_slice(&code_info.data.borrow())?;
+    if !code.is_claimed {
+        return Err(ReferralError::CodeNotClaimed.into());
+    }
+    if code.referrer != referrer_info.key.to_bytes() {
+        return Err(ReferralError::InvalidReferralCode.into());
+    }
+    if code.code_hash != args.code_hash {
+        return Err(ReferralError::InvalidReferralCode.into());
+    }
+
+    // ── 4. Calculate reward ─────────────────────────────────────────────────
+    let reward = calculate_reward(
+        args.purchase_amount,
+        config.reward_bps,
+        config.max_reward_lamports,
+    )?;
+
+    // ── 5. Load or create ReferrerBalance ───────────────────────────────────
+    let (expected_balance_pda, balance_bump) = Pubkey::find_program_address(
+        &[b"referrer_balance", referrer_info.key.as_ref()],
+        program_id,
+    );
+    if referrer_balance_info.key != &expected_balance_pda {
+        return Err(solana_program::program_error::ProgramError::InvalidSeeds);
+    }
+
+    if referrer_balance_info.data_is_empty() {
+        let rent = Rent::get()?;
+        let lamports = rent.minimum_balance(ReferrerBalance::SIZE);
+        invoke_signed(
+            &system_instruction::create_account(
+                client_info.key,
+                referrer_balance_info.key,
+                lamports,
+                ReferrerBalance::SIZE as u64,
+                program_id,
+            ),
+            &[
+                client_info.clone(),
+                referrer_balance_info.clone(),
+                system_program.clone(),
+            ],
+            &[&[b"referrer_balance", referrer_info.key.as_ref(), &[balance_bump]]],
+        )?;
+        let initial = ReferrerBalance {
+            referrer:       referrer_info.key.to_bytes(),
+            total_earned:   0,
+            total_claimed:  0,
+            referral_count: 0,
+            next_sequence:  0,
+            bump:           balance_bump,
+            _padding:       [0; 7],
+        };
+        initial.serialize(&mut *referrer_balance_info.data.borrow_mut())?;
+    }
+
+    let mut balance =
+        ReferrerBalance::try_from_slice(&referrer_balance_info.data.borrow())?;
+    let sequence = balance.next_sequence;
+
+    // ── 6. Create ReferralRecord PDA ────────────────────────────────────────
+    let seq_bytes = sequence.to_le_bytes();
+    let (expected_record_pda, record_bump) = Pubkey::find_program_address(
+        &[
+            b"referral_record",
+            referrer_info.key.as_ref(),
+            client_info.key.as_ref(),
+            &seq_bytes,
+        ],
+        program_id,
+    );
+    if record_info.key != &expected_record_pda {
+        return Err(solana_program::program_error::ProgramError::InvalidSeeds);
+    }
+
+    let rent = Rent::get()?;
+    let record_lamports = rent.minimum_balance(ReferralRecord::SIZE);
+    invoke_signed(
+        &system_instruction::create_account(
+            client_info.key,
+            record_info.key,
+            record_lamports,
+            ReferralRecord::SIZE as u64,
+            program_id,
+        ),
+        &[
+            client_info.clone(),
+            record_info.clone(),
+            system_program.clone(),
+        ],
+        &[&[
+            b"referral_record",
+            referrer_info.key.as_ref(),
+            client_info.key.as_ref(),
+            &seq_bytes,
+            &[record_bump],
+        ]],
+    )?;
+
+    let clock = Clock::get()?;
+    let record = ReferralRecord {
+        referrer:        referrer_info.key.to_bytes(),
+        client:          client_info.key.to_bytes(),
+        purchase_amount: args.purchase_amount,
+        reward_lamports: reward,
+        code_hash:       args.code_hash,
+        timestamp:       clock.unix_timestamp,
+        sequence,
+        bump:            record_bump,
+        _padding:        [0; 3],
+    };
+    record.serialize(&mut *record_info.data.borrow_mut())?;
+
+    // ── 7. Update ReferrerBalance ───────────────────────────────────────────
+    balance.total_earned = balance
+        .total_earned
+        .checked_add(reward)
+        .ok_or(ReferralError::Overflow)?;
+    balance.referral_count = balance
+        .referral_count
+        .checked_add(1)
+        .ok_or(ReferralError::Overflow)?;
+    balance.next_sequence = balance
+        .next_sequence
+        .checked_add(1)
+        .ok_or(ReferralError::Overflow)?;
+    balance.serialize(&mut *referrer_balance_info.data.borrow_mut())?;
+
+    // ── 8. Update RewardsPool tracking ──────────────────────────────────────
+    let mut pool = RewardsPool::try_from_slice(&rewards_pool_info.data.borrow())?;
+    pool.total_deposited = pool
+        .total_deposited
+        .checked_add(reward)
+        .ok_or(ReferralError::Overflow)?;
+    pool.serialize(&mut *rewards_pool_info.data.borrow_mut())?;
+
+    Ok(())
+}

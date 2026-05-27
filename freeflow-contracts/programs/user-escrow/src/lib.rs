@@ -35,6 +35,17 @@ declare_id!("7PzcA2sNDzrvhTNLFScWZuNKS4g7jCCghsowZA9RsZ26");
 pub const FOUNDATION_PUBKEY: Pubkey =
     solana_program::pubkey!("8SL4dhnXU9tjvsbwfkVzQbfV99wGnVZBECoiuwrdbaJk");
 
+/// Calculate referral reward without importing the referral crate.
+///
+/// Uses u128 to prevent overflow. Returns `min(amount * bps / 10_000, max_reward)`.
+fn calculate_referral_reward(amount: u64, reward_bps: u16, max_reward: u64) -> u64 {
+    let reward = (amount as u128)
+        .saturating_mul(reward_bps as u128)
+        .checked_div(10_000)
+        .unwrap_or(0) as u64;
+    reward.min(max_reward)
+}
+
 // ─── Program ─────────────────────────────────────────────────────────────────
 
 #[program]
@@ -102,12 +113,19 @@ pub mod user_escrow {
     /// Fixed price: $0.10 / $FLOW.
     /// payment_amount is in USD cents (e.g. 300 = $3.00 = 30 $FLOW).
     ///
+    /// When `referrer` is `Some(pubkey)`, a referral cut is split to `pool_vault`
+    /// and only the remainder goes to escrow. Pass `None` for the original behaviour.
+    ///
+    /// When `referrer` is `None`, `pool_vault` and `referral_config` may be any
+    /// pubkey (e.g. `SystemProgram::id()`); they are not accessed.
+    ///
     /// NO cap check — permanent escrow makes sybil attacks harmless.
     /// NO withdrawal function — code does not exist.
     pub fn purchase_and_escrow(
-        ctx: Context<PurchaseAndEscrow>,
+        ctx:            Context<PurchaseAndEscrow>,
         payment_amount: u64,
         payment_type:   PaymentType,
+        referrer:       Option<Pubkey>,
     ) -> Result<()> {
         require!(payment_amount > 0, EscrowError::InvalidPaymentAmount);
 
@@ -122,37 +140,76 @@ pub mod user_escrow {
 
         require!(flow_lamports > 0, EscrowError::InvalidPaymentAmount);
 
-        // Transfer $FLOW from treasury vault → user escrow token account.
-        // treasury_authority PDA signs the transfer.
         let bump = ctx.bumps.treasury_authority;
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from:      ctx.accounts.treasury_vault_token.to_account_info(),
-                    to:        ctx.accounts.user_escrow_token.to_account_info(),
-                    authority: ctx.accounts.treasury_authority.to_account_info(),
-                },
-                &[&[b"treasury_authority", &[bump]]],
-            ),
-            flow_lamports,
-        )?;
 
-        // Update escrow state (idempotent on user field).
+        // Determine how much goes to escrow vs. referral pool.
+        let (escrow_amount, referral_reward) = if referrer.is_some() {
+            // Read reward params from ReferralConfig at known raw-Borsh offsets:
+            //   [0..2]  reward_bps:            u16
+            //   [2..10] max_reward_lamports:   u64
+            let config_data = ctx.accounts.referral_config.data.borrow();
+            require!(config_data.len() >= 10, EscrowError::InvalidPaymentAmount);
+            let reward_bps  = u16::from_le_bytes(config_data[0..2].try_into().unwrap());
+            let max_reward  = u64::from_le_bytes(config_data[2..10].try_into().unwrap());
+            drop(config_data);
+
+            let reward = calculate_referral_reward(flow_lamports, reward_bps, max_reward);
+            let remainder = flow_lamports
+                .checked_sub(reward)
+                .ok_or(EscrowError::InvalidPaymentAmount)?;
+            (remainder, reward)
+        } else {
+            (flow_lamports, 0u64)
+        };
+
+        // Transfer referral cut to pool vault (treasury_authority PDA signs).
+        if referral_reward > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from:      ctx.accounts.treasury_vault_token.to_account_info(),
+                        to:        ctx.accounts.pool_vault.to_account_info(),
+                        authority: ctx.accounts.treasury_authority.to_account_info(),
+                    },
+                    &[&[b"treasury_authority", &[bump]]],
+                ),
+                referral_reward,
+            )?;
+        }
+
+        // Transfer remainder (or full amount when no referral) to user escrow.
+        if escrow_amount > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from:      ctx.accounts.treasury_vault_token.to_account_info(),
+                        to:        ctx.accounts.user_escrow_token.to_account_info(),
+                        authority: ctx.accounts.treasury_authority.to_account_info(),
+                    },
+                    &[&[b"treasury_authority", &[bump]]],
+                ),
+                escrow_amount,
+            )?;
+        }
+
+        // Update escrow state (escrow_amount, not full flow_lamports, when referral active).
         let escrow           = &mut ctx.accounts.user_escrow;
         escrow.user          = ctx.accounts.user.key();
         escrow.balance       = escrow
             .balance
-            .checked_add(flow_lamports)
+            .checked_add(escrow_amount)
             .ok_or(EscrowError::InvalidPaymentAmount)?;
         escrow.last_topup_ts = Clock::get()?.unix_timestamp as u64;
 
         emit!(PurchaseAndEscrowed {
-            user:           ctx.accounts.user.key(),
+            user:             ctx.accounts.user.key(),
             payment_type,
             payment_amount,
-            flow_amount:    flow_lamports,
-            escrow_balance: escrow.balance,
+            flow_amount:      flow_lamports,
+            escrow_balance:   escrow.balance,
+            referral_reward,
         });
 
         Ok(())
@@ -163,41 +220,80 @@ pub mod user_escrow {
     /// Phase 2: User already bought $FLOW on DEX, sends it to escrow.
     ///
     /// market-price — no oracle needed here (user bears slippage via min_flow_amount).
+    ///
+    /// When `referrer` is `Some(pubkey)`, a referral cut is split to `pool_vault`
+    /// and only the remainder goes to escrow. Pass `None` for the original behaviour.
     pub fn purchase_and_escrow_phase2(
-        ctx: Context<PurchaseAndEscrowPhase2>,
+        ctx:             Context<PurchaseAndEscrowPhase2>,
         min_flow_amount: u64,
         flow_amount:     u64,
+        referrer:        Option<Pubkey>,
     ) -> Result<()> {
         require!(flow_amount > 0, EscrowError::InvalidPaymentAmount);
         require!(flow_amount >= min_flow_amount, EscrowError::InvalidPaymentAmount);
 
-        // Transfer $FLOW from user token account → user escrow token account.
-        token::transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from:      ctx.accounts.user_token.to_account_info(),
-                    to:        ctx.accounts.user_escrow_token.to_account_info(),
-                    authority: ctx.accounts.user.to_account_info(),
-                },
-            ),
-            flow_amount,
-        )?;
+        // Determine how much goes to escrow vs. referral pool.
+        let (escrow_amount, referral_reward) = if referrer.is_some() {
+            let config_data = ctx.accounts.referral_config.data.borrow();
+            require!(config_data.len() >= 10, EscrowError::InvalidPaymentAmount);
+            let reward_bps  = u16::from_le_bytes(config_data[0..2].try_into().unwrap());
+            let max_reward  = u64::from_le_bytes(config_data[2..10].try_into().unwrap());
+            drop(config_data);
+
+            let reward = calculate_referral_reward(flow_amount, reward_bps, max_reward);
+            let remainder = flow_amount
+                .checked_sub(reward)
+                .ok_or(EscrowError::InvalidPaymentAmount)?;
+            (remainder, reward)
+        } else {
+            (flow_amount, 0u64)
+        };
+
+        // Transfer referral cut to pool vault (user signs directly — no PDA needed).
+        if referral_reward > 0 {
+            token::transfer(
+                CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from:      ctx.accounts.user_token.to_account_info(),
+                        to:        ctx.accounts.pool_vault.to_account_info(),
+                        authority: ctx.accounts.user.to_account_info(),
+                    },
+                ),
+                referral_reward,
+            )?;
+        }
+
+        // Transfer remainder (or full amount when no referral) to user escrow.
+        if escrow_amount > 0 {
+            token::transfer(
+                CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from:      ctx.accounts.user_token.to_account_info(),
+                        to:        ctx.accounts.user_escrow_token.to_account_info(),
+                        authority: ctx.accounts.user.to_account_info(),
+                    },
+                ),
+                escrow_amount,
+            )?;
+        }
 
         let escrow           = &mut ctx.accounts.user_escrow;
         escrow.user          = ctx.accounts.user.key();
         escrow.balance       = escrow
             .balance
-            .checked_add(flow_amount)
+            .checked_add(escrow_amount)
             .ok_or(EscrowError::InvalidPaymentAmount)?;
         escrow.last_topup_ts = Clock::get()?.unix_timestamp as u64;
 
         emit!(PurchaseAndEscrowed {
-            user:           ctx.accounts.user.key(),
-            payment_type:   PaymentType::Dex,
-            payment_amount: flow_amount,
+            user:             ctx.accounts.user.key(),
+            payment_type:     PaymentType::Dex,
+            payment_amount:   flow_amount,
             flow_amount,
-            escrow_balance: escrow.balance,
+            escrow_balance:   escrow.balance,
+            referral_reward,
         });
 
         Ok(())
@@ -601,6 +697,16 @@ pub struct PurchaseAndEscrow<'info> {
     pub token_mint:    Account<'info, Mint>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+
+    /// CHECK: Referral pool vault SPL token account.
+    ///        Pass `SystemProgram::id()` when `referrer` is `None`.
+    ///        When `referrer` is `Some`, must be the pool vault from ReferralConfig.
+    #[account(mut)]
+    pub pool_vault: UncheckedAccount<'info>,
+
+    /// CHECK: ReferralConfig PDA from the referral program. Raw bytes read at offsets [0..10].
+    ///        Pass `SystemProgram::id()` when `referrer` is `None`.
+    pub referral_config: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -635,6 +741,15 @@ pub struct PurchaseAndEscrowPhase2<'info> {
     pub token_mint:    Account<'info, Mint>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+
+    /// CHECK: Referral pool vault SPL token account.
+    ///        Pass `SystemProgram::id()` when `referrer` is `None`.
+    #[account(mut)]
+    pub pool_vault: UncheckedAccount<'info>,
+
+    /// CHECK: ReferralConfig PDA from the referral program. Raw bytes read at offsets [0..10].
+    ///        Pass `SystemProgram::id()` when `referrer` is `None`.
+    pub referral_config: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -825,14 +940,16 @@ pub enum PaymentType {
 
 #[event]
 pub struct PurchaseAndEscrowed {
-    pub user:           Pubkey,
-    pub payment_type:   PaymentType,
+    pub user:             Pubkey,
+    pub payment_type:     PaymentType,
     /// USD cents paid (e.g. 300 = $3.00).
-    pub payment_amount: u64,
-    /// $FLOW lamports transferred to escrow.
-    pub flow_amount:    u64,
+    pub payment_amount:   u64,
+    /// Total $FLOW lamports purchased (escrow_amount + referral_reward).
+    pub flow_amount:      u64,
     /// New total escrow balance in $FLOW lamports.
-    pub escrow_balance: u64,
+    pub escrow_balance:   u64,
+    /// $FLOW lamports transferred to referral pool vault. 0 when no referrer.
+    pub referral_reward:  u64,
 }
 
 #[event]
