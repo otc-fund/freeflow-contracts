@@ -1055,7 +1055,7 @@ pub enum RewardsInstruction {
     /// Accounts:
     ///   0: resolver_wallet (signer — anyone can trigger)
     ///   1: pending_claims (PendingClaimsStore PDA, writable)
-    ///   2: reward_account (relay's reward PDA, writable — for released rewards)
+    ///   2: reward_account (account slot — ignored; RewardAccount removed)
     ForceResolve {
         /// SHA-256 of the stalled disputed claim.
         claim_hash: [u8; 32],
@@ -1067,7 +1067,7 @@ pub enum RewardsInstruction {
     ///
     /// Accounts:
     ///   0: relay_wallet (signer)
-    ///   1: reward_account (relay's reward PDA, writable)
+    ///   1: reward_account (account slot — ignored; RewardAccount removed)
     ///   2: pending_claims (PendingClaimsStore PDA, writable)
     ///   3: reservation_account (UserEscrowReservation PDA for user, writable, optional)
     ///   4: user_escrow_account (UserEscrow PDA from user-escrow program, readable, optional)
@@ -2703,7 +2703,7 @@ fn parse_claim_usage_accounts<'s, 'info: 's>(
 ///
 /// Account layout:
 ///   0: relay_wallet      — signer
-///   1: reward_account    — relay's aggregate reward PDA (writable)
+///   1: reward_account    — account slot; ignored (RewardAccount removed)
 ///   2: claim_state       — UserRelayClaimState PDA for (client, relay) (writable)
 ///   3: pending_claims    — PendingClaimsStore PDA for this relay (writable, optional)
 ///   4: rewards_config    — RewardsConfig PDA (readable, optional)
@@ -4024,7 +4024,7 @@ fn parse_release_accounts<'s, 'info: 's>(
 ///
 /// Account layout:
 ///   0: relay_wallet          — signer (relay's wallet; also used as `relay` param in CPI)
-///   1: reward_account        — relay's aggregate reward PDA (writable)
+///   1: reward_account        — account slot; ignored (RewardAccount removed)
 ///   2: pending_claims        — PendingClaimsStore PDA (writable)
 ///   3: reservation           — UserEscrowReservation PDA for user (writable, optional)
 ///   4: user_escrow_state     — UserEscrow PDA from user-escrow program (writable, optional)
@@ -4050,7 +4050,7 @@ fn process_release_rewards_ix(
 ) -> ProgramResult {
     let ParsedReleaseAccounts {
         relay_wallet,
-        reward_account,
+        reward_account: _reward_account, // account slot kept for layout compat; RewardAccount removed
         pending_claims_ai,
         reservation_ai,
         user_escrow_state_ai,
