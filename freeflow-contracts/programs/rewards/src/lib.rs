@@ -16,8 +16,8 @@
 //!   Icon       (50K+ repFlow):     1.5×  — maximum
 //!
 //! Instructions:
-//!   0x00  ClaimRewards     — relay submits signed claim (legacy)
-//!   0x01  RecordBytes      — oracle posts byte counters (legacy)
+//!   0x00  (disabled)       — was ClaimRewards; permanently disabled, returns InvalidInstructionData
+//!   0x01  RecordBytes      — oracle posts byte counters (legacy, disabled)
 //!   0x02  ClaimUsage       — relay submits usage records → escrowed, 7-day dispute window
 //!   0x03  DisputeClaim     — challenger disputes a record within the window
 //!   0x04  ResolveDispute   — anyone resolves after dispute (Ed25519 verify)
@@ -870,16 +870,12 @@ pub fn process_instruction(
         .map_err(|_| ProgramError::InvalidInstructionData)?;
 
     match ix {
-        RewardsInstruction::ClaimRewards {
-            period_start, period_end,
-            bytes_routed, bytes_seeded, uptime_seconds,
-            repflow_balance,
-        } => process_claim(
-            program_id, accounts,
-            period_start, period_end,
-            bytes_routed, bytes_seeded, uptime_seconds,
-            repflow_balance,
-        ),
+        RewardsInstruction::LegacyClaimRewards => {
+            // disc=0: permanently disabled. Was ClaimRewards (aggregate self-report, no
+            // client signatures). All relays must use ClaimUsage (disc=2) instead.
+            msg!("ClaimRewards (disc=0) is permanently disabled. Use ClaimUsage (disc=2).");
+            Err(ProgramError::InvalidInstructionData)
+        }
         RewardsInstruction::RecordBytes { relay_pubkey, bytes_routed, bytes_seeded } => {
             process_record_bytes(program_id, accounts, relay_pubkey, bytes_routed, bytes_seeded)
         }
@@ -976,16 +972,9 @@ pub fn process_instruction(
 
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
 pub enum RewardsInstruction {
-    /// Legacy: relay submits aggregate byte/uptime counts. No sequence enforcement.
-    ClaimRewards {
-        period_start:    i64,
-        period_end:      i64,
-        bytes_routed:    u64,
-        bytes_seeded:    u64,
-        uptime_seconds:  u64,
-        /// repFlow balance, oracle-attested at claim time.
-        repflow_balance: u64,
-    },
+    /// Disc=0: permanently disabled. Was ClaimRewards (legacy aggregate self-report).
+    /// Returns InvalidInstructionData. Unit variant preserves discriminant stability.
+    LegacyClaimRewards,
     /// Legacy: oracle posts verified byte counters on-chain.
     RecordBytes {
         relay_pubkey: [u8; 32],
@@ -2522,141 +2511,9 @@ pub fn release_rewards(
     Ok((relay_amount, bond, treasury_penalty))
 }
 
-// ─── repFlow tier ─────────────────────────────────────────────────────────────
-
-/// repFlow tier determines reward multipliers and cashback.
-/// Mirrors freeflow-relay-runtime/src/repflow/tiers.rs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepFlowTier {
-    Newcomer = 0,  // 0–1,000
-    Active   = 1,  // 1,001–5,000
-    Trusted  = 2,  // 5,001–10,000
-    Veteran  = 3,  // 10,001–25,000
-    Legend   = 4,  // 25,001–50,000
-    Icon     = 5,  // 50,001+
-}
-
-impl RepFlowTier {
-    pub fn from_balance(balance: u64) -> Self {
-        match balance {
-            0..=1_000          => Self::Newcomer,
-            1_001..=5_000      => Self::Active,
-            5_001..=10_000     => Self::Trusted,
-            10_001..=25_000    => Self::Veteran,
-            25_001..=50_000    => Self::Legend,
-            _                  => Self::Icon,
-        }
-    }
-
-    /// Reward multiplier in basis points (100 = 1.0×).
-    pub fn reward_multiplier_bps(self) -> u64 {
-        match self {
-            Self::Newcomer => 90,
-            Self::Active   => 100,
-            Self::Trusted  => 110,
-            Self::Veteran  => 130,
-            Self::Legend   => 140,
-            Self::Icon     => 150,
-        }
-    }
-
-    /// Cashback percentage on routing + seeding rewards (2%–12%).
-    pub fn cashback_percent(self) -> u64 {
-        match self {
-            Self::Newcomer => 2,
-            Self::Active   => 3,
-            Self::Trusted  => 5,
-            Self::Veteran  => 7,
-            Self::Legend   => 10,
-            Self::Icon     => 12,
-        }
-    }
-}
-
-// ── On-chain reward account ───────────────────────────────────────────────────
-
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
-pub struct RewardAccount {
-    pub relay_wallet:           [u8; 32],
-    pub total_lamports_claimed: u64,
-    pub total_bytes_routed:     u64,
-    pub total_bytes_seeded:     u64,
-    pub total_uptime_seconds:   u64,
-    pub last_claim_ts:          i64,
-    pub claim_count:            u64,
-    /// DEPRECATED — kept for backwards compat with existing accounts.
-    pub tier:                   u8,
-    pub bump:                   u8,
-    // ── repFlow fields (added in v2) ──────────────────────────────────────
-    pub repflow_balance:        u64,
-    pub repflow_tier:           u8,
-    pub total_cashback_earned:  u64,
-}
-
-impl RewardAccount {
-    pub const SIZE: usize =
-        32 + 8 + 8 + 8 + 8 + 8 + 8 + 1 + 1
-        + 8 + 1 + 8;
-
-    // Target emission rates (E1 fix — previously 1000× below on-chain PDA values).
-    // Routing:  1 FLOW/GB  = 10^9 base units / 1024 MB ≈ 1_000_000 base units/MB
-    // Seeding:  2 FLOW/GB  ≈ 2_000_000 base units/MB
-    // Uptime:   10 FLOW/hr = 10 × 10^9 = 10_000_000_000 base units/hr
-    const BASE_ROUTING_PER_MB:   u64 = 1_000_000;
-    const BASE_SEEDING_PER_MB:   u64 = 2_000_000;
-    const BASE_UPTIME_PER_HOUR:  u64 = 10_000_000_000;
-    const MIN_CLAIM_INTERVAL:    i64 = 86_400;
-
-    pub fn calculate_reward(
-        &self,
-        bytes_routed:    u64,
-        bytes_seeded:    u64,
-        uptime_seconds:  u64,
-        repflow_balance: u64,
-        routing_per_mb:  u64,   // from RewardRatesAccount PDA; use BASE_ROUTING_PER_MB as default
-        seeding_per_mb:  u64,   // from RewardRatesAccount PDA; use BASE_SEEDING_PER_MB as default
-        uptime_per_hour: u64,   // from RewardRatesAccount PDA; use BASE_UPTIME_PER_HOUR as default
-    ) -> u64 {
-        let routing_mb = bytes_routed / (1024 * 1024);
-        let seeding_mb = bytes_seeded / (1024 * 1024);
-
-        let repflow_tier   = RepFlowTier::from_balance(repflow_balance);
-        let multiplier_bps = repflow_tier.reward_multiplier_bps();
-        let cashback_pct   = repflow_tier.cashback_percent();
-
-        let routing_base = routing_mb.saturating_mul(routing_per_mb);
-        let seeding_base = seeding_mb.saturating_mul(seeding_per_mb);
-
-        // E2 fix: multiply-then-divide to preserve sub-hour precision.
-        // Old: (uptime_seconds / 3600) * uptime_per_hour → 0 for 3599 s
-        // New: (uptime_seconds * uptime_per_hour) / 3600  → ≈ uptime_per_hour for 3599 s
-        // Note: uptime_per_hour = 10_000_000_000 fits in u64; uptime_seconds ≤ 172_800 (48h cap).
-        // Max product: 172_800 × 10_000_000_000 = 1.728×10^15 < u64::MAX (1.84×10^19) — safe.
-        let uptime_base = uptime_seconds
-            .saturating_mul(uptime_per_hour)
-            .saturating_div(3600);
-
-        // H-01: Use saturating arithmetic to prevent silent integer overflow
-        // when bytes_routed or bytes_seeded are abnormally large. Saturating at
-        // u64::MAX is safe here — the caller validates inputs via MAX_BYTES_PER_SECOND.
-        let routing_reward = routing_base
-            .saturating_mul(multiplier_bps)
-            .saturating_div(100);
-        let seeding_reward = seeding_base
-            .saturating_mul(multiplier_bps)
-            .saturating_div(100);
-
-        let cashback = routing_reward
-            .saturating_add(seeding_reward)
-            .saturating_mul(cashback_pct)
-            .saturating_div(100);
-
-        routing_reward
-            .saturating_add(seeding_reward)
-            .saturating_add(uptime_base)
-            .saturating_add(cashback)
-    }
-}
+// RepFlowTier and RewardAccount removed — only used by the legacy ClaimRewards
+// path (disc=0), which is permanently disabled. ClaimUsage (disc=2) uses
+// RewardRatesAccount PDA for rate lookup and does not use tier multipliers.
 
 // ─── P1 Reservation helpers ───────────────────────────────────────────────────
 
@@ -2763,159 +2620,7 @@ fn write_store(ai: &AccountInfo, store: &PendingClaimsStore) -> Result<(), Progr
 
 // ── Instruction processors ────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
-#[inline(never)]
-fn process_claim(
-    program_id:      &Pubkey,
-    accounts:        &[AccountInfo],
-    period_start:    i64,
-    period_end:      i64,
-    bytes_routed:    u64,
-    bytes_seeded:    u64,
-    uptime_seconds:  u64,
-    repflow_balance: u64,
-) -> ProgramResult {
-    let accounts_iter  = &mut accounts.iter();
-    let relay_wallet   = next_account_info(accounts_iter)?;
-    let reward_account = next_account_info(accounts_iter)?;
-
-    // account[2] (optional, readonly): RewardRatesAccount PDA [b"reward_rates"]
-    // When present and valid, live PDA rates are used for reward calculation (E1 fix).
-    // When absent or unparseable, falls back to BASE_* constants (backward compatible).
-    let reward_rates_ai = accounts_iter.next();
-    let (routing_per_mb, seeding_per_mb, uptime_per_hour) = match reward_rates_ai {
-        Some(ai) if ai.lamports() > 0 && ai.data_len() >= RewardRatesAccount::SIZE => {
-            match RewardRatesAccount::try_from_slice(&ai.try_borrow_data()?) {
-                Ok(rr) => {
-                    msg!(
-                        "ClaimRewards: PDA rates routing={}/MB seeding={}/MB uptime={}/hr",
-                        rr.routing_per_mb, rr.seeding_per_mb, rr.uptime_per_hour
-                    );
-                    (rr.routing_per_mb, rr.seeding_per_mb, rr.uptime_per_hour)
-                }
-                Err(_) => {
-                    msg!("ClaimRewards: reward_rates PDA parse failed — using fallback constants");
-                    (RewardAccount::BASE_ROUTING_PER_MB, RewardAccount::BASE_SEEDING_PER_MB, RewardAccount::BASE_UPTIME_PER_HOUR)
-                }
-            }
-        }
-        _ => {
-            msg!("ClaimRewards: no reward_rates PDA supplied — using fallback constants");
-            (RewardAccount::BASE_ROUTING_PER_MB, RewardAccount::BASE_SEEDING_PER_MB, RewardAccount::BASE_UPTIME_PER_HOUR)
-        }
-    };
-
-    if !relay_wallet.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-
-    // F1-H5: Cap repflow_balance to the Icon-tier maximum (50,001 units).
-    // repflow_balance comes from instruction data (not on-chain) — an inflated
-    // value boosts the multiplier from 0.9x (Newcomer) up to 1.5x (Icon), but
-    // claiming more than Icon is meaningless and signals tampering.
-    const MAX_REPFLOW_BALANCE: u64 = 100_000; // 2× Icon threshold — generous safety margin
-    if repflow_balance > MAX_REPFLOW_BALANCE {
-        msg!("ClaimRewards: repflow_balance {} exceeds sanity cap {}", repflow_balance, MAX_REPFLOW_BALANCE);
-        return Err(ProgramError::InvalidInstructionData);
-    }
-
-    // F1-M1: Cap per-period bytes to prevent fabricated overclaims.
-    // At MAX_BYTES_PER_SECOND (1 GB/s) over the max period (48 h), legitimate
-    // throughput is at most ~172 TB. Cap at 200 TB to give headroom.
-    const MAX_BYTES_PER_PERIOD: u64 = 200 * 1024 * 1024 * 1024 * 1024; // 200 TB
-    if bytes_routed > MAX_BYTES_PER_PERIOD || bytes_seeded > MAX_BYTES_PER_PERIOD {
-        msg!("ClaimRewards: bytes exceed per-period cap (200 TB)");
-        return Err(ProgramError::InvalidInstructionData);
-    }
-
-    let clock = Clock::get()?;
-
-    let mut state = if reward_account.data_len() >= RewardAccount::SIZE
-        && reward_account.lamports() > 0
-    {
-        let data = reward_account.try_borrow_data()?;
-        RewardAccount::try_from_slice(&data)
-            .map_err(|_| ProgramError::InvalidAccountData)?
-    } else {
-        let repflow_tier = RepFlowTier::from_balance(repflow_balance) as u8;
-        RewardAccount {
-            relay_wallet:           relay_wallet.key.to_bytes(),
-            total_lamports_claimed: 0,
-            total_bytes_routed:     0,
-            total_bytes_seeded:     0,
-            total_uptime_seconds:   0,
-            last_claim_ts:          0,
-            claim_count:            0,
-            tier:                   1,
-            bump:                   0,
-            repflow_balance,
-            repflow_tier,
-            total_cashback_earned:  0,
-        }
-    };
-
-    if state.last_claim_ts > 0 {
-        let elapsed = clock.unix_timestamp - state.last_claim_ts;
-        if elapsed < RewardAccount::MIN_CLAIM_INTERVAL {
-            msg!("Claim too soon: {}s elapsed, need {}s", elapsed, RewardAccount::MIN_CLAIM_INTERVAL);
-            return Err(ProgramError::InvalidInstructionData);
-        }
-    }
-
-    let reward = state.calculate_reward(
-        bytes_routed, bytes_seeded, uptime_seconds, repflow_balance,
-        routing_per_mb, seeding_per_mb, uptime_per_hour,
-    );
-    if reward == 0 {
-        msg!("No rewards to claim");
-        return Err(ProgramError::InvalidInstructionData);
-    }
-
-    let repflow_tier  = RepFlowTier::from_balance(repflow_balance);
-    let cashback_pct  = repflow_tier.cashback_percent();
-    let routing_mb    = bytes_routed / (1024 * 1024);
-    let seeding_mb    = bytes_seeded / (1024 * 1024);
-    // H-01: Use saturating arithmetic throughout — mirrors calculate_reward() with PDA rates.
-    let routing_r     = routing_mb
-        .saturating_mul(routing_per_mb)
-        .saturating_mul(repflow_tier.reward_multiplier_bps())
-        .saturating_div(100);
-    let seeding_r     = seeding_mb
-        .saturating_mul(seeding_per_mb)
-        .saturating_mul(repflow_tier.reward_multiplier_bps())
-        .saturating_div(100);
-    let cashback      = routing_r
-        .saturating_add(seeding_r)
-        .saturating_mul(cashback_pct)
-        .saturating_div(100);
-
-    state.total_lamports_claimed =
-        state.total_lamports_claimed.saturating_add(reward);
-    state.total_bytes_routed     =
-        state.total_bytes_routed.saturating_add(bytes_routed);
-    state.total_bytes_seeded     =
-        state.total_bytes_seeded.saturating_add(bytes_seeded);
-    state.total_uptime_seconds   =
-        state.total_uptime_seconds.saturating_add(uptime_seconds);
-    state.last_claim_ts          = clock.unix_timestamp;
-    state.claim_count            = state.claim_count.saturating_add(1);
-    state.repflow_balance        = repflow_balance;
-    state.repflow_tier           = repflow_tier as u8;
-    state.total_cashback_earned  =
-        state.total_cashback_earned.saturating_add(cashback);
-
-    let mut data = reward_account.try_borrow_mut_data()?;
-    state.serialize(&mut &mut data[..])?;
-
-    msg!(
-        "Rewards claimed: {} lamports (repFlow={} tier={:?} mult={}bps cashback={}%)",
-        reward, repflow_balance, repflow_tier,
-        repflow_tier.reward_multiplier_bps(),
-        repflow_tier.cashback_percent()
-    );
-
-    Ok(())
-}
+// process_claim (ClaimRewards, disc=0) removed — permanently disabled.
 
 #[inline(never)]
 fn process_record_bytes(
@@ -3029,7 +2734,7 @@ fn process_claim_usage(
 ) -> ProgramResult {
     let ParsedClaimUsageAccounts {
         relay_wallet,
-        reward_account_ai,
+        reward_account_ai: _reward_account_ai, // account slot kept for layout compat; not read
         claim_state_ai,
         pending_claims_ai,
         rewards_config_ai,
@@ -3155,19 +2860,10 @@ fn process_claim_usage(
                 return Err(RewardsError::InsufficientStake.into());
             }
 
-            // Read total_lamports_claimed from reward_account for earnings-based stake scaling.
-            let total_claimed = if reward_account_ai.data_len() >= RewardAccount::SIZE
-                && reward_account_ai.lamports() > 0
-            {
-                let ra_data = reward_account_ai.try_borrow_data()?;
-                if let Ok(ra) = RewardAccount::try_from_slice(&ra_data) {
-                    ra.total_lamports_claimed
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
+            // RewardAccount removed (legacy ClaimRewards path permanently disabled).
+            // total_lamports_claimed is always 0 — earnings-based stake scaling is
+            // not active, so BondConfig::compute_min_stake returns the flat minimum.
+            let total_claimed = 0u64;
 
             // Read price from RewardRatesAccount if provided.
             let flow_price_cents = if let Some(rr_ai) = reward_rates_ai {
@@ -4536,14 +4232,8 @@ fn process_release_rewards_ix(
         )?;
     }
 
-    // Credit released amount to the relay's aggregate reward account.
-    if reward_account.data_len() >= RewardAccount::SIZE && reward_account.lamports() > 0 {
-        let mut data = reward_account.try_borrow_mut_data()?;
-        let mut acct = RewardAccount::try_from_slice(&data)
-            .map_err(|_| ProgramError::InvalidAccountData)?;
-        acct.total_lamports_claimed = acct.total_lamports_claimed.saturating_add(amount);
-        acct.serialize(&mut &mut data[..])?;
-    }
+    // RewardAccount.total_lamports_claimed update removed — RewardAccount is
+    // permanently disabled (legacy ClaimRewards path). No write needed here.
 
     msg!(
         "ReleaseRewards: {} $FLOW released + {} $FLOW bond returned (claim {:08x})",
@@ -6661,162 +6351,10 @@ mod tests {
         assert_eq!(store.claims[1].status, ClaimStatus::Released);
     }
 
-    // ─── RepFlowTier + RewardAccount (existing tests) ────────────────────────
-
-    fn make_account(repflow_balance: u64) -> RewardAccount {
-        let repflow_tier = RepFlowTier::from_balance(repflow_balance) as u8;
-        RewardAccount {
-            relay_wallet:           [0u8; 32],
-            total_lamports_claimed: 0,
-            total_bytes_routed:     0,
-            total_bytes_seeded:     0,
-            total_uptime_seconds:   0,
-            last_claim_ts:          0,
-            claim_count:            0,
-            tier:                   1,
-            bump:                   0,
-            repflow_balance,
-            repflow_tier,
-            total_cashback_earned:  0,
-        }
-    }
-
-    #[test]
-    fn newcomer_gets_penalty_multiplier() {
-        let tier = RepFlowTier::from_balance(500);
-        assert_eq!(tier.reward_multiplier_bps(), 90,  "Newcomer: 0.9×");
-        assert_eq!(tier.cashback_percent(),       2,   "Newcomer: 2% cashback");
-    }
-
-    #[test]
-    fn icon_gets_max_multiplier() {
-        let tier = RepFlowTier::from_balance(100_000);
-        assert_eq!(tier.reward_multiplier_bps(), 150, "Icon: 1.5×");
-        assert_eq!(tier.cashback_percent(),      12,  "Icon: 12% cashback");
-    }
-
-    #[test]
-    fn active_tier_is_baseline() {
-        let tier = RepFlowTier::from_balance(2_000);
-        assert_eq!(tier.reward_multiplier_bps(), 100, "Active: 1.0× (no change)");
-    }
-
-    // Helper: return current BASE_* constants as a rate tuple so tests
-    // don't need to repeat the three constant names.
-    fn default_rates() -> (u64, u64, u64) {
-        (RewardAccount::BASE_ROUTING_PER_MB,
-         RewardAccount::BASE_SEEDING_PER_MB,
-         RewardAccount::BASE_UPTIME_PER_HOUR)
-    }
-
-    #[test]
-    fn icon_earns_more_than_newcomer() {
-        let (r, s, u) = default_rates();
-        let bytes  = 100 * 1024 * 1024 * 1024_u64;
-        let uptime = 3600_u64;
-        let icon     = make_account(100_000);
-        let newcomer = make_account(0);
-        let icon_r   = icon.calculate_reward(bytes, bytes, uptime, 100_000, r, s, u);
-        let newc_r   = newcomer.calculate_reward(bytes, bytes, uptime, 0, r, s, u);
-        assert!(icon_r > newc_r);
-        let ratio = icon_r as f64 / newc_r as f64;
-        assert!(ratio > 1.5, "Icon/Newcomer ratio must exceed 1.5× (got {ratio:.2}×)");
-    }
-
-    #[test]
-    fn cashback_is_included_in_total() {
-        let (r, s, u) = default_rates();
-        let routing_mb = 1024u64;
-        let bytes      = routing_mb * 1024 * 1024;
-        let icon       = make_account(100_000);
-        let total      = icon.calculate_reward(bytes, 0, 0, 100_000, r, s, u);
-        let base       = routing_mb * r;
-        let multiplied = base * 150 / 100;
-        let cashback   = multiplied * 12 / 100;
-        let expected   = multiplied + cashback;
-        assert_eq!(total, expected);
-    }
-
-    #[test]
-    fn uptime_reward_not_multiplied() {
-        let (r, s, u) = default_rates();
-        let uptime_hrs = 24u64;
-        let uptime_s   = uptime_hrs * 3600;
-        let icon     = make_account(100_000);
-        let newcomer = make_account(0);
-        // With full hours the new formula gives the same result as the old one.
-        let uptime_expected = uptime_hrs * u;
-        assert_eq!(icon.calculate_reward(0, 0, uptime_s, 100_000, r, s, u), uptime_expected);
-        assert_eq!(newcomer.calculate_reward(0, 0, uptime_s, 0, r, s, u),   uptime_expected);
-    }
-
-    #[test]
-    fn rewards_calculation_with_repflow_veteran() {
-        let (r, s, u) = default_rates();
-        let routing_mb   = 1024u64;
-        let bytes_routed = routing_mb * 1024 * 1024;
-        let repflow_bal  = 15_000;
-        let acct         = make_account(repflow_bal);
-        let total        = acct.calculate_reward(bytes_routed, 0, 0, repflow_bal, r, s, u);
-        let base         = routing_mb * r;
-        let mult         = base * 130 / 100;
-        let cashback     = mult * 7 / 100;
-        assert_eq!(total, mult + cashback);
-    }
-
-    #[test]
-    fn zero_activity_zero_reward() {
-        let (r, s, u) = default_rates();
-        let acct = make_account(5_000);
-        assert_eq!(acct.calculate_reward(0, 0, 0, 5_000, r, s, u), 0);
-    }
-
-    // ─── E2 regression: partial-hour uptime earns proportional reward ────────
-
-    #[test]
-    fn uptime_partial_hour_earns_proportional_reward() {
-        // E2 fix: 3599 s should earn almost 1 full hour — NOT zero.
-        // Old formula: (3599 / 3600) * rate = 0  (integer division truncates)
-        // New formula: (3599 * rate) / 3600     ≈ rate (99.97% of 1 hr)
-        let (r, s, u) = default_rates();
-        let acct     = make_account(2_000); // Active tier, 1.0× multiplier
-        let uptime_s = 3599_u64;
-
-        let actual   = acct.calculate_reward(0, 0, uptime_s, 2_000, r, s, u);
-        let expected = uptime_s.saturating_mul(u).saturating_div(3600);
-
-        assert!(expected > 0, "3599 s must yield non-zero uptime reward");
-        assert_eq!(actual, expected, "actual must equal multiply-then-divide formula");
-        // Must be ≥ 99 % of 1 full-hour reward.
-        assert!(actual >= u * 99 / 100,
-            "3599 s should earn ≥99%% of 1 hr reward; got {actual}, 1hr reward={u}");
-    }
-
-    // ─── E1 regression: 1000× higher rates produce 1000× reward ────────────
-
-    #[test]
-    fn higher_rates_yield_proportionally_higher_rewards() {
-        // Shape of E1: PDA stores 1_000_000/MB; old hardcoded = 1_000/MB (1000× gap).
-        // Verify calculate_reward() scales linearly with the rate parameters.
-        let acct     = make_account(2_000); // Active tier, 1.0× (no mult effect)
-        let bytes    = 1024u64 * 1024 * 1024; // 1 GB
-        let uptime_s = 3600_u64;             // exact 1 hour so both formulas agree
-
-        // Old constants (pre-fix fallback)
-        let reward_old = acct.calculate_reward(
-            bytes, 0, uptime_s, 2_000,
-            1_000, 2_000, 10_000_000,
-        );
-        // Target rates (what the PDA already stores)
-        let reward_new = acct.calculate_reward(
-            bytes, 0, uptime_s, 2_000,
-            1_000_000, 2_000_000, 10_000_000_000,
-        );
-
-        assert!(reward_old > 0, "old-rate reward must be non-zero");
-        assert_eq!(reward_new, reward_old * 1_000,
-            "1000× rates must produce 1000× reward (got old={reward_old} new={reward_new})");
-    }
+    // RepFlowTier + RewardAccount tests removed — RepFlowTier and RewardAccount
+    // were deleted along with the legacy ClaimRewards path (disc=0).
+    // E1/E2 regression tests (partial-hour uptime, 1000× rate scaling) covered
+    // by the ClaimUsage path via RewardRatesAccount PDA.
 
     // ─── Append-Only Chain validation tests ─────────────────────────────────
 
@@ -7233,27 +6771,7 @@ mod tests {
         assert_eq!(penalty, 4_000); // 20% of 20_000
     }
 
-    #[test]
-    fn tier_boundaries_correct() {
-        let cases = [
-            (0,          RepFlowTier::Newcomer),
-            (1_000,      RepFlowTier::Newcomer),
-            (1_001,      RepFlowTier::Active),
-            (5_000,      RepFlowTier::Active),
-            (5_001,      RepFlowTier::Trusted),
-            (10_000,     RepFlowTier::Trusted),
-            (10_001,     RepFlowTier::Veteran),
-            (25_000,     RepFlowTier::Veteran),
-            (25_001,     RepFlowTier::Legend),
-            (50_000,     RepFlowTier::Legend),
-            (50_001,     RepFlowTier::Icon),
-            (u64::MAX,   RepFlowTier::Icon),
-        ];
-        for (bal, expected) in cases {
-            assert_eq!(RepFlowTier::from_balance(bal), expected,
-                "balance={bal} → expected {expected:?}");
-        }
-    }
+    // tier_boundaries_correct test removed — RepFlowTier removed with legacy path.
 
     // ─── P1 ClaimStatus::is_terminal tests ──────────────────────────────────
 

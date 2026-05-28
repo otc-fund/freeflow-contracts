@@ -85,7 +85,7 @@ async function main() {
 
   // Pre-allocate the BondConfig PDA with system program.
   // RewardsInstruction::InitializeBondConfig is the last added variant.
-  // Count variants: ClaimRewards(0), RecordBytes(1), ClaimUsage(2), DisputeClaim(3),
+  // Count variants: LegacyClaimRewards(0, disabled), RecordBytes(1), ClaimUsage(2), DisputeClaim(3),
   //   ResolveDisputeRelaySlashed(4), ResolveDisputeChallengerSlashed(5), ForceResolve(6),
   //   ReleaseRewards(7), InitializeRewardsConfig(8), InitializeReservation(9),
   //   SetMigrationMode(10), SweepExpiredEscrow(11), RequestReconciliation(12),

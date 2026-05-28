@@ -64,7 +64,7 @@ function cat(...bufs: Buffer[]): Buffer {
 // ─── RewardsInstruction enum indices ─────────────────────────────────────────
 // Borsh encodes enum variants as 1 u8 index + fields.
 // Enum order (0-indexed):
-//   0  ClaimRewards            7  ReleaseRewards        14 CancelReconciliation
+//   0  LegacyClaimRewards (disabled) 7 ReleaseRewards   14 CancelReconciliation
 //   1  RecordBytes             8  InitializeRewardsConfig 15 PreMintFoundation
 //   2  ClaimUsage              9  InitializeReservation 16 InitializeRewardRates
 //   3  DisputeClaim           10  SetMigrationMode      17 UpdateRewardRates
