@@ -938,7 +938,7 @@ pub fn process_claim_pending_ix(
 ///   12: reward_account_treasury (writable)
 ///   13: trial_mint_cap        (writable, PDA)
 ///   14: system_program
-///   15+: per release × 1: [trial_usage_pda (writable)]
+///   15+: per release × 2: [claim_state (writable), trial_usage_pda (writable)]
 pub fn process_release_trial_claim_ix(
     program_id:  &Pubkey,
     accounts:    &[AccountInfo],
@@ -996,6 +996,7 @@ pub fn process_release_trial_claim_ix(
     let mut total_released_amount: u64 = 0;
 
     for release in &releases {
+        let claim_state_ai = next_account_info(iter)?;
         let trial_usage_ai = next_account_info(iter)?;
 
         // Verify Merkle proof.
@@ -1009,8 +1010,36 @@ pub fn process_release_trial_claim_ix(
             return Err(RewardsError::ClientSignatureInvalid.into());
         }
 
-        // AlreadyReleased check via trial usage PDA last_usage_ts.
-        // (UserRelayClaimState is not used for trial — no escrow.)
+        // AlreadyReleased guard via UserRelayClaimState (same guard as paid ReleaseClaim).
+        let (claim_state_pda, cs_bump) = Pubkey::find_program_address(
+            &[b"claim_state", &release.client_pubkey, relay_wallet.key.as_ref()],
+            program_id,
+        );
+        if claim_state_ai.key != &claim_state_pda {
+            return Err(ProgramError::InvalidArgument);
+        }
+        let mut claim_state: UserRelayClaimState = if claim_state_ai.lamports() == 0 {
+            create_pda_account(
+                relay_wallet, claim_state_ai, system_prog, program_id,
+                &[b"claim_state", &release.client_pubkey, relay_wallet.key.as_ref(), &[cs_bump]],
+                USER_RELAY_CLAIM_STATE_SIZE,
+            )?;
+            UserRelayClaimState {
+                user:                release.client_pubkey,
+                relay:               relay_wallet.key.to_bytes(),
+                last_claimed_seq:    0,
+                total_claimed_bytes: 0,
+                last_claim_slot:     0,
+                last_release_epoch:  0,
+                bump:                cs_bump,
+            }
+        } else {
+            UserRelayClaimState::try_from_slice(&claim_state_ai.data.borrow())
+                .map_err(|_| ProgramError::InvalidAccountData)?
+        };
+        if claim_state.last_release_epoch == claim_epoch {
+            return Err(RewardsError::AlreadyReleased.into());
+        }
 
         // Cumulative cap.
         let new_amount = commitment.released_amount
@@ -1083,6 +1112,9 @@ pub fn process_release_trial_claim_ix(
         commitment.released_count  += 1;
         commitment.released_amount  = new_amount;
         commitment.released_bytes   = new_bytes;
+
+        claim_state.last_release_epoch = claim_epoch;
+        save_account(claim_state_ai, &claim_state)?;
 
         total_released_amount = total_released_amount
             .checked_add(release.total_amount)
