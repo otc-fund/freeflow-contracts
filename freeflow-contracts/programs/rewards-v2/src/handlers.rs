@@ -402,7 +402,7 @@ fn compute_claim_hash(
 ///   13: reward_account_relay     (writable)
 ///   14: reward_account_treasury  (writable)
 ///   15: system_program
-///   16+: per release × 4: [claim_state, user_escrow, fund_hold, user_escrow_token]
+///   16+: per release × 5: [user_wallet, claim_state, user_escrow, fund_hold, user_escrow_token]
 pub fn process_release_claim_ix(
     program_id:  &Pubkey,
     accounts:    &[AccountInfo],
@@ -459,6 +459,7 @@ pub fn process_release_claim_ix(
     let mut total_released_bytes:  u64 = 0;
 
     for release in &releases {
+        let user_wallet_ai       = next_account_info(iter)?;
         let claim_state_ai       = next_account_info(iter)?;
         let user_escrow_ai       = next_account_info(iter)?;
         let fund_hold_ai         = next_account_info(iter)?;
@@ -508,7 +509,7 @@ pub fn process_release_claim_ix(
         cpi_burn_held_funds(
             escrow_program,
             service_authority,
-            user_escrow_ai,  // user_ai — caller must pass client wallet as first per-release account
+            user_wallet_ai,
             user_escrow_ai,
             user_escrow_token_ai,
             fund_hold_ai,
