@@ -6,6 +6,7 @@ members = [
     "programs/repflow-token",
     "programs/user-escrow",
     "programs/referral",
+    "programs/rewards-v2",
 ]
 resolver = "2"
 
