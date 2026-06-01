@@ -67,8 +67,8 @@ pub struct InitializeUser<'info> {
 /// Only authorised minters (governance council members) can call this.
 /// Enforces a 200 repFlow daily rate limit per user (24-hour rolling window).
 pub fn mint_repflow(ctx: Context<MintRepFlow>, amount: u64, activity_code: u8) -> Result<()> {
-    // Extract config_info before mutable borrow
-    let config_bump = ctx.accounts.config.bump;
+    // Use canonical bump from Anchor (not stored config.bump which may be 0 from old program).
+    let config_bump = ctx.bumps.config;
     let config_info = ctx.accounts.config.to_account_info();
     let config = &mut ctx.accounts.config;
     let user   = &mut ctx.accounts.repflow_user;
@@ -175,7 +175,7 @@ pub struct MintRepFlow<'info> {
     #[account(
         mut,
         seeds = [b"repflow_config"],
-        bump  = config.bump,
+        bump,  // canonical bump — avoids relying on config.bump which may be 0 from old initialise
     )]
     pub config: Account<'info, RepFlowConfig>,
 
@@ -226,7 +226,7 @@ pub fn mint_repflow_from_rewards(
     amount:        u64,
     activity_code: u8,
 ) -> Result<()> {
-    let config_bump = ctx.accounts.config.bump;
+    let config_bump = ctx.bumps.config;
     let config_info = ctx.accounts.config.to_account_info();
     let config = &mut ctx.accounts.config;
     let user   = &mut ctx.accounts.repflow_user;
@@ -353,7 +353,7 @@ pub struct MintRepFlowFromRewards<'info> {
     #[account(
         mut,
         seeds = [b"repflow_config"],
-        bump  = config.bump,
+        bump,  // canonical bump
     )]
     pub config: Account<'info, RepFlowConfig>,
 
@@ -399,7 +399,7 @@ pub fn claim_daily_uptime_repflow(
     ctx:    Context<ClaimDailyUptimeRepflow>,
     amount: u64,
 ) -> Result<()> {
-    let config_bump = ctx.accounts.config.bump;
+    let config_bump = ctx.bumps.config;
     let config_info = ctx.accounts.config.to_account_info();
     let config = &mut ctx.accounts.config;
     let user   = &mut ctx.accounts.repflow_user;
@@ -616,7 +616,7 @@ pub struct ClaimDailyUptimeRepflow<'info> {
     #[account(
         mut,
         seeds = [b"repflow_config"],
-        bump  = config.bump,
+        bump,  // canonical bump — config.bump may be 0 from old program
     )]
     pub config: Account<'info, RepFlowConfig>,
 

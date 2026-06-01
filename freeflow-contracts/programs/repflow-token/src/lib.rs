@@ -247,7 +247,7 @@ pub struct AdminOnly<'info> {
     #[account(
         mut,
         seeds  = [b"repflow_config"],
-        bump   = config.bump,
+        bump,  // canonical — config.bump may be 0 from old program
         has_one = admin,
     )]
     pub config: Account<'info, RepFlowConfig>,

@@ -83,7 +83,7 @@ pub fn propose_slash(
 pub struct ProposeSlash<'info> {
     #[account(
         seeds = [b"repflow_config"],
-        bump  = config.bump,
+        bump,  // canonical — config.bump may be 0 from old program
     )]
     pub config: Account<'info, RepFlowConfig>,
 
@@ -143,8 +143,7 @@ pub struct WaiveAppeal<'info> {
 ///
 /// Can be called by any authorised burner. Burns the repFlow on-chain.
 pub fn execute_slash(ctx: Context<ExecuteSlash>, _slash_id: u64) -> Result<()> {
-    // Extract config_info before mutable borrow
-    let config_bump = ctx.accounts.config.bump;
+    let config_bump = ctx.bumps.config;
     let config_info = ctx.accounts.config.to_account_info();
     let config = &mut ctx.accounts.config;
     let user   = &mut ctx.accounts.repflow_user;
@@ -233,7 +232,7 @@ pub struct ExecuteSlash<'info> {
     #[account(
         mut,
         seeds = [b"repflow_config"],
-        bump  = config.bump,
+        bump,  // canonical — config.bump may be 0 from old program
     )]
     pub config: Account<'info, RepFlowConfig>,
 
