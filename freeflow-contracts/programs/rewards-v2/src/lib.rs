@@ -39,6 +39,8 @@ pub mod handlers;
 mod test_merkle;
 #[cfg(test)]
 mod test_e2e;
+#[cfg(test)]
+mod test_trial;
 
 use types::{ClientReleaseOnChain, ReserveBatchEntry};
 

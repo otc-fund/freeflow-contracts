@@ -17,3 +17,4 @@ spl-token      = { workspace = true }
 [dev-dependencies]
 solana-program-test = { workspace = true }
 solana-sdk          = { workspace = true }
+tokio               = { workspace = true }
