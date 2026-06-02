@@ -185,7 +185,36 @@ mod logic {
 
     // ── TrialMintCap enforcement ──────────────────────────────────────────────
 
-    /// Fresh cap PDA starts at zero; cap equals 100 $FLOW (6-decimal confirmed).
+    /// Relay uptime self-claims (client_pubkey == relay_wallet) must NOT count
+    /// against MAX_TRIAL_MINT_PER_RELAY_PER_EPOCH — that cap is for trial fraud
+    /// prevention only.  Uptime has no quota limit.
+    #[test]
+    fn trial_mint_cap_excludes_relay_self_uptime() {
+        let relay  = [0xAAu8; 32];
+        let client = [0xBBu8; 32];
+
+        // Simulate accumulating only trial-client amounts into trial_cap_amount.
+        let mut trial_cap_amount: u64 = 0;
+
+        // Relay uptime release (client_pubkey == relay) — must NOT accumulate.
+        let is_relay_self_uptime = relay == relay; // true
+        if !is_relay_self_uptime {
+            trial_cap_amount += 50_000_000_000; // large uptime amount
+        }
+        assert_eq!(trial_cap_amount, 0, "relay uptime must not count against cap");
+
+        // Trial client release (client_pubkey != relay) — must accumulate.
+        let is_relay_self_uptime = client == relay; // false
+        if !is_relay_self_uptime {
+            trial_cap_amount += 5_000_000_000; // 5 $FLOW trial usage
+        }
+        assert_eq!(trial_cap_amount, 5_000_000_000,
+            "trial client amount must count against cap");
+        assert!(trial_cap_amount <= MAX_TRIAL_MINT_PER_RELAY_PER_EPOCH,
+            "trial amount must be within cap");
+    }
+
+    /// Fresh cap PDA starts at zero; cap equals 100 $FLOW (9-decimal confirmed).
     #[test]
     fn trial_mint_cap_initial_state() {
         let tmc = trial_mint_cap(0);

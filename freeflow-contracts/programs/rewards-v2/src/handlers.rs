@@ -993,12 +993,21 @@ pub fn process_release_trial_claim_ix(
 
     let (_, authority_bump) = Pubkey::find_program_address(&[b"mint_authority"], program_id);
 
-    let mut total_released_amount: u64 = 0;
+    let mut total_released_amount: u64 = 0; // all releases — used for 70/30 mint
     let mut total_released_bytes:  u64 = 0;
+    let mut trial_cap_amount:      u64 = 0; // trial clients only — used for TrialMintCap
+
+    // Relay pubkey as bytes for self-uptime detection.
+    let relay_key_bytes = relay_wallet.key.to_bytes();
 
     for release in &releases {
         let claim_state_ai = next_account_info(iter)?;
         let trial_usage_ai = next_account_info(iter)?;
+
+        // Relay uptime self-claim: client_pubkey == relay_wallet.
+        // Skip TrialUsage checks (10 GB cap + 30-day expiry don't apply to relay uptime)
+        // and exclude from TrialMintCap (which is a free-trial-fraud limit, not uptime).
+        let is_relay_self_uptime = release.client_pubkey == relay_key_bytes;
 
         // Verify Merkle proof.
         let leaf_hash = compute_merkle_leaf_hash_from_release(release);
@@ -1056,61 +1065,65 @@ pub fn process_release_trial_claim_ix(
             return Err(RewardsError::ReleaseExceedsCommitment.into());
         }
 
-        // Derive trial_usage PDA.
-        let (trial_usage_pda, tu_bump) = Pubkey::find_program_address(
-            &[b"trial_usage", &release.client_pubkey],
-            program_id,
-        );
-        if trial_usage_ai.key != &trial_usage_pda {
-            return Err(ProgramError::InvalidArgument);
-        }
-
-        if trial_usage_ai.lamports() == 0 {
-            // Create new TrialUsage PDA.
-            create_pda_account(
-                relay_wallet, trial_usage_ai, system_prog, program_id,
-                &[b"trial_usage", &release.client_pubkey, &[tu_bump]],
-                TRIAL_USAGE_SIZE,
-            )?;
-            let trial_usage = TrialUsage {
-                user_pubkey:   release.client_pubkey,
-                used_bytes:    release.total_bytes,
-                claimed_bytes: 0,
-                device_uuid:   release.device_uuid,
-                first_seen_ts: now,
-                last_usage_ts: now,
-                expires_at:    now + FREE_TRIAL_DURATION_SECS,
-                cap_bytes:     FREE_TRIAL_BYTES,
-                bump:          tu_bump,
-            };
-            save_account(trial_usage_ai, &trial_usage)?;
-        } else {
-            let mut trial_usage: TrialUsage =
-                TrialUsage::try_from_slice(&trial_usage_ai.data.borrow())
-                    .map_err(|_| ProgramError::InvalidAccountData)?;
-
-            // Check expiry.
-            if trial_usage.expires_at <= now {
-                return Err(RewardsError::TrialExpired.into());
-            }
-            // Check cap — claimed_bytes and cap_bytes are both in bytes, not micro-FLOW.
-            let new_claimed = trial_usage.claimed_bytes
-                .checked_add(release.total_bytes)
-                .ok_or(RewardsError::ArithmeticOverflow)?;
-            if new_claimed > trial_usage.cap_bytes {
-                return Err(RewardsError::TrialCapExceeded.into());
-            }
-            // Verify device_uuid consistency.
-            if trial_usage.device_uuid != release.device_uuid {
+        if !is_relay_self_uptime {
+            // ── Trial client path: enforce TrialUsage PDA (10 GB cap, 30-day expiry) ──
+            let (trial_usage_pda, tu_bump) = Pubkey::find_program_address(
+                &[b"trial_usage", &release.client_pubkey],
+                program_id,
+            );
+            if trial_usage_ai.key != &trial_usage_pda {
                 return Err(ProgramError::InvalidArgument);
             }
 
-            trial_usage.claimed_bytes = new_claimed;
-            trial_usage.used_bytes    = trial_usage.used_bytes
-                .saturating_add(release.total_bytes);
-            trial_usage.last_usage_ts = now;
-            save_account(trial_usage_ai, &trial_usage)?;
+            if trial_usage_ai.lamports() == 0 {
+                create_pda_account(
+                    relay_wallet, trial_usage_ai, system_prog, program_id,
+                    &[b"trial_usage", &release.client_pubkey, &[tu_bump]],
+                    TRIAL_USAGE_SIZE,
+                )?;
+                let trial_usage = TrialUsage {
+                    user_pubkey:   release.client_pubkey,
+                    used_bytes:    release.total_bytes,
+                    claimed_bytes: 0,
+                    device_uuid:   release.device_uuid,
+                    first_seen_ts: now,
+                    last_usage_ts: now,
+                    expires_at:    now + FREE_TRIAL_DURATION_SECS,
+                    cap_bytes:     FREE_TRIAL_BYTES,
+                    bump:          tu_bump,
+                };
+                save_account(trial_usage_ai, &trial_usage)?;
+            } else {
+                let mut trial_usage: TrialUsage =
+                    TrialUsage::try_from_slice(&trial_usage_ai.data.borrow())
+                        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+                if trial_usage.expires_at <= now {
+                    return Err(RewardsError::TrialExpired.into());
+                }
+                let new_claimed = trial_usage.claimed_bytes
+                    .checked_add(release.total_bytes)
+                    .ok_or(RewardsError::ArithmeticOverflow)?;
+                if new_claimed > trial_usage.cap_bytes {
+                    return Err(RewardsError::TrialCapExceeded.into());
+                }
+                if trial_usage.device_uuid != release.device_uuid {
+                    return Err(ProgramError::InvalidArgument);
+                }
+                trial_usage.claimed_bytes = new_claimed;
+                trial_usage.used_bytes    = trial_usage.used_bytes
+                    .saturating_add(release.total_bytes);
+                trial_usage.last_usage_ts = now;
+                save_account(trial_usage_ai, &trial_usage)?;
+            }
+
+            // Only trial clients count against TrialMintCap.
+            trial_cap_amount = trial_cap_amount
+                .checked_add(release.total_amount)
+                .ok_or(RewardsError::ArithmeticOverflow)?;
         }
+        // Relay self-uptime: trial_usage_ai slot is still consumed from the
+        // accounts iterator above but not touched — caller passes a dummy account.
 
         commitment.released_count  += 1;
         commitment.released_amount  = new_amount;
@@ -1153,8 +1166,9 @@ pub fn process_release_trial_claim_ix(
             .map_err(|_| ProgramError::InvalidAccountData)?
     };
 
+    // Cap applies only to free-trial client amounts — relay self-uptime is excluded.
     let new_minted = tmc.minted_so_far
-        .checked_add(total_released_amount)
+        .checked_add(trial_cap_amount)
         .ok_or(RewardsError::ArithmeticOverflow)?;
     if new_minted > MAX_TRIAL_MINT_PER_RELAY_PER_EPOCH {
         return Err(RewardsError::TrialMintCapExceeded.into());
