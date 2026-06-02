@@ -185,13 +185,14 @@ mod logic {
 
     // ── TrialMintCap enforcement ──────────────────────────────────────────────
 
-    /// Fresh cap PDA starts at zero and the cap constant is reasonable.
+    /// Fresh cap PDA starts at zero; cap equals 100 $FLOW (6-decimal confirmed).
     #[test]
     fn trial_mint_cap_initial_state() {
         let tmc = trial_mint_cap(0);
         assert_eq!(tmc.minted_so_far, 0, "fresh TrialMintCap must start at zero");
-        assert!(MAX_TRIAL_MINT_PER_RELAY_PER_EPOCH > 0,
-            "cap must be a positive value");
+        // 100 $FLOW × 1_000_000 micro-FLOW/$FLOW = 100_000_000
+        assert_eq!(MAX_TRIAL_MINT_PER_RELAY_PER_EPOCH, 100 * MICRO_FLOW_PER_FLOW,
+            "cap must be exactly 100 $FLOW in micro-FLOW units");
     }
 
     /// Multiple releases accumulate into `minted_so_far`.
