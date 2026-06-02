@@ -191,7 +191,7 @@ mod logic {
         let tmc = trial_mint_cap(0);
         assert_eq!(tmc.minted_so_far, 0, "fresh TrialMintCap must start at zero");
         // 100 $FLOW × 1_000_000 micro-FLOW/$FLOW = 100_000_000
-        assert_eq!(MAX_TRIAL_MINT_PER_RELAY_PER_EPOCH, 100 * MICRO_FLOW_PER_FLOW,
+        assert_eq!(MAX_TRIAL_MINT_PER_RELAY_PER_EPOCH, 100 * BASE_UNITS_PER_FLOW,
             "cap must be exactly 100 $FLOW in micro-FLOW units");
     }
 

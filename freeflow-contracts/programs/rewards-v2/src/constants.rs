@@ -20,16 +20,15 @@ pub const BYTES_PER_FLOW: u64 = 1_073_741_824;
 
 /// $FLOW mint decimal places.
 ///
-/// $FLOW uses 6 decimal places (like USDC).
-/// 1 $FLOW = 1_000_000 raw token units (micro-FLOW).
-/// All on-chain mint amounts are in micro-FLOW units.
-pub const FLOW_DECIMALS: u32 = 6;
+/// $FLOW uses 9 decimal places (same as SOL/lamports).
+/// 1 $FLOW = 1_000_000_000 base units.
+/// All on-chain mint_to amounts are in base units.
+pub const FLOW_DECIMALS: u32 = 9;
 
-/// Raw token units per $FLOW (10^FLOW_DECIMALS).
+/// Base units per $FLOW (10^FLOW_DECIMALS = 10^9).
 ///
-/// Relay usage records store `charge_flow_micro` in micro-FLOW units.
-/// On-chain mint_to calls receive amounts in the same micro-FLOW units.
-pub const MICRO_FLOW_PER_FLOW: u64 = 1_000_000;
+/// Analogous to LAMPORTS_PER_SOL.  All on-chain mint amounts use this unit.
+pub const BASE_UNITS_PER_FLOW: u64 = 1_000_000_000;
 
 /// 70% split to relay, 30% to foundation.
 pub const RELAY_SPLIT_PCT:      u64 = 70;
@@ -43,9 +42,9 @@ pub const FREE_TRIAL_DURATION_SECS: u64 = 2_592_000;
 
 /// Max trial $FLOW minted per relay per epoch.
 ///
-/// = 100 $FLOW × MICRO_FLOW_PER_FLOW = 100_000_000 micro-FLOW.
+/// = 100 $FLOW × BASE_UNITS_PER_FLOW = 100_000_000_000 base units.
 /// Prevents a relay from fabricating unlimited trial claims in a single epoch.
 ///
-/// Basis: a relay routing full 10 GB trial bandwidth earns ≈ 40 $FLOW
-/// (at $0.025/FLOW rate).  The cap allows 2.5× headroom before enforcement.
-pub const MAX_TRIAL_MINT_PER_RELAY_PER_EPOCH: u64 = 100 * MICRO_FLOW_PER_FLOW; // 100 $FLOW
+/// Basis: a relay routing the full 10 GB trial bandwidth earns ≈ 40 $FLOW
+/// (at $0.025/FLOW rate).  The 100 $FLOW cap allows 2.5× headroom.
+pub const MAX_TRIAL_MINT_PER_RELAY_PER_EPOCH: u64 = 100 * BASE_UNITS_PER_FLOW; // 100 $FLOW

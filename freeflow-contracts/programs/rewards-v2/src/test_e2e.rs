@@ -153,22 +153,23 @@ mod tests {
     }
 
     #[test]
-    fn flow_decimals_and_micro_flow_are_consistent() {
-        // $FLOW uses 6 decimal places — same as USDC.
-        assert_eq!(FLOW_DECIMALS, 6);
-        assert_eq!(MICRO_FLOW_PER_FLOW, 10u64.pow(FLOW_DECIMALS));
+    fn flow_decimals_and_base_units_are_consistent() {
+        // $FLOW uses 9 decimal places — same as SOL (lamports).
+        assert_eq!(FLOW_DECIMALS, 9);
+        assert_eq!(BASE_UNITS_PER_FLOW, 10u64.pow(FLOW_DECIMALS));
+        assert_eq!(BASE_UNITS_PER_FLOW, 1_000_000_000);
     }
 
     #[test]
     fn trial_mint_cap_is_100_flow() {
         // MAX_TRIAL_MINT_PER_RELAY_PER_EPOCH must equal exactly 100 $FLOW
-        // expressed in micro-FLOW (6 decimal places).
+        // expressed in base units (9 decimal places).
         assert_eq!(
             MAX_TRIAL_MINT_PER_RELAY_PER_EPOCH,
-            100 * MICRO_FLOW_PER_FLOW,
-            "cap must be 100 $FLOW = 100_000_000 micro-FLOW"
+            100 * BASE_UNITS_PER_FLOW,
+            "cap must be 100 $FLOW = 100_000_000_000 base units"
         );
-        assert_eq!(MAX_TRIAL_MINT_PER_RELAY_PER_EPOCH, 100_000_000);
+        assert_eq!(MAX_TRIAL_MINT_PER_RELAY_PER_EPOCH, 100_000_000_000);
     }
 
     #[test]
