@@ -262,6 +262,127 @@ pub struct ExecuteSlash<'info> {
     pub system_program: Program<'info, System>,
 }
 
+// ─── Instruction: slash_repflow_from_rewards ──────────────────────────────────
+
+/// Instant slash via CPI from rewards-v2 — no 72-hour appeal window.
+///
+/// Called exclusively by rewards-v2 during `ClientDispute` (Merkle proof failure
+/// confirmed) or `SlashTrialFraud` (foundation audit confirmed fake trial).
+///
+/// Signed by the rewards program's `slash_authority` PDA
+/// (seeds: `[b"slash_authority"]` from `REWARDS_PROGRAM_ID`).
+///
+/// Unlike `propose_slash` + `execute_slash`, on-chain cryptographic evidence
+/// (a failed Merkle proof or a foundation-verified fraud audit) is considered
+/// sufficient without a 72-hour human appeal window.
+///
+/// Accounts:
+///   0: config         (writable, seeds=[b"repflow_config"])
+///   1: repflow_user   (writable, seeds=[b"repflow_user", wallet])
+///   2: mint           (writable — repFlow Token-2022 mint)
+///   3: user_ata       (writable — relay's repFlow ATA)
+///   4: slash_authority (signer  — rewards-v2 PDA, seeds=[b"slash_authority"])
+///   5: token_program
+pub fn slash_repflow_from_rewards(
+    ctx:    Context<SlashRepFlowFromRewards>,
+    amount: u64,
+) -> Result<()> {
+    let config_bump = ctx.bumps.config;
+    let config_info = ctx.accounts.config.to_account_info();
+    let config = &mut ctx.accounts.config;
+    let user   = &mut ctx.accounts.repflow_user;
+
+    require!(!config.paused, RepFlowError::ProgramPaused);
+
+    // Verify slash_authority is the rewards program's slash_authority PDA.
+    // Only rewards-v2 can produce a signer for this PDA — proves the caller is rewards-v2.
+    let (expected_slash_auth, _) = Pubkey::find_program_address(
+        &[b"slash_authority"],
+        &crate::REWARDS_PROGRAM_ID,
+    );
+    require!(
+        ctx.accounts.slash_authority.key() == expected_slash_auth,
+        RepFlowError::UnauthorizedRewardsCPI,
+    );
+
+    // Cap at current balance — cannot slash more than exists.
+    let actual_slash = amount.min(user.balance);
+    if actual_slash == 0 {
+        msg!("slash_repflow_from_rewards: balance is 0, nothing to slash");
+        return Ok(());
+    }
+
+    // Burn via SPL Token-2022.
+    let seeds  = &[b"repflow_config".as_ref(), &[config_bump]];
+    let signer = &[&seeds[..]];
+
+    token_2022::burn(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Burn {
+                mint:      ctx.accounts.mint.to_account_info(),
+                from:      ctx.accounts.user_ata.to_account_info(),
+                authority: config_info,
+            },
+            signer,
+        ),
+        actual_slash,
+    )?;
+
+    // Update state.
+    user.balance          = user.balance.saturating_sub(actual_slash);
+    user.lifetime_slashed = user.lifetime_slashed.saturating_add(actual_slash);
+    user.slash_count      = user.slash_count.saturating_add(1);
+    config.total_burned   = config.total_burned.saturating_add(actual_slash);
+
+    let now = Clock::get()?.unix_timestamp;
+    emit!(RepFlowBurned {
+        wallet:       user.wallet,
+        amount:       actual_slash,
+        offense_code: 255, // 255 = automated slash from rewards program
+        new_balance:  user.balance,
+        slash_count:  user.slash_count,
+        timestamp:    now,
+    });
+
+    msg!(
+        "slash_repflow_from_rewards: {} repFlow burned from {} — new balance={}",
+        actual_slash, user.wallet, user.balance,
+    );
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct SlashRepFlowFromRewards<'info> {
+    #[account(
+        mut,
+        seeds = [b"repflow_config"],
+        bump,
+    )]
+    pub config: Account<'info, RepFlowConfig>,
+
+    #[account(
+        mut,
+        seeds = [b"repflow_user", repflow_user.wallet.as_ref()],
+        bump  = repflow_user.bump,
+    )]
+    pub repflow_user: Account<'info, RepFlowUser>,
+
+    /// repFlow Token-2022 mint.
+    #[account(mut)]
+    pub mint: UncheckedAccount<'info>,
+
+    /// The relay's repFlow ATA (Token-2022). Burned from this account.
+    #[account(mut)]
+    pub user_ata: UncheckedAccount<'info>,
+
+    /// rewards-v2 slash_authority PDA — proves caller is the rewards program.
+    /// Seeds: [b"slash_authority"] from REWARDS_PROGRAM_ID.
+    pub slash_authority: Signer<'info>,
+
+    pub token_program: Program<'info, Token2022>,
+}
+
 // ─── Events ───────────────────────────────────────────────────────────────────
 
 #[event]

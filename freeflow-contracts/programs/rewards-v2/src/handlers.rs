@@ -994,6 +994,7 @@ pub fn process_release_trial_claim_ix(
     let (_, authority_bump) = Pubkey::find_program_address(&[b"mint_authority"], program_id);
 
     let mut total_released_amount: u64 = 0;
+    let mut total_released_bytes:  u64 = 0;
 
     for release in &releases {
         let claim_state_ai = next_account_info(iter)?;
@@ -1092,9 +1093,9 @@ pub fn process_release_trial_claim_ix(
             if trial_usage.expires_at <= now {
                 return Err(RewardsError::TrialExpired.into());
             }
-            // Check cap.
+            // Check cap — claimed_bytes and cap_bytes are both in bytes, not micro-FLOW.
             let new_claimed = trial_usage.claimed_bytes
-                .checked_add(release.total_amount)
+                .checked_add(release.total_bytes)
                 .ok_or(RewardsError::ArithmeticOverflow)?;
             if new_claimed > trial_usage.cap_bytes {
                 return Err(RewardsError::TrialCapExceeded.into());
@@ -1118,6 +1119,9 @@ pub fn process_release_trial_claim_ix(
 
         total_released_amount = total_released_amount
             .checked_add(release.total_amount)
+            .ok_or(RewardsError::ArithmeticOverflow)?;
+        total_released_bytes = total_released_bytes
+            .checked_add(release.total_bytes)
             .ok_or(RewardsError::ArithmeticOverflow)?;
     }
 
@@ -1162,8 +1166,10 @@ pub fn process_release_trial_claim_ix(
     cpi_mint_flow(token_program, flow_mint, reward_relay, service_authority, relay_amount, authority_bump)?;
     cpi_mint_flow(token_program, flow_mint, reward_treasury, service_authority, treasury_amount, authority_bump)?;
 
-    // Mint bandwidth repFlow.
-    let repflow_amount = commitment.released_bytes / BYTES_PER_FLOW;
+    // Mint bandwidth repFlow — use this transaction's bytes only, not commitment
+    // cumulative. Using commitment.released_bytes here would double-mint repFlow
+    // on every subsequent ReleaseTrialClaim call in the same epoch.
+    let repflow_amount = total_released_bytes / BYTES_PER_FLOW;
     if repflow_amount > 0 {
         cpi_mint_repflow_bandwidth(
             repflow_program, repflow_config, relay_repflow_user,
@@ -1272,7 +1278,7 @@ pub fn process_slash_trial_fraud_ix(
     let repflow_mint         = next_account_info(iter)?;
     let relay_repflow_ata    = next_account_info(iter)?;
     let token_program        = next_account_info(iter)?;
-    let _system_prog         = next_account_info(iter)?;
+    let system_prog          = next_account_info(iter)?;
 
     if !foundation_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -1286,13 +1292,36 @@ pub fn process_slash_trial_fraud_ix(
         return Err(ProgramError::IllegalOwner);
     }
 
-    // Load relay reputation (must exist — relay must have submitted a ReleaseTrialClaim).
-    if reputation_ai.lamports() == 0 {
-        return Err(RewardsError::AccountNotFound.into());
+    // Load or create relay reputation.
+    // Created here if the relay has never had a ClientDispute — trial fraud
+    // may be the first offense so we cannot require the PDA to pre-exist.
+    // Seed: relay_repflow_user.key identifies the relay wallet being slashed.
+    let relay_key = relay_repflow_user.key.to_bytes();
+    let (rep_pda, rep_bump) = Pubkey::find_program_address(
+        &[b"relay_reputation", &relay_key],
+        program_id,
+    );
+    if reputation_ai.key != &rep_pda {
+        return Err(ProgramError::InvalidArgument);
     }
-    let mut rep: RelayReputation =
+
+    let mut rep: RelayReputation = if reputation_ai.lamports() == 0 {
+        // First offense — create the reputation PDA funded by the foundation.
+        create_pda_account(
+            foundation_wallet, reputation_ai, system_prog, program_id,
+            &[b"relay_reputation", &relay_key, &[rep_bump]],
+            RELAY_REPUTATION_SIZE,
+        )?;
+        RelayReputation {
+            relay:            relay_key,
+            slash_count:      0,
+            lifetime_slashed: 0,
+            bump:             rep_bump,
+        }
+    } else {
         RelayReputation::try_from_slice(&reputation_ai.data.borrow())
-            .map_err(|_| ProgramError::InvalidAccountData)?;
+            .map_err(|_| ProgramError::InvalidAccountData)?
+    };
 
     rep.slash_count += 1;
     let relay_repflow_balance = read_repflow_balance(relay_repflow_user)?;

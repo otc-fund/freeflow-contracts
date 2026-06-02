@@ -311,17 +311,20 @@ pub fn cpi_mint_repflow_bandwidth<'a>(
     })
 }
 
-/// CPI to repflow-token::slash_repflow_from_rewards (stub — not yet in repflow-token).
+/// CPI to repflow-token::slash_repflow_from_rewards.
 ///
-/// STUB: `slash_repflow_from_rewards` does not yet exist in the repflow-token program.
-/// This function will need to be implemented once repflow-token adds a direct-slash
-/// instruction that skips the 72h appeal window.
+/// Instant slash — no 72-hour appeal window. Used by `ClientDispute` (Merkle proof
+/// failure) and `SlashTrialFraud` (foundation fraud audit). The `slash_authority`
+/// PDA (seeds `[b"slash_authority"]` from this program) signs the CPI, which
+/// repflow-token verifies to ensure only rewards-v2 can call this instruction.
 ///
-/// For now this constructs the instruction in the correct format but will fail
-/// at runtime until repflow-token is updated.
-///
-/// Authorization: `slash_authority_pda` (seeds `[b"slash_authority"]`) must be
-/// registered as an authorized burner in repflow-token.
+/// Account layout matching `SlashRepFlowFromRewards` in repflow-token:
+///   0: repflow_config   (writable)
+///   1: repflow_user     (writable)
+///   2: repflow_mint     (writable)
+///   3: repflow_ata      (writable — relay's Token-2022 ATA)
+///   4: slash_authority  (signer   — rewards-v2 PDA [b"slash_authority"])
+///   5: token_program
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 pub fn cpi_slash_repflow<'a>(
@@ -339,9 +342,10 @@ pub fn cpi_slash_repflow<'a>(
         return Ok(());
     }
 
-    // STUB: discriminator for the future slash_repflow_from_rewards instruction.
+    // Anchor discriminator: sha256("global:slash_repflow_from_rewards")[0..8]
     let disc = anchor_ix_discriminator(b"slash_repflow_from_rewards");
 
+    // instruction data: discriminator(8) + amount(u64 le)(8)
     let mut data = Vec::with_capacity(16);
     data.extend_from_slice(&disc);
     data.extend_from_slice(&amount.to_le_bytes());
@@ -349,12 +353,12 @@ pub fn cpi_slash_repflow<'a>(
     let ix = Instruction {
         program_id: *repflow_program_ai.key,
         accounts: vec![
-            AccountMeta::new(*repflow_config_ai.key,    false),
-            AccountMeta::new(*repflow_user_ai.key,      false),
-            AccountMeta::new(*relay_repflow_mint_ai.key, false),
-            AccountMeta::new(*relay_repflow_ata_ai.key,  false),
-            AccountMeta::new_readonly(*slash_authority_ai.key, true),
-            AccountMeta::new_readonly(*token_program_ai.key,   false),
+            AccountMeta::new(         *repflow_config_ai.key,     false), // 0: config
+            AccountMeta::new(         *repflow_user_ai.key,       false), // 1: repflow_user
+            AccountMeta::new(         *relay_repflow_mint_ai.key, false), // 2: mint
+            AccountMeta::new(         *relay_repflow_ata_ai.key,  false), // 3: user_ata
+            AccountMeta::new_readonly(*slash_authority_ai.key,    true),  // 4: slash_authority (signer)
+            AccountMeta::new_readonly(*token_program_ai.key,      false), // 5: token_program
         ],
         data,
     };
@@ -372,7 +376,7 @@ pub fn cpi_slash_repflow<'a>(
         ],
         &[&[b"slash_authority", &[slash_authority_bump]]],
     ).map_err(|e| {
-        msg!("cpi_slash_repflow failed (stub — repflow-token needs update): {:?}", e);
+        msg!("cpi_slash_repflow failed: {:?}", e);
         e
     })
 }

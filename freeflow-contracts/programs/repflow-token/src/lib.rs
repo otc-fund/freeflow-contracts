@@ -200,6 +200,18 @@ pub mod repflow_token {
         burn::execute_slash(ctx, slash_id)
     }
 
+    /// Instant slash via CPI from rewards-v2 (no appeal window).
+    ///
+    /// Called exclusively by rewards-v2 during `ClientDispute` or `SlashTrialFraud`.
+    /// Signed by the rewards program's `slash_authority` PDA — no human appeal needed
+    /// because the evidence is cryptographic (Merkle proof failure or audit hash).
+    pub fn slash_repflow_from_rewards(
+        ctx:    Context<SlashRepFlowFromRewards>,
+        amount: u64,
+    ) -> Result<()> {
+        burn::slash_repflow_from_rewards(ctx, amount)
+    }
+
     // ── Transfer hook (SPL Token-2022 CPI) ─────────────────────────────────
 
     /// Initialize the extra-account-metas PDA for the transfer hook.
