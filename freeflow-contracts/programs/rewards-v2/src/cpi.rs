@@ -2,7 +2,7 @@
 //!
 //! Covers:
 //!   - user_escrow:    hold_client_funds, burn_held_funds, release_funds
-//!   - repflow-token:  mint_repflow_from_rewards, slash_repflow_from_rewards (stub)
+//!   - repflow-token:  mint_repflow_from_rewards, slash_repflow_from_rewards
 //!   - SPL Token:      mint_to ($FLOW)
 //!
 //! All user_escrow and repflow-token programs are Anchor-based.

@@ -1106,6 +1106,8 @@ pub fn process_release_trial_claim_ix(
             }
 
             trial_usage.claimed_bytes = new_claimed;
+            trial_usage.used_bytes    = trial_usage.used_bytes
+                .saturating_add(release.total_bytes);
             trial_usage.last_usage_ts = now;
             save_account(trial_usage_ai, &trial_usage)?;
         }
