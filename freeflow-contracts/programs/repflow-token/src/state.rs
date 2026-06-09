@@ -10,6 +10,8 @@ use anchor_lang::prelude::*;
 pub struct RepFlowConfig {
     /// Admin authority (can update minters/burners and toggle pause).
     pub admin:          Pubkey,
+    /// The repFlow SPL Token-2022 mint address. Set once at initialisation.
+    pub mint:           Pubkey,
     /// List of authorised minter public keys (up to 5 for 3-of-5 multisig).
     pub minters:        [Pubkey; 5],
     /// Number of active minters.
@@ -35,10 +37,10 @@ pub struct RepFlowConfig {
 }
 
 impl RepFlowConfig {
-    // admin(32) + minters(32*5) + minter_count(1) + burners(32*5) + burner_count(1)
+    // admin(32) + mint(32) + minters(32*5) + minter_count(1) + burners(32*5) + burner_count(1)
     // + paused(1) + total_minted(8) + total_burned(8) + updated_at(8) + bump(1)
     // + max_supply(8) + padding(56)
-    pub const SIZE: usize = 32 + (32 * 5) + 1 + (32 * 5) + 1 + 1 + 8 + 8 + 8 + 1 + 8 + 56;
+    pub const SIZE: usize = 32 + 32 + (32 * 5) + 1 + (32 * 5) + 1 + 1 + 8 + 8 + 8 + 1 + 8 + 56;
 
     /// Hard cap: 1 billion repFlow units.
     pub const MAX_SUPPLY: u64 = 1_000_000_000;

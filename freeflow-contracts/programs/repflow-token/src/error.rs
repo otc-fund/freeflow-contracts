@@ -44,6 +44,10 @@ pub enum RepFlowError {
     #[msg("Arithmetic overflow in calculation")]
     Overflow,
 
+    /// The mint account provided does not match the mint recorded in the config.
+    #[msg("Mint account does not match the repFlow config mint")]
+    InvalidMint,
+
     /// M-03: The provided user token account does not belong to the slashed user.
     #[msg("user_ata does not belong to the slashed user wallet")]
     InvalidAta,

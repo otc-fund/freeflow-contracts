@@ -186,14 +186,8 @@ pub struct MintRepFlow<'info> {
     )]
     pub repflow_user: Account<'info, RepFlowUser>,
 
-    /// The repFlow mint (PDA-owned by config).
-    /// M-02: Removed the dead constraint `mint.key() == config.key()` — it compared
-    /// the mint account's pubkey against the config PDA's pubkey, which can never be
-    /// equal (different PDAs), so every mint_repflow call would have been rejected
-    /// with a constraint violation. Proper mint validation is done via `config.mint_pubkey`
-    /// in the tokenomics phase; for now we accept the caller-provided mint and rely on
-    /// SPL Token-2022 to reject a mismatched mint authority.
-    #[account(mut)]
+    /// The repFlow SPL Token-2022 mint (must match config.mint).
+    #[account(mut, constraint = mint.key() == config.mint @ crate::error::RepFlowError::InvalidMint)]
     pub mint: UncheckedAccount<'info>,
 
     /// Recipient's associated token account.

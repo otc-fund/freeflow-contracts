@@ -127,7 +127,9 @@ pub struct FoundationConfig {
 pub const FOUNDATION_CONFIG_SIZE: usize = 32 + 1 + 1;
 
 // ── TrialMintCap PDA ────────────────────────────────────────────────────────
-// Seeds: [b"trial_mint_cap", relay_pubkey, claim_epoch.to_le_bytes()]
+// Seeds: [b"trial_mint_cap", relay_pubkey]
+// M-4 fix: epoch removed from seeds — one lifetime PDA per relay so the
+// minted_so_far counter is never reset and the per-epoch drain exploit is closed.
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TrialMintCap {

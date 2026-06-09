@@ -363,6 +363,8 @@ pub fn cpi_slash_repflow<'a>(
         data,
     };
 
+    // M-2: accounts slice must match ix.accounts exactly (6 entries, 0-5).
+    // repflow_program_ai is the CPI target, not an instruction account — omit it.
     invoke_signed(
         &ix,
         &[
@@ -372,7 +374,6 @@ pub fn cpi_slash_repflow<'a>(
             relay_repflow_ata_ai.clone(),
             slash_authority_ai.clone(),
             token_program_ai.clone(),
-            repflow_program_ai.clone(),
         ],
         &[&[b"slash_authority", &[slash_authority_bump]]],
     ).map_err(|e| {

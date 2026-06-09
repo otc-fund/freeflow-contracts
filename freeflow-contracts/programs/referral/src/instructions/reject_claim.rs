@@ -48,6 +48,12 @@ pub fn process(
         return Err(ReferralError::ClaimAlreadyExecuted.into());
     }
 
+    // ── M-1: Enforce 48-hour review window ─────────────────────────────────
+    let clock = Clock::get()?;
+    if clock.unix_timestamp > request.review_deadline {
+        return Err(ReferralError::ReviewDeadlinePassed.into());
+    }
+
     // ── 3. Unlock referrer balance ──────────────────────────────────────────
     let mut balance =
         ReferrerBalance::try_from_slice(&referrer_balance_info.data.borrow())?;
@@ -61,7 +67,6 @@ pub fn process(
     balance.serialize(&mut *referrer_balance_info.data.borrow_mut())?;
 
     // ── 4. Mark claim rejected ──────────────────────────────────────────────
-    let clock = Clock::get()?;
     request.status = 2; // Rejected
     request.executed_at = clock.unix_timestamp;
     request.serialize(&mut *claim_request_info.data.borrow_mut())?;

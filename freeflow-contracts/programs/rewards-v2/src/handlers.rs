@@ -540,8 +540,9 @@ pub fn process_release_claim_ix(
 
     if repflow_balance >= MIN_RELAY_REPFLOW {
         // Mint $FLOW 70/30.
+        // M-1: derive treasury as remainder to avoid truncation loss.
         let relay_amount    = total_released_amount * RELAY_SPLIT_PCT / 100;
-        let treasury_amount = total_released_amount * FOUNDATION_SPLIT_PCT / 100;
+        let treasury_amount = total_released_amount - relay_amount;
         cpi_mint_flow(token_program, flow_mint, reward_relay, service_authority, relay_amount, authority_bump)?;
         cpi_mint_flow(token_program, flow_mint, reward_treasury, service_authority, treasury_amount, authority_bump)?;
 
@@ -593,8 +594,9 @@ pub fn process_release_claim_ix(
                 .map_err(|_| ProgramError::InvalidAccountData)?
         };
 
+        // M-1: derive treasury as remainder to avoid truncation loss.
         let relay_amount    = total_released_amount * RELAY_SPLIT_PCT / 100;
-        let treasury_amount = total_released_amount * FOUNDATION_SPLIT_PCT / 100;
+        let treasury_amount = total_released_amount - relay_amount;
         let repflow_amount  = total_released_bytes / BYTES_PER_FLOW;
 
         cb.pending_relay_flow = cb.pending_relay_flow
@@ -603,9 +605,12 @@ pub fn process_release_claim_ix(
             .checked_add(treasury_amount).ok_or(RewardsError::ArithmeticOverflow)?;
         cb.pending_repflow    = cb.pending_repflow
             .checked_add(repflow_amount).ok_or(RewardsError::ArithmeticOverflow)?;
-        save_account(cb_ai, &cb)?;
 
+        // H-2: persist commitment to Complete BEFORE crediting ClaimableBalance.
+        // If the second save fails the commitment guard blocks a double-credit.
         commitment.status = ClaimCommitmentStatus::Complete;
+        save_account(commitment_ai, &commitment)?;
+        save_account(cb_ai, &cb)?;
         msg!(
             "ReleaseClaim: relay probationary (<2001 repFlow). {} $FLOW deferred",
             total_released_amount,
@@ -642,7 +647,8 @@ pub fn process_release_claim_ix(
 ///   11: relay_repflow_ata    (writable)
 ///   12: token_program
 ///   13: system_program
-///   14+: per disputed batch × 2: [fund_hold, user_escrow]
+///   14: fund_hold            (writable, FundHold PDA in user_escrow keyed by claim_hash)
+///   15: user_escrow          (writable, UserEscrow PDA for the client)
 #[allow(clippy::too_many_arguments)]
 pub fn process_client_dispute_ix(
     program_id:          &Pubkey,
@@ -673,6 +679,8 @@ pub fn process_client_dispute_ix(
     let relay_repflow_ata = next_account_info(iter)?;
     let token_program    = next_account_info(iter)?;
     let system_prog      = next_account_info(iter)?;
+    let fund_hold_ai     = next_account_info(iter)?;
+    let user_escrow_ai   = next_account_info(iter)?;
 
     if !client.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -714,11 +722,21 @@ pub fn process_client_dispute_ix(
         return Err(RewardsError::BatchSignatureInvalid.into());
     }
 
-    // Compute expected Merkle leaf.
+    // Compute expected Merkle leaf and claim hash (needed for both the
+    // fund_hold guard below and the eventual cpi_release_funds call).
     let expected_leaf = compute_merkle_leaf_hash(
         &client_pubkey, &session_id, batch_nonce, &original_batch_hash,
         total_amount, total_bytes, record_count,
     );
+    let claim_hash = compute_claim_hash(&client_pubkey, &session_id, batch_nonce, &expected_leaf);
+
+    // H-1: reject fabricated disputes.  A FundHold PDA is created by
+    // ReserveBatch only when real client funds were locked for this exact
+    // batch (keyed by claim_hash).  lamports == 0 means the batch was never
+    // reserved — no legitimate dispute is possible.
+    if fund_hold_ai.lamports() == 0 {
+        return Err(RewardsError::NoClaimHistory.into());
+    }
 
     // Check Merkle inclusion.
     let in_tree = if commitment.client_count == 1 {
@@ -799,10 +817,6 @@ pub fn process_client_dispute_ix(
 
     // Release client's funds.
     let (_, authority_bump) = Pubkey::find_program_address(&[b"mint_authority"], program_id);
-    let claim_hash = compute_claim_hash(&client_pubkey, &session_id, batch_nonce, &expected_leaf);
-
-    let fund_hold_ai   = next_account_info(iter)?;
-    let user_escrow_ai = next_account_info(iter)?;
 
     cpi_release_funds(
         escrow_program,
@@ -815,13 +829,10 @@ pub fn process_client_dispute_ix(
         authority_bump,
     ).map_err(|_| RewardsError::CpiFailed)?;
 
-    // Update commitment status.
-    let mut commitment_mut: ClaimCommitment =
-        ClaimCommitment::try_from_slice(&commitment_ai.data.borrow())
-            .map_err(|_| ProgramError::InvalidAccountData)?;
-    commitment_mut.status = ClaimCommitmentStatus::Disputed;
-    save_account(commitment_ai, &commitment_mut)?;
-
+    // L-4: do NOT set commitment to Disputed — that would freeze all other
+    // clients' funds in this epoch.  H-1 already prevents repeat disputes on
+    // the same batch (fund_hold lamports == 0 after release).  The commitment
+    // stays Active so honest clients can still proceed to ReleaseClaim.
     msg!(
         "ClientDispute: epoch={} client={:?} FORGED/OMITTED -- relay slashed (offense #{})",
         claim_epoch, &client_pubkey[..4], rep.slash_count,
@@ -972,6 +983,12 @@ pub fn process_release_trial_claim_ix(
             .map_err(|_| RewardsError::ClaimCommitmentNotFound)?;
     if commitment.claim_epoch != claim_epoch {
         return Err(ProgramError::InvalidArgument);
+    }
+    // C-1 / M-3: Guard against calling on an already-Complete commitment.
+    // (ReleaseClaim does this via Active→Releasing state machine; trial path must
+    // guard explicitly since it bypasses that machine.)
+    if commitment.status == ClaimCommitmentStatus::Complete {
+        return Err(RewardsError::EpochComplete.into());
     }
 
     // Check foundation kill switch.
@@ -1141,8 +1158,9 @@ pub fn process_release_trial_claim_ix(
     }
 
     // TrialMintCap check.
+    // M-4 fix: PDA keyed only by relay (no epoch) — lifetime cap that never resets.
     let (tmc_pda, tmc_bump) = Pubkey::find_program_address(
-        &[b"trial_mint_cap", relay_wallet.key.as_ref(), &claim_epoch.to_le_bytes()],
+        &[b"trial_mint_cap", relay_wallet.key.as_ref()],
         program_id,
     );
     if trial_mint_cap_ai.key != &tmc_pda {
@@ -1152,12 +1170,12 @@ pub fn process_release_trial_claim_ix(
     let mut tmc: TrialMintCap = if trial_mint_cap_ai.lamports() == 0 {
         create_pda_account(
             relay_wallet, trial_mint_cap_ai, system_prog, program_id,
-            &[b"trial_mint_cap", relay_wallet.key.as_ref(), &claim_epoch.to_le_bytes(), &[tmc_bump]],
+            &[b"trial_mint_cap", relay_wallet.key.as_ref(), &[tmc_bump]],
             TRIAL_MINT_CAP_SIZE,
         )?;
         TrialMintCap {
             relay: relay_wallet.key.to_bytes(),
-            epoch: claim_epoch,
+            epoch: claim_epoch, // records the epoch of first init — informational only
             minted_so_far: 0,
             bump: tmc_bump,
         }
@@ -1177,8 +1195,9 @@ pub fn process_release_trial_claim_ix(
     save_account(trial_mint_cap_ai, &tmc)?;
 
     // Mint $FLOW 70/30 directly (no burn).
+    // M-1: derive treasury as remainder to avoid truncation loss.
     let relay_amount    = total_released_amount * RELAY_SPLIT_PCT / 100;
-    let treasury_amount = total_released_amount * FOUNDATION_SPLIT_PCT / 100;
+    let treasury_amount = total_released_amount - relay_amount;
     cpi_mint_flow(token_program, flow_mint, reward_relay, service_authority, relay_amount, authority_bump)?;
     cpi_mint_flow(token_program, flow_mint, reward_treasury, service_authority, treasury_amount, authority_bump)?;
 

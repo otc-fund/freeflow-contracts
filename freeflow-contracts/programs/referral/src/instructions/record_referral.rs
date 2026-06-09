@@ -216,6 +216,10 @@ pub fn process(
     balance.serialize(&mut *referrer_balance_info.data.borrow_mut())?;
 
     // ── 8. Update RewardsPool tracking ──────────────────────────────────────
+    // L-5: validate ownership before deserializing pool accounting
+    if rewards_pool_info.owner != program_id {
+        return Err(solana_program::program_error::ProgramError::InvalidAccountOwner);
+    }
     let mut pool = RewardsPool::try_from_slice(&rewards_pool_info.data.borrow())?;
     pool.total_deposited = pool
         .total_deposited

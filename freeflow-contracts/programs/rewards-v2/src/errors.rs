@@ -55,6 +55,7 @@ pub enum RewardsError {
     AlreadyReleased            = 40,
     ReleaseExceedsCommitment   = 41,
     ReserveExceedsCommitment   = 42,
+    NoClaimHistory             = 43,
 }
 
 impl From<RewardsError> for ProgramError {

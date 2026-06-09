@@ -57,8 +57,9 @@ const GOVERNANCE_PUBKEY: solana_program::pubkey::Pubkey =
 const REWARDS_PROGRAM_PUBKEY: solana_program::pubkey::Pubkey =
     solana_program::pubkey!("2yeVew5qq5jf5zuoqiE2svVLRE9HTN6J2GfB9LopdM1C");
 
+/// Foundation wallet: 8SL4dhnXU9tjvsbwfkVzQbfV99wGnVZBECoiuwrdbaJk
 pub const NETWORK_AUTHORITY_PUBKEY: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+    "6e7ee205cf04716c9f85d7c2addc4d1b1690acb02960411f6e5896e9ab632559";
 
 solana_program::declare_id!("7N1JRX3LY3goVAZCyaJyH7kpZ3kboZvh3jteDmCq6Dz4");
 

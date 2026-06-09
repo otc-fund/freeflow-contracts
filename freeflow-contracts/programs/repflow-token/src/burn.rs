@@ -250,7 +250,8 @@ pub struct ExecuteSlash<'info> {
     )]
     pub slash_record: Account<'info, SlashRecord>,
 
-    #[account(mut)]
+    /// The repFlow SPL Token-2022 mint (must match config.mint).
+    #[account(mut, constraint = mint.key() == config.mint @ crate::error::RepFlowError::InvalidMint)]
     pub mint: UncheckedAccount<'info>,
 
     #[account(mut)]

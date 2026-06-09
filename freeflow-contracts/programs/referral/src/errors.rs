@@ -22,9 +22,10 @@ pub enum ReferralError {
     InvalidReferralConfigOwner,     // 15 — H-2: referral_config not owned by referral program
     InvalidReferralConfigSize,      // 16 — H-2: referral_config data too small
     InvalidReferralConfigAuthority, // 17 — H-2: config authority doesn't match expected
-    ReviewPeriodNotExpired,         // 18
+    ReviewPeriodNotExpired,         // 18 — reserved for future auto-release guard
     ClaimAlreadyExecuted,           // 19
     InvalidClaimStatus,             // 20
+    ReviewDeadlinePassed,           // 21 — M-1: foundation acted after 48h window closed
 }
 
 impl From<ReferralError> for ProgramError {

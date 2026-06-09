@@ -19,7 +19,7 @@ pub fn calculate_reward(
         .checked_mul(reward_bps as u128)
         .ok_or(ReferralError::Overflow)?
         .checked_div(10_000)
-        .unwrap() as u64;
+        .ok_or(ReferralError::Overflow)? as u64;
     Ok(reward.min(max_reward))
 }
 

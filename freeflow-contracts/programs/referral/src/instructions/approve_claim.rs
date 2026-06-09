@@ -55,8 +55,18 @@ pub fn process(
         return Err(ReferralError::ClaimAlreadyExecuted.into());
     }
 
+    // ── M-1: Enforce 48-hour review window ─────────────────────────────────
+    let clock = Clock::get()?;
+    if clock.unix_timestamp > request.review_deadline {
+        return Err(ReferralError::ReviewDeadlinePassed.into());
+    }
+
     // ── 3. Check vault has enough $FLOW ─────────────────────────────────────
     {
+        // L-1: verify vault is a genuine SPL token account before reading raw bytes
+        if vault_info.owner != &spl_token::id() {
+            return Err(solana_program::program_error::ProgramError::InvalidAccountOwner);
+        }
         let vault_data = vault_info.data.borrow();
         let vault_balance =
             u64::from_le_bytes(vault_data[64..72].try_into().unwrap());
@@ -92,7 +102,6 @@ pub fn process(
     )?;
 
     // ── 6. Mark claim approved ──────────────────────────────────────────────
-    let clock = Clock::get()?;
     request.status = 1; // Approved
     request.executed_at = clock.unix_timestamp;
     request.serialize(&mut *claim_request_info.data.borrow_mut())?;

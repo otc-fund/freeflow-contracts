@@ -80,13 +80,27 @@ pub fn compute_merkle_leaf_hash(
 
 /// Convenience wrapper: compute leaf hash from a ReserveBatchEntry.
 ///
-/// Maps: `batch_nonce = entry.highest_seq`, `batch_hash = entry.merkle_leaf_hash`.
+/// Maps: `batch_nonce = entry.highest_seq`.
+///
+/// **C-2 fix:** `batch_hash` is recomputed deterministically as
+/// `SHA-256(client_pubkey || session_id || highest_seq)` — the same formula
+/// used by `compute_merkle_leaf_hash_from_release` — instead of trusting the
+/// relay-supplied `entry.merkle_leaf_hash`.  This ensures ReserveBatch and
+/// ReleaseClaim always derive identical leaf hashes from the same session data.
+/// The `merkle_leaf_hash` field of `ReserveBatchEntry` is no longer used in
+/// the leaf hash computation and is ignored here.
 pub fn compute_merkle_leaf_hash_from_entry(entry: &ReserveBatchEntry) -> [u8; 32] {
+    // Recompute batch_hash identically to compute_merkle_leaf_hash_from_release.
+    let batch_hash = hashv(&[
+        entry.client_pubkey.as_slice(),
+        entry.session_id.as_slice(),
+        &entry.highest_seq.to_le_bytes(),
+    ]).to_bytes();
     compute_merkle_leaf_hash(
         &entry.client_pubkey,
         &entry.session_id,
         entry.highest_seq,
-        &entry.merkle_leaf_hash,
+        &batch_hash,
         entry.amount,
         entry.bytes,
         entry.record_count,

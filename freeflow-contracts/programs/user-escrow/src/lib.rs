@@ -35,13 +35,23 @@ declare_id!("7PzcA2sNDzrvhTNLFScWZuNKS4g7jCCghsowZA9RsZ26");
 pub const FOUNDATION_PUBKEY: Pubkey =
     solana_program::pubkey!("8SL4dhnXU9tjvsbwfkVzQbfV99wGnVZBECoiuwrdbaJk");
 
+// H-1: Referral program ID for ReferralConfig ownership validation.
+pub const REFERRAL_PROGRAM_ID: Pubkey =
+    solana_program::pubkey!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+
+// Borsh-serialized size and authority field offset of ReferralConfig (no discriminant).
+// Layout: reward_bps(2) + max_reward(8) + min_purchase(8) + authority(32) + vault(32) + bump(1) + pad(3) = 86
+const REFERRAL_CONFIG_SIZE: usize = 86;
+const REFERRAL_CONFIG_AUTHORITY_OFFSET: usize = 18; // byte offset of authority [u8; 32]
+
 /// Calculate referral reward without importing the referral crate.
 ///
 /// Uses u128 to prevent overflow. Returns `min(amount * bps / 10_000, max_reward)`.
+/// Formula and overflow strategy mirrors referral::utils::calculate_reward exactly.
 fn calculate_referral_reward(amount: u64, reward_bps: u16, max_reward: u64) -> u64 {
     let reward = (amount as u128)
-        .saturating_mul(reward_bps as u128)
-        .checked_div(10_000)
+        .checked_mul(reward_bps as u128)
+        .and_then(|v| v.checked_div(10_000))
         .unwrap_or(0) as u64;
     reward.min(max_reward)
 }
@@ -144,13 +154,28 @@ pub mod user_escrow {
 
         // Determine how much goes to escrow vs. referral pool.
         let (escrow_amount, referral_reward) = if referrer.is_some() {
-            // Read reward params from ReferralConfig at known raw-Borsh offsets:
-            //   [0..2]  reward_bps:            u16
-            //   [2..10] max_reward_lamports:   u64
+            // H-1: verify ownership, size, and authority before reading raw bytes.
+            // Raw-Borsh ReferralConfig layout (86 bytes, no discriminant):
+            //   [0..2]   reward_bps (u16)
+            //   [2..10]  max_reward_lamports (u64)
+            //   [18..50] authority ([u8; 32])
+            require!(
+                *ctx.accounts.referral_config.owner == REFERRAL_PROGRAM_ID,
+                EscrowError::InvalidReferralConfigOwner
+            );
             let config_data = ctx.accounts.referral_config.data.borrow();
-            require!(config_data.len() >= 10, EscrowError::InvalidPaymentAmount);
-            let reward_bps  = u16::from_le_bytes(config_data[0..2].try_into().unwrap());
-            let max_reward  = u64::from_le_bytes(config_data[2..10].try_into().unwrap());
+            require!(
+                config_data.len() >= REFERRAL_CONFIG_SIZE,
+                EscrowError::InvalidReferralConfigSize
+            );
+            require!(
+                &config_data[REFERRAL_CONFIG_AUTHORITY_OFFSET
+                    ..REFERRAL_CONFIG_AUTHORITY_OFFSET + 32]
+                    == FOUNDATION_PUBKEY.as_ref(),
+                EscrowError::InvalidReferralConfigAuthority
+            );
+            let reward_bps = u16::from_le_bytes(config_data[0..2].try_into().unwrap());
+            let max_reward = u64::from_le_bytes(config_data[2..10].try_into().unwrap());
             drop(config_data);
 
             let reward = calculate_referral_reward(flow_lamports, reward_bps, max_reward);
@@ -234,10 +259,24 @@ pub mod user_escrow {
 
         // Determine how much goes to escrow vs. referral pool.
         let (escrow_amount, referral_reward) = if referrer.is_some() {
+            // H-1: verify ownership, size, and authority before reading raw bytes.
+            require!(
+                *ctx.accounts.referral_config.owner == REFERRAL_PROGRAM_ID,
+                EscrowError::InvalidReferralConfigOwner
+            );
             let config_data = ctx.accounts.referral_config.data.borrow();
-            require!(config_data.len() >= 10, EscrowError::InvalidPaymentAmount);
-            let reward_bps  = u16::from_le_bytes(config_data[0..2].try_into().unwrap());
-            let max_reward  = u64::from_le_bytes(config_data[2..10].try_into().unwrap());
+            require!(
+                config_data.len() >= REFERRAL_CONFIG_SIZE,
+                EscrowError::InvalidReferralConfigSize
+            );
+            require!(
+                &config_data[REFERRAL_CONFIG_AUTHORITY_OFFSET
+                    ..REFERRAL_CONFIG_AUTHORITY_OFFSET + 32]
+                    == FOUNDATION_PUBKEY.as_ref(),
+                EscrowError::InvalidReferralConfigAuthority
+            );
+            let reward_bps = u16::from_le_bytes(config_data[0..2].try_into().unwrap());
+            let max_reward = u64::from_le_bytes(config_data[2..10].try_into().unwrap());
             drop(config_data);
 
             let reward = calculate_referral_reward(flow_amount, reward_bps, max_reward);
@@ -1023,4 +1062,13 @@ pub enum EscrowError {
 
     #[msg("Insufficient effective balance (balance - held < amount)")]
     InsufficientEffectiveBalance,   // 6006
+
+    #[msg("ReferralConfig account not owned by referral program")]
+    InvalidReferralConfigOwner,     // 6007
+
+    #[msg("ReferralConfig account data too small")]
+    InvalidReferralConfigSize,      // 6008
+
+    #[msg("ReferralConfig authority does not match foundation")]
+    InvalidReferralConfigAuthority, // 6009
 }
