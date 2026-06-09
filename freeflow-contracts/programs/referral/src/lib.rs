@@ -39,7 +39,7 @@ use instructions::{
     update_config::{self, UpdateReferralConfigArgs},
 };
 
-declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+declare_id!("Bwx1U3WLcproQKAbCkWZBagjpq6ThwWU1psdmd9pmmeF");
 
 entrypoint!(process_instruction);
 

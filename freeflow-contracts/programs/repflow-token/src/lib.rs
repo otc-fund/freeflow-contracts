@@ -125,6 +125,48 @@ pub mod repflow_token {
         Ok(())
     }
 
+    /// Full config reset — use after a layout migration where existing account
+    /// data is stale (fields shifted when a new field was inserted mid-struct).
+    ///
+    /// Preserves `admin` (validated by the `has_one` constraint). Rewrites every
+    /// other field so the account is back in a known-good state.
+    ///
+    /// `minters`    — list of authorised minter keys (max 5).
+    /// `max_supply` — hard cap in repFlow base units (pass 1_000_000_000).
+    pub fn reinitialize_config(
+        ctx:        Context<AdminOnly>,
+        new_mint:   Pubkey,
+        minters:    Vec<Pubkey>,
+        max_supply: u64,
+    ) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        let now    = Clock::get()?.unix_timestamp;
+
+        config.mint         = new_mint;
+        config.max_supply   = max_supply;
+        config.paused       = false;
+        config.total_minted = 0;
+        config.total_burned = 0;
+        config.updated_at   = now;
+        config.bump         = ctx.bumps.config;
+
+        config.minters = [Pubkey::default(); 5];
+        let minter_count = minters.len().min(5);
+        for (i, m) in minters.iter().take(minter_count).enumerate() {
+            config.minters[i] = *m;
+        }
+        config.minter_count = minter_count as u8;
+
+        config.burners      = [Pubkey::default(); 5];
+        config.burner_count = 0;
+
+        msg!(
+            "repFlow config reinitialized: mint={} minters={}",
+            new_mint, minter_count
+        );
+        Ok(())
+    }
+
     // ── User management ─────────────────────────────────────────────────────
 
     /// Create a repFlow user account for a new participant.
