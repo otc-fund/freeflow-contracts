@@ -1014,17 +1014,16 @@ pub fn process_release_trial_claim_ix(
     let mut total_released_bytes:  u64 = 0;
     let mut trial_cap_amount:      u64 = 0; // trial clients only — used for TrialMintCap
 
-    // Relay pubkey as bytes for self-uptime detection.
-    let relay_key_bytes = relay_wallet.key.to_bytes();
-
     for release in &releases {
         let claim_state_ai = next_account_info(iter)?;
         let trial_usage_ai = next_account_info(iter)?;
 
-        // Relay uptime self-claim: client_pubkey == relay_wallet.
+        // Relay uptime self-claim: session_id has epoch_secs repeated in both halves
+        // (set by UsageTracker::build_uptime_record: [epoch_secs_le || epoch_secs_le]).
+        // Regular trial client session IDs are random UUIDs; probability of false match ≈ 1/2^64.
         // Skip TrialUsage checks (10 GB cap + 30-day expiry don't apply to relay uptime)
         // and exclude from TrialMintCap (which is a free-trial-fraud limit, not uptime).
-        let is_relay_self_uptime = release.client_pubkey == relay_key_bytes;
+        let is_relay_self_uptime = release.session_id[..8] == release.session_id[8..];
 
         // Verify Merkle proof.
         let leaf_hash = compute_merkle_leaf_hash_from_release(release);

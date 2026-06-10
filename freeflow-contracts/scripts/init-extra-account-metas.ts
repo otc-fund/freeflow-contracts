@@ -20,7 +20,7 @@ import * as crypto from "crypto";
 
 const RPC_URL      = "https://api.devnet.solana.com";
 const REPFLOW_PROG = new PublicKey("8K4GhPEQ1yy9vdTaMPTL83G5qr5ZHZiBm2VBQ58jJs5w");
-const REPFLOW_MINT = new PublicKey("BFaMqKEjS57NZdP6naPoEHavzUQc1KHL27WqY5CZMkmN");
+const REPFLOW_MINT = new PublicKey("G8QRTf5PL2FFPzMCxSgaX3okgRLoE2jSseGAoTfGJ7YW");
 
 // Load wallet keypair
 const walletPath = process.env.ANCHOR_WALLET || "D:\\Solana\\Wallet\\id.json";
