@@ -1157,9 +1157,11 @@ pub fn process_release_trial_claim_ix(
     }
 
     // TrialMintCap check.
-    // M-4 fix: PDA keyed only by relay (no epoch) — lifetime cap that never resets.
+    // Per-relay-per-epoch cap: PDA keyed by (relay, epoch) so the cap resets each
+    // epoch. Seed MUST match the off-chain clients
+    // (find_trial_mint_cap_pda → [b"trial_mint_cap", relay, epoch_le]).
     let (tmc_pda, tmc_bump) = Pubkey::find_program_address(
-        &[b"trial_mint_cap", relay_wallet.key.as_ref()],
+        &[b"trial_mint_cap", relay_wallet.key.as_ref(), &claim_epoch.to_le_bytes()],
         program_id,
     );
     if trial_mint_cap_ai.key != &tmc_pda {
@@ -1169,12 +1171,12 @@ pub fn process_release_trial_claim_ix(
     let mut tmc: TrialMintCap = if trial_mint_cap_ai.lamports() == 0 {
         create_pda_account(
             relay_wallet, trial_mint_cap_ai, system_prog, program_id,
-            &[b"trial_mint_cap", relay_wallet.key.as_ref(), &[tmc_bump]],
+            &[b"trial_mint_cap", relay_wallet.key.as_ref(), &claim_epoch.to_le_bytes(), &[tmc_bump]],
             TRIAL_MINT_CAP_SIZE,
         )?;
         TrialMintCap {
             relay: relay_wallet.key.to_bytes(),
-            epoch: claim_epoch, // records the epoch of first init — informational only
+            epoch: claim_epoch, // this PDA's epoch (part of the seed)
             minted_so_far: 0,
             bump: tmc_bump,
         }
