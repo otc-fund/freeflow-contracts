@@ -426,6 +426,10 @@ pub fn process_release_claim_ix(
     let reward_relay          = next_account_info(iter)?;
     let reward_treasury       = next_account_info(iter)?;
     let system_prog           = next_account_info(iter)?;
+    // Token-2022 program + repFlow ExtraAccountMetaList PDA — forwarded to the
+    // repflow-token CPI. `token_program` above is SPL Token ($FLOW mint only).
+    let token_2022_program    = next_account_info(iter)?;
+    let repflow_eam           = next_account_info(iter)?;
 
     if !relay_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -551,8 +555,8 @@ pub fn process_release_claim_ix(
         if repflow_amount > 0 {
             cpi_mint_repflow_bandwidth(
                 repflow_program, repflow_config, relay_repflow_user,
-                repflow_mint, relay_repflow_ata, service_authority, token_program,
-                repflow_amount, authority_bump,
+                repflow_mint, relay_repflow_ata, service_authority, token_2022_program,
+                repflow_eam, repflow_amount, authority_bump,
             )?;
         }
 
@@ -875,6 +879,10 @@ pub fn process_claim_pending_ix(
     let relay_repflow_ata  = next_account_info(iter)?;
     let reward_relay       = next_account_info(iter)?;
     let reward_treasury    = next_account_info(iter)?;
+    // Token-2022 program + repFlow ExtraAccountMetaList PDA — forwarded to the
+    // repflow-token CPI. `token_program` above is SPL Token ($FLOW mint only).
+    let token_2022_program = next_account_info(iter)?;
+    let repflow_eam        = next_account_info(iter)?;
 
     if !relay_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -910,8 +918,8 @@ pub fn process_claim_pending_ix(
     if cb.pending_repflow > 0 {
         cpi_mint_repflow_bandwidth(
             repflow_program, repflow_config, relay_repflow_user,
-            repflow_mint, relay_repflow_ata, service_authority, token_program,
-            cb.pending_repflow, authority_bump,
+            repflow_mint, relay_repflow_ata, service_authority, token_2022_program,
+            repflow_eam, cb.pending_repflow, authority_bump,
         )?;
     }
 
@@ -972,6 +980,12 @@ pub fn process_release_trial_claim_ix(
     let reward_treasury     = next_account_info(iter)?;
     let trial_mint_cap_ai   = next_account_info(iter)?;
     let system_prog         = next_account_info(iter)?;
+    // Token-2022 program + repFlow ExtraAccountMetaList PDA — forwarded to the
+    // repflow-token CPI (which validates `Program<'info, Token2022>` and requires
+    // the EAM PDA as a remaining account). The `token_program` above is SPL Token,
+    // used only for the $FLOW mint; it must NOT be forwarded to repflow-token.
+    let token_2022_program  = next_account_info(iter)?;
+    let repflow_eam         = next_account_info(iter)?;
 
     if !relay_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -1209,8 +1223,8 @@ pub fn process_release_trial_claim_ix(
     if repflow_amount > 0 {
         cpi_mint_repflow_bandwidth(
             repflow_program, repflow_config, relay_repflow_user,
-            repflow_mint, relay_repflow_ata, service_authority, token_program,
-            repflow_amount, authority_bump,
+            repflow_mint, relay_repflow_ata, service_authority, token_2022_program,
+            repflow_eam, repflow_amount, authority_bump,
         )?;
     }
 

@@ -28,7 +28,7 @@ declare_id!("8K4GhPEQ1yy9vdTaMPTL83G5qr5ZHZiBm2VBQ58jJs5w");
 
 /// Rewards program ID — used in `mint_repflow_from_rewards` to verify that the
 /// CPI caller's authority PDA is derived from the rewards program.
-pub const REWARDS_PROGRAM_ID: Pubkey = pubkey!("2yeVew5qq5jf5zuoqiE2svVLRE9HTN6J2GfB9LopdM1C");
+pub const REWARDS_PROGRAM_ID: Pubkey = pubkey!("26pFEqpZYeG5xxmAMc74ZsANo6Kdduf5HYq5qk7Y34eT");
 
 #[program]
 pub mod repflow_token {

@@ -263,6 +263,7 @@ pub fn cpi_mint_repflow_bandwidth<'a>(
     repflow_ata_ai:      &AccountInfo<'a>,
     rewards_authority:   &AccountInfo<'a>,
     token_program_ai:    &AccountInfo<'a>,
+    repflow_eam_ai:      &AccountInfo<'a>,
     amount:              u64,
     mint_authority_bump: u8,
 ) -> ProgramResult {
@@ -289,6 +290,9 @@ pub fn cpi_mint_repflow_bandwidth<'a>(
             AccountMeta::new(*repflow_ata_ai.key,     false),
             AccountMeta::new_readonly(*rewards_authority.key, true),
             AccountMeta::new_readonly(*token_program_ai.key,  false),
+            // ExtraAccountMetaList PDA, passed as a remaining account; repflow-token's
+            // mint_repflow_from_rewards requires it (TransferHookNotInitialized otherwise).
+            AccountMeta::new_readonly(*repflow_eam_ai.key,    false),
         ],
         data,
     };
@@ -302,6 +306,7 @@ pub fn cpi_mint_repflow_bandwidth<'a>(
             repflow_ata_ai.clone(),
             rewards_authority.clone(),
             token_program_ai.clone(),
+            repflow_eam_ai.clone(),
             repflow_program_ai.clone(),
         ],
         &[&[b"mint_authority", &[mint_authority_bump]]],
