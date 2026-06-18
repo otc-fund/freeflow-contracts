@@ -1,11 +1,63 @@
 # FreeFlow Contracts — Build Guide
 
-This document is the authoritative reference for building the five Solana programs
+This document is the authoritative reference for building the Solana programs
 in this workspace. Read it before touching the build toolchain.
 
 ---
 
-## Quick start (correct commands)
+## ⚠️ devnet toolchain change — 2026-06-19 (READ FIRST)
+
+**Solana devnet now runs Agave `4.1.0-beta.2` validators.** This broke the old
+build flow. The 4.1-beta validator **disabled SBPFv0 deployment** and switched
+the ELF `e_flags` encoding (`0x1`/`0x2`/`0x3` = v1/v2/v3, no longer the legacy
+`0x20`). Modern platform-tools (v1.48/v1.54) LLVM emits genuine **v3**
+instructions, so you must build and label the artifact as **v3** or the
+validator rejects the deploy.
+
+**Symptom if you use the old toolchain:**
+`solana program deploy` fails with `invalid account data for instruction` and a
+program log `Detected sbpf_version required by the executable which are not enabled`.
+
+**Current working recipe (devnet, verified 2026-06-19):**
+
+```bash
+# From WSL Ubuntu only — NOT Windows-native PowerShell or cmd
+# Switch the active toolchain to match the cluster:
+agave-install init 4.1.0-beta.2        # platform-tools v1.54, cargo-build-sbf 4.1.0
+
+export PATH="/root/.local/share/solana/install/active_release/bin:/root/.cargo/bin:$PATH"
+export HOME=/root
+cd /mnt/d/Solana/freeflow-contracts
+
+# Build the WHOLE workspace with explicit v3 arch.
+# Do NOT pass -p <one-crate>: the post-build artifact-copy step then crashes
+# looking for the other programs' .so ("Unable to get file metadata for ...so").
+cargo-build-sbf --arch v3
+```
+
+Verify the artifact is v3 before deploying:
+
+```bash
+readelf -h target/deploy/repflow_token.so | grep Flags   # expect: Flags: 0x3
+```
+
+Then deploy with the 4.1-beta CLI over default TPU (no `--use-rpc`) — see
+[Deploying to devnet](#deploying-to-devnet).
+
+> **Why `cargo-build-sbf` directly and not `anchor build` here:** `--arch v3` is
+> a `cargo-build-sbf` flag and `anchor build` does not forward it cleanly. With
+> the 4.1 toolchain the lockfile/edition2024 workarounds below are no longer
+> needed (its cargo is new enough), so calling `cargo-build-sbf` directly is
+> safe. The 2.1.13 sections below are retained for historical reference and for
+> any cluster still on the old validator.
+
+The old toolchains remain on disk at
+`/root/.local/share/solana/install/releases/{2.1.13,2.2.20,4.1.0-beta.2}`;
+`agave-install init <ver>` switches `active_release`.
+
+---
+
+## Legacy quick start (Agave 2.1.13 — pre-4.1 clusters only)
 
 ```bash
 # From WSL Ubuntu only — NOT Windows-native PowerShell or cmd
@@ -13,24 +65,39 @@ export PATH="/root/.local/share/solana/install/active_release/bin:/root/.cargo/b
 export HOME=/root
 cd /mnt/d/Solana/freeflow-contracts
 
-# Build all five programs
+# Build all programs
 anchor build --no-idl
 
 # Build one program (e.g. repflow-token)
 anchor build --no-idl -p repflow_token
 ```
 
-That is the complete build. Nothing else is needed.
+This was the complete build against Agave 2.1.13. It no longer produces a
+deployable artifact for the 4.1-beta devnet (see notice above).
 
 ---
 
 ## Required toolchain
 
+**For devnet (current — Agave 4.1-beta):**
+
 | Tool | Version | Notes |
 |---|---|---|
 | OS | WSL Ubuntu (Linux) | **Must use WSL — Windows-native `cargo-build-sbf.exe` is incompatible** |
-| solana-cli | 2.1.13 (Agave) | `solana-install update` to change versions |
-| cargo-build-sbf | 2.1.13 | Ships with Solana; `platform-tools v1.43`, `rustc 1.79.0` |
+| solana-cli | 4.1.0-beta.2 (Agave) | `agave-install init 4.1.0-beta.2`; must match the cluster |
+| cargo-build-sbf | 4.1.0 | Ships with 4.1-beta; `platform-tools v1.54` |
+| build flag | `--arch v3` | Required so the ELF `e_flags` (0x3) match the v3 instructions LLVM emits |
+
+The CLI version only matters for whether the *deploy* step's local verifier
+accepts the artifact (older CLIs reject v3 locally). For the *build*, only the
+platform-tools/`--arch` combination determines the deployable SBPF version.
+
+**Legacy (Agave 2.1.13 — pre-4.1 clusters):**
+
+| Tool | Version | Notes |
+|---|---|---|
+| solana-cli | 2.1.13 (Agave) | `agave-install init 2.1.13` |
+| cargo-build-sbf | 2.1.13 | `platform-tools v1.43`, `rustc 1.79.0` |
 | anchor-cli | 0.30.1 | Located at `/root/.cargo/bin/anchor` |
 | cargo (default) | 1.95.0+ | Located at `/root/.cargo/bin/cargo`; **only used for lockfile management** |
 
@@ -136,10 +203,15 @@ use the targeted `cargo update --precise` commands above instead.
 | Program | Crate name | Deploy ID (all clusters) | Build type |
 |---|---|---|---|
 | repflow-token | `repflow-token` | `8K4GhPEQ1yy9vdTaMPTL83G5qr5ZHZiBm2VBQ58jJs5w` | Anchor |
+| rewards-v2 | `freeflow-rewards-v2` | `26pFEqpZYeG5xxmAMc74ZsANo6Kdduf5HYq5qk7Y34eT` | Anchor |
 | staking | `staking` | `7N1JRX3LY3goVAZCyaJyH7kpZ3kboZvh3jteDmCq6Dz4` | Raw entrypoint |
 | rewards | `rewards` | `2yeVew5qq5jf5zuoqiE2svVLRE9HTN6J2GfB9LopdM1C` | Raw entrypoint |
 | registry | `registry` | `HkMhMoEv7U8VowyVsCCk9pZDkWwp18ei1BZ3Fif94DCE` | Raw entrypoint |
 | user-escrow | `user-escrow` | `7PzcA2sNDzrvhTNLFScWZuNKS4g7jCCghsowZA9RsZ26` | Anchor |
+
+> The active $FLOW reward + uptime flow runs through **rewards-v2** (`26pFE…`),
+> which CPIs into **repflow-token** (`8K4Gh…`). The raw-entrypoint **rewards**
+> (`2yeVew…`) is the older program kept for reference.
 
 All `declare_id!` values in source must match the table above. The IDs are
 identical across localnet, devnet, and mainnet entries in `Anchor.toml`.
@@ -148,6 +220,7 @@ identical across localnet, devnet, and mainnet entries in `Anchor.toml`.
 
 ```
 target/deploy/
+  freeflow_rewards_v2.so
   registry.so
   repflow_token.so
   rewards.so
@@ -163,7 +236,9 @@ deployer wallet, so the keypair files are irrelevant for day-to-day work.
 
 ## Deploying to devnet
 
-After building, deploy each program that changed:
+After building, deploy each program that changed. On the 4.1-beta devnet, deploy
+with the **4.1-beta CLI** over the default TPU path (do **not** add `--use-rpc`).
+Confirm `solana cluster-version --url devnet` reports a `4.1.x` build first.
 
 ```bash
 export PATH="/root/.local/share/solana/install/active_release/bin:/root/.cargo/bin:$PATH"
@@ -171,6 +246,11 @@ export HOME=/root
 cd /mnt/d/Solana/freeflow-contracts
 
 WALLET=/mnt/d/Solana/Wallet/id.json
+
+# rewards-v2
+solana program deploy target/deploy/freeflow_rewards_v2.so \
+  --url devnet --keypair $WALLET \
+  --program-id 26pFEqpZYeG5xxmAMc74ZsANo6Kdduf5HYq5qk7Y34eT
 
 # repflow-token (example — repeat for each changed program)
 solana program deploy target/deploy/repflow_token.so \
@@ -216,6 +296,16 @@ Both must stay in sync. If you bump a pin in `Cargo.toml`, run the matching
 ---
 
 ## Troubleshooting
+
+### `Detected sbpf_version required by the executable which are not enabled` / `invalid account data for instruction` on deploy
+
+The artifact's SBPF version does not match what the cluster's validator allows.
+Since 2026-06-19 devnet runs Agave 4.1-beta, which requires v3. Rebuild the whole
+workspace under the 4.1 toolchain with `cargo-build-sbf --arch v3` and confirm
+`readelf -h target/deploy/<prog>.so | grep Flags` shows `0x3`. See the
+**devnet toolchain change** notice at the top of this file. Note `--arch v0/v1/v2`
+only relabel `e_flags`; the LLVM-emitted instruction floor stays v3, so a lower
+label is rejected as "declared version < instructions used".
 
 ### `feature 'edition2024' is required`
 
