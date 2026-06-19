@@ -51,12 +51,8 @@ pub mod repflow_token {
         config.admin        = ctx.accounts.admin.key();
         config.mint         = mint;
         config.paused       = false;
-        config.total_minted = 0;
-        config.total_burned = 0;
         config.updated_at   = now;
         config.bump         = ctx.bumps.config;
-        // Set hard cap at 1 billion repFlow (tokenomics).
-        config.max_supply   = crate::state::RepFlowConfig::MAX_SUPPLY;
 
         // Populate minters (max 5 for 3-of-5 multisig).
         let minter_count = minters.len().min(5);
@@ -132,21 +128,16 @@ pub mod repflow_token {
     /// other field so the account is back in a known-good state.
     ///
     /// `minters`    — list of authorised minter keys (max 5).
-    /// `max_supply` — hard cap in repFlow base units (pass 1_000_000_000).
     pub fn reinitialize_config(
         ctx:        Context<AdminOnly>,
         new_mint:   Pubkey,
         minters:    Vec<Pubkey>,
-        max_supply: u64,
     ) -> Result<()> {
         let config = &mut ctx.accounts.config;
         let now    = Clock::get()?.unix_timestamp;
 
         config.mint         = new_mint;
-        config.max_supply   = max_supply;
         config.paused       = false;
-        config.total_minted = 0;
-        config.total_burned = 0;
         config.updated_at   = now;
         config.bump         = ctx.bumps.config;
 
@@ -392,20 +383,14 @@ pub mod repflow_token {
 
         let now = Clock::get()?.unix_timestamp;
 
-        // ── Update rf_config.total_minted ──
+        // ── Pause check (read-only — PDA-only, no shared counter write) ──
         {
-            let mut data = rf_config_info.try_borrow_mut_data()?;
-            let mut config = {
+            let data = rf_config_info.try_borrow_data()?;
+            let config = {
                 let slice: &[u8] = &*data;
                 RepFlowConfig::try_deserialize(&mut &*slice)?
             };
             require!(!config.paused, RepFlowError::ProgramPaused);
-            config.total_minted = config
-                .total_minted
-                .checked_add(amount)
-                .ok_or(error!(RepFlowError::Overflow))?;
-            let mut writer: &mut [u8] = &mut *data;
-            config.try_serialize(&mut writer)?;
         }
 
         // ── Update rf_user balances ──

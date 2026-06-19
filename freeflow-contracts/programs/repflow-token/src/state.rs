@@ -22,28 +22,18 @@ pub struct RepFlowConfig {
     pub burner_count:   u8,
     /// Emergency pause flag — when true, all mint/burn operations are suspended.
     pub paused:         bool,
-    /// Total repFlow minted across all users (cumulative).
-    pub total_minted:   u64,
-    /// Total repFlow burned via slashing (cumulative).
-    pub total_burned:   u64,
     /// Unix timestamp of last config update.
     pub updated_at:     i64,
     /// PDA bump seed.
     pub bump:           u8,
-    /// Maximum total repFlow that may ever be minted (hard cap).
-    /// 0 means uncapped (legacy — set during initialize to enable cap enforcement).
-    /// Tokenomics: 1 billion repFlow units.
-    pub max_supply:     u64,
 }
 
 impl RepFlowConfig {
     // admin(32) + mint(32) + minters(32*5) + minter_count(1) + burners(32*5) + burner_count(1)
-    // + paused(1) + total_minted(8) + total_burned(8) + updated_at(8) + bump(1)
-    // + max_supply(8) + padding(56)
-    pub const SIZE: usize = 32 + 32 + (32 * 5) + 1 + (32 * 5) + 1 + 1 + 8 + 8 + 8 + 1 + 8 + 56;
-
-    /// Hard cap: 1 billion repFlow units.
-    pub const MAX_SUPPLY: u64 = 1_000_000_000;
+    // + paused(1) + updated_at(8) + bump(1) + padding(56)
+    // PDA-only: global counters (total_minted/total_burned/max_supply) removed —
+    // per-user earns must not contend on this shared config account.
+    pub const SIZE: usize = 32 + 32 + (32 * 5) + 1 + (32 * 5) + 1 + 1 + 8 + 1 + 56;
 
     pub fn is_minter(&self, key: &Pubkey) -> bool {
         self.minters[..self.minter_count as usize].contains(key)

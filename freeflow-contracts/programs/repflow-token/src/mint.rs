@@ -597,45 +597,6 @@ pub struct ProofOfServiceSubmitted {
 mod tests {
     use super::*;
 
-    // ── C-1: Supply cap ordering ──────────────────────────────────────────────
-
-    /// C-1: Supply cap arithmetic — new_total > max_supply must be caught.
-    ///
-    /// Verifies that the supply cap check correctly identifies when a mint
-    /// would breach the 1 B supply limit. The *ordering* (check before CPI)
-    /// is enforced by code review — this test covers the arithmetic logic.
-    #[test]
-    fn supply_cap_check_catches_overflow_before_cpi() {
-        let total_minted: u64 = 999_999_999;
-        let max_supply: u64   = 1_000_000_000;
-
-        // Exactly at cap — should be allowed.
-        let amount_ok: u64 = 1;
-        let new_total_ok = total_minted.checked_add(amount_ok).unwrap();
-        assert_eq!(new_total_ok, max_supply);
-        assert!(!(max_supply > 0 && new_total_ok > max_supply),
-            "exactly at cap must not trigger the cap error");
-
-        // One above cap — must be rejected.
-        let amount_over: u64 = 2;
-        let new_total_over = total_minted.checked_add(amount_over).unwrap();
-        assert!(max_supply > 0 && new_total_over > max_supply,
-            "one over cap must trigger the cap error");
-    }
-
-    /// C-1: With max_supply = 0 (disabled), any amount should pass the cap check.
-    #[test]
-    fn supply_cap_check_disabled_when_max_supply_zero() {
-        let total_minted: u64 = u64::MAX - 1;
-        let max_supply: u64   = 0; // disabled
-        let amount: u64       = 1;
-
-        let new_total = total_minted.checked_add(amount).unwrap();
-        // When max_supply == 0 the condition `max_supply > 0` is false → no cap.
-        assert!(!(max_supply > 0 && new_total > max_supply),
-            "max_supply = 0 disables the cap check");
-    }
-
     // ── C-2: Transfer hook guard PDA derivation ───────────────────────────────
 
     /// C-2: The ExtraAccountMetaList PDA is derived from the correct seeds.
