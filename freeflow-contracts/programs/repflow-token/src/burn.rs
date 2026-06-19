@@ -7,7 +7,6 @@
 //! This prevents accidental or malicious slashing without recourse.
 
 use anchor_lang::prelude::*;
-use anchor_spl::token_2022::{self, Burn, Token2022};
 
 use crate::{
     error::RepFlowError,
@@ -141,11 +140,9 @@ pub struct WaiveAppeal<'info> {
 
 /// Execute a proposed slash after the appeal window has closed.
 ///
-/// Can be called by any authorised burner. Burns the repFlow on-chain.
+/// Can be called by any authorised burner. Deducts the repFlow from the user PDA.
 pub fn execute_slash(ctx: Context<ExecuteSlash>, _slash_id: u64) -> Result<()> {
-    let config_bump = ctx.bumps.config;
-    let config_info = ctx.accounts.config.to_account_info();
-    let config = &mut ctx.accounts.config;
+    let config = &ctx.accounts.config;
     let user   = &mut ctx.accounts.repflow_user;
     let record = &mut ctx.accounts.slash_record;
     let now    = Clock::get()?.unix_timestamp;
@@ -162,51 +159,12 @@ pub fn execute_slash(ctx: Context<ExecuteSlash>, _slash_id: u64) -> Result<()> {
         require!(now >= record.appeal_deadline, RepFlowError::AppealWindowOpen);
     }
 
-    // M-03: Validate that user_ata is owned by the slashed user's wallet.
-    // SPL Token account layout: mint(32) | owner(32) | amount(8) | ...
-    // If we allow any account here, a burner could burn from an unrelated token
-    // account, or drain an account belonging to a different user.
-    // Use `record.wallet` (already set from `user.wallet`) to avoid a second
-    // borrow of `ctx.accounts.repflow_user` while `user` holds a mutable borrow.
-    {
-        let expected_owner = record.wallet; // == user.wallet
-        let ata_data = ctx.accounts.user_ata.try_borrow_data()?;
-        if ata_data.len() < 64 {
-            return Err(RepFlowError::InvalidAta.into());
-        }
-        let ata_owner = Pubkey::try_from(&ata_data[32..64])
-            .map_err(|_| RepFlowError::InvalidAta)?;
-        require!(
-            ata_owner == expected_owner,
-            RepFlowError::InvalidAta
-        );
-    }
-
     let actual_slash = record.slash_amount.min(user.balance);
 
-    // ── Burn via SPL Token-2022 ────────────────────────────────────────────
-    let seeds  = &[b"repflow_config".as_ref(), &[config_bump]];
-    let signer = &[&seeds[..]];
-
-    token_2022::burn(
-        CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            Burn {
-                mint:      ctx.accounts.mint.to_account_info(),
-                from:      ctx.accounts.user_ata.to_account_info(),
-                authority: config_info,
-            },
-            signer,
-        ),
-        actual_slash,
-    )?;
-
-    // ── Update state ───────────────────────────────────────────────────────
+    // ── Update state (PDA only — no SPL burn, no shared counter) ───────────
     user.balance          = user.balance.saturating_sub(actual_slash);
     user.lifetime_slashed = user.lifetime_slashed.saturating_add(actual_slash);
     user.slash_count      = user.slash_count.saturating_add(1);
-
-    config.total_burned   = config.total_burned.saturating_add(actual_slash);
     record.executed       = true;
 
     emit!(RepFlowBurned {
@@ -230,7 +188,6 @@ pub fn execute_slash(ctx: Context<ExecuteSlash>, _slash_id: u64) -> Result<()> {
 #[instruction(slash_id: u64)]
 pub struct ExecuteSlash<'info> {
     #[account(
-        mut,
         seeds = [b"repflow_config"],
         bump,  // canonical — config.bump may be 0 from old program
     )]
@@ -250,17 +207,7 @@ pub struct ExecuteSlash<'info> {
     )]
     pub slash_record: Account<'info, SlashRecord>,
 
-    /// The repFlow SPL Token-2022 mint (must match config.mint).
-    #[account(mut, constraint = mint.key() == config.mint @ crate::error::RepFlowError::InvalidMint)]
-    pub mint: UncheckedAccount<'info>,
-
-    #[account(mut)]
-    pub user_ata: UncheckedAccount<'info>,
-
     pub burner: Signer<'info>,
-
-    pub token_program:  Program<'info, Token2022>,
-    pub system_program: Program<'info, System>,
 }
 
 // ─── Instruction: slash_repflow_from_rewards ──────────────────────────────────
@@ -277,20 +224,15 @@ pub struct ExecuteSlash<'info> {
 /// (a failed Merkle proof or a foundation-verified fraud audit) is considered
 /// sufficient without a 72-hour human appeal window.
 ///
-/// Accounts:
-///   0: config         (writable, seeds=[b"repflow_config"])
+/// Accounts (PDA-only — no SPL burn):
+///   0: config         (readonly, seeds=[b"repflow_config"])
 ///   1: repflow_user   (writable, seeds=[b"repflow_user", wallet])
-///   2: mint           (writable — repFlow Token-2022 mint)
-///   3: user_ata       (writable — relay's repFlow ATA)
-///   4: slash_authority (signer  — rewards-v2 PDA, seeds=[b"slash_authority"])
-///   5: token_program
+///   2: slash_authority (signer  — rewards-v2 PDA, seeds=[b"slash_authority"])
 pub fn slash_repflow_from_rewards(
     ctx:    Context<SlashRepFlowFromRewards>,
     amount: u64,
 ) -> Result<()> {
-    let config_bump = ctx.bumps.config;
-    let config_info = ctx.accounts.config.to_account_info();
-    let config = &mut ctx.accounts.config;
+    let config = &ctx.accounts.config;
     let user   = &mut ctx.accounts.repflow_user;
 
     require!(!config.paused, RepFlowError::ProgramPaused);
@@ -313,28 +255,10 @@ pub fn slash_repflow_from_rewards(
         return Ok(());
     }
 
-    // Burn via SPL Token-2022.
-    let seeds  = &[b"repflow_config".as_ref(), &[config_bump]];
-    let signer = &[&seeds[..]];
-
-    token_2022::burn(
-        CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            Burn {
-                mint:      ctx.accounts.mint.to_account_info(),
-                from:      ctx.accounts.user_ata.to_account_info(),
-                authority: config_info,
-            },
-            signer,
-        ),
-        actual_slash,
-    )?;
-
-    // Update state.
+    // Update state (PDA only — no SPL burn, no shared counter).
     user.balance          = user.balance.saturating_sub(actual_slash);
     user.lifetime_slashed = user.lifetime_slashed.saturating_add(actual_slash);
     user.slash_count      = user.slash_count.saturating_add(1);
-    config.total_burned   = config.total_burned.saturating_add(actual_slash);
 
     let now = Clock::get()?.unix_timestamp;
     emit!(RepFlowBurned {
@@ -356,7 +280,6 @@ pub fn slash_repflow_from_rewards(
 #[derive(Accounts)]
 pub struct SlashRepFlowFromRewards<'info> {
     #[account(
-        mut,
         seeds = [b"repflow_config"],
         bump,
     )]
@@ -369,19 +292,9 @@ pub struct SlashRepFlowFromRewards<'info> {
     )]
     pub repflow_user: Account<'info, RepFlowUser>,
 
-    /// repFlow Token-2022 mint.
-    #[account(mut)]
-    pub mint: UncheckedAccount<'info>,
-
-    /// The relay's repFlow ATA (Token-2022). Burned from this account.
-    #[account(mut)]
-    pub user_ata: UncheckedAccount<'info>,
-
     /// rewards-v2 slash_authority PDA — proves caller is the rewards program.
     /// Seeds: [b"slash_authority"] from REWARDS_PROGRAM_ID.
     pub slash_authority: Signer<'info>,
-
-    pub token_program: Program<'info, Token2022>,
 }
 
 // ─── Events ───────────────────────────────────────────────────────────────────
