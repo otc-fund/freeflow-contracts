@@ -13,12 +13,14 @@
 use anchor_lang::prelude::*;
 
 pub mod burn;
+pub mod client_rep;
 pub mod error;
 pub mod mint;
 pub mod state;
 pub mod transfer_hook;
 
 use burn::*;
+use client_rep::*;
 use mint::*;
 use transfer_hook::*;
 use state::{RepFlowConfig, RepFlowUser};
@@ -163,6 +165,23 @@ pub mod repflow_token {
     /// Create a repFlow user account for a new participant.
     pub fn initialize_user(ctx: Context<InitializeUser>) -> Result<()> {
         mint::initialize_user(ctx)
+    }
+
+    // ── Client reputation (greenfield, PDA-only) ───────────────────────
+
+    /// Create a client reputation account (client-funded).
+    pub fn initialize_client_rep(ctx: Context<InitializeClientRep>) -> Result<()> {
+        client_rep::initialize_client_rep(ctx)
+    }
+
+    /// Credit client repFlow (rewards-v2 CPI, mint_authority PDA).
+    pub fn credit_client_rep(ctx: Context<CreditClientRep>, amount: u64) -> Result<()> {
+        client_rep::credit_client_rep(ctx, amount)
+    }
+
+    /// Slash client repFlow (rewards-v2 CPI, slash_authority PDA).
+    pub fn slash_client_rep(ctx: Context<SlashClientRep>, amount: u64) -> Result<()> {
+        client_rep::slash_client_rep(ctx, amount)
     }
 
     // ── Proof-of-Service (bootstrap path) ──────────────────────────────
