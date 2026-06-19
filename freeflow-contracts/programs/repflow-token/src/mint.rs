@@ -67,10 +67,7 @@ pub struct InitializeUser<'info> {
 /// Only authorised minters (governance council members) can call this.
 /// Enforces a 200 repFlow daily rate limit per user (24-hour rolling window).
 pub fn mint_repflow(ctx: Context<MintRepFlow>, amount: u64, activity_code: u8) -> Result<()> {
-    // Use canonical bump from Anchor (not stored config.bump which may be 0 from old program).
-    let config_bump = ctx.bumps.config;
-    let config_info = ctx.accounts.config.to_account_info();
-    let config = &mut ctx.accounts.config;
+    let config = &ctx.accounts.config;
     let user   = &mut ctx.accounts.repflow_user;
     let now    = Clock::get()?.unix_timestamp;
 
@@ -94,64 +91,11 @@ pub fn mint_repflow(ctx: Context<MintRepFlow>, amount: u64, activity_code: u8) -
         RepFlowError::DailyRateLimitExceeded
     );
 
-    // ── C-2: Transfer hook initialization guard ───────────────────────────
-    // Verify the ExtraAccountMetaList PDA exists before minting.
-    // Without it the SPL Token-2022 runtime cannot find the hook's account list,
-    // meaning the transfer hook is inactive and repFlow is freely transferable.
-    //
-    // Callers MUST pass the ExtraAccountMetaList PDA as a remaining account.
-    // PDA seeds: [b"extra-account-metas", mint.key()] — SPL Token-2022 standard.
-    let (expected_eam_pda, _) = Pubkey::find_program_address(
-        &[b"extra-account-metas", ctx.accounts.mint.key().as_ref()],
-        &crate::ID,
-    );
-    require!(
-        ctx.remaining_accounts
-            .iter()
-            .any(|a| a.key() == expected_eam_pda && a.lamports() > 0),
-        RepFlowError::TransferHookNotInitialized,
-    );
-
-    // ── C-1: Supply cap check (BEFORE mint) ───────────────────────────────
-    // Enforced BEFORE the CPI so the SPL mint cannot execute if it would
-    // exceed the 1 B repFlow supply cap. Previously this check was after
-    // `mint_to` — this fix closes that ordering vulnerability.
-    let new_total = config.total_minted
-        .checked_add(amount)
-        .ok_or(RepFlowError::Overflow)?;
-    if config.max_supply > 0 && new_total > config.max_supply {
-        msg!(
-            "mint_repflow: would exceed max_supply ({} + {} > {})",
-            config.total_minted, amount, config.max_supply
-        );
-        return Err(RepFlowError::Overflow.into());
-    }
-
-    // ── Mint via SPL Token-2022 ────────────────────────────────────────────
-    let seeds   = &[b"repflow_config".as_ref(), &[config_bump]];
-    let signer  = &[&seeds[..]];
-
-    token_2022::mint_to(
-        CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            MintTo {
-                mint:      ctx.accounts.mint.to_account_info(),
-                to:        ctx.accounts.recipient_ata.to_account_info(),
-                authority: config_info,
-            },
-            signer,
-        ),
-        amount,
-    )?;
-
-    // ── Update user state ──────────────────────────────────────────────────
+    // ── Update user state (PDA only — no SPL, no shared counter) ───────────
     user.balance             = user.balance.checked_add(amount).ok_or(RepFlowError::Overflow)?;
     user.lifetime_earned     = user.lifetime_earned.checked_add(amount).ok_or(RepFlowError::Overflow)?;
     user.daily_minted        = new_daily;
     user.last_earned_at      = now;
-
-    // ── Update global stats ───────────────────────────────────────────────
-    config.total_minted = new_total;
 
     emit!(RepFlowMinted {
         wallet:        user.wallet,
@@ -173,7 +117,6 @@ pub fn mint_repflow(ctx: Context<MintRepFlow>, amount: u64, activity_code: u8) -
 #[derive(Accounts)]
 pub struct MintRepFlow<'info> {
     #[account(
-        mut,
         seeds = [b"repflow_config"],
         bump,  // canonical bump — avoids relying on config.bump which may be 0 from old initialise
     )]
@@ -186,19 +129,8 @@ pub struct MintRepFlow<'info> {
     )]
     pub repflow_user: Account<'info, RepFlowUser>,
 
-    /// The repFlow SPL Token-2022 mint (must match config.mint).
-    #[account(mut, constraint = mint.key() == config.mint @ crate::error::RepFlowError::InvalidMint)]
-    pub mint: UncheckedAccount<'info>,
-
-    /// Recipient's associated token account.
-    #[account(mut)]
-    pub recipient_ata: UncheckedAccount<'info>,
-
     /// The minter (must be in config.minters).
     pub minter: Signer<'info>,
-
-    pub token_program:  Program<'info, Token2022>,
-    pub system_program: Program<'info, System>,
 }
 
 // ─── Instruction: mint_repflow_from_rewards ───────────────────────────────────
