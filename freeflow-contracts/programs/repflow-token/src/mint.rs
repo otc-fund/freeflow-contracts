@@ -6,7 +6,6 @@
 //! Rate limit: 200 repFlow per user per 24-hour window (uptime ≤ 50 + bandwidth 1 repFlow/GB).
 
 use anchor_lang::prelude::*;
-use anchor_spl::token_2022::{self, MintTo, Token2022};
 
 use crate::{
     error::RepFlowError,
@@ -267,9 +266,7 @@ pub fn claim_daily_uptime_repflow(
     ctx:    Context<ClaimDailyUptimeRepflow>,
     amount: u64,
 ) -> Result<()> {
-    let config_bump = ctx.bumps.config;
-    let config_info = ctx.accounts.config.to_account_info();
-    let config = &mut ctx.accounts.config;
+    let config = &ctx.accounts.config;
     let user   = &mut ctx.accounts.repflow_user;
     let now    = Clock::get()?.unix_timestamp;
 
@@ -296,33 +293,6 @@ pub fn claim_daily_uptime_repflow(
         new_daily <= RepFlowUser::MAX_DAILY_MINT,
         RepFlowError::DailyRateLimitExceeded,
     );
-
-    // ── C-2: Transfer hook initialization guard ───────────────────────────
-    // Verify the ExtraAccountMetaList PDA exists before minting.
-    // The relay sidecar MUST pass the ExtraAccountMetaList PDA as a remaining
-    // account when calling this instruction.
-    let (expected_eam_pda, _) = Pubkey::find_program_address(
-        &[b"extra-account-metas", ctx.accounts.mint.key().as_ref()],
-        &crate::ID,
-    );
-    require!(
-        ctx.remaining_accounts
-            .iter()
-            .any(|a| a.key() == expected_eam_pda && a.lamports() > 0),
-        RepFlowError::TransferHookNotInitialized,
-    );
-
-    // ── Supply cap check ──────────────────────────────────────────────────
-    let new_total = config.total_minted
-        .checked_add(amount)
-        .ok_or(RepFlowError::Overflow)?;
-    if config.max_supply > 0 && new_total > config.max_supply {
-        msg!(
-            "claim_daily_uptime_repflow: would exceed max_supply ({} + {} > {})",
-            config.total_minted, amount, config.max_supply
-        );
-        return Err(RepFlowError::Overflow.into());
-    }
 
     // ── Stage 2: Proof-of-Service verification ────────────────────────────
     //
@@ -437,30 +407,12 @@ pub fn claim_daily_uptime_repflow(
         }
     }
 
-    // ── Mint via SPL Token-2022 ────────────────────────────────────────────
-    let seeds  = &[b"repflow_config".as_ref(), &[config_bump]];
-    let signer = &[&seeds[..]];
-
-    token_2022::mint_to(
-        CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            MintTo {
-                mint:      ctx.accounts.mint.to_account_info(),
-                to:        ctx.accounts.relay_ata.to_account_info(),
-                authority: config_info,
-            },
-            signer,
-        ),
-        amount,
-    )?;
-
-    // ── Update user state ──────────────────────────────────────────────────
+    // ── Update user state (PDA only — no SPL, no shared counter) ───────────
     user.balance             = user.balance.checked_add(amount).ok_or(RepFlowError::Overflow)?;
     user.lifetime_earned     = user.lifetime_earned.checked_add(amount).ok_or(RepFlowError::Overflow)?;
     user.daily_minted        = new_daily;
     user.uptime_daily_minted = new_uptime;
     user.last_earned_at      = now;
-    config.total_minted      = new_total;
 
     emit!(RepFlowMinted {
         wallet:        user.wallet,
@@ -482,7 +434,6 @@ pub fn claim_daily_uptime_repflow(
 #[derive(Accounts)]
 pub struct ClaimDailyUptimeRepflow<'info> {
     #[account(
-        mut,
         seeds = [b"repflow_config"],
         bump,  // canonical bump — config.bump may be 0 from old program
     )]
@@ -499,16 +450,6 @@ pub struct ClaimDailyUptimeRepflow<'info> {
 
     /// The relay's wallet — signer — proves the relay is online (liveness).
     pub relay_wallet: Signer<'info>,
-
-    /// The repFlow mint (Token-2022, PDA-owned by config).
-    #[account(mut)]
-    pub mint: UncheckedAccount<'info>,
-
-    /// Relay's associated repFlow token account.
-    #[account(mut)]
-    pub relay_ata: UncheckedAccount<'info>,
-
-    pub token_program: Program<'info, Token2022>,
 }
 
 // ─── Instruction: submit_proof_of_service ────────────────────────────────────
