@@ -285,3 +285,41 @@ impl SlashRecord {
     pub const SIZE: usize = 32 + 8 + 1 + 32 + 8 + 8 + 1 + 1 + 32 + 1 + 32;
     pub const APPEAL_WINDOW_SECS: i64 = 72 * 3600; // 72 hours
 }
+
+/// Client reputation — separate from RepFlowUser (clients track different signals).
+/// PDA: ["client_rep", wallet]
+#[account]
+#[derive(Debug)]
+pub struct ClientRep {
+    pub wallet:             Pubkey,   // 32
+    pub balance:            u64,      // 8  — earned client repFlow
+    pub lifetime_earned:    u64,      // 8
+    pub lifetime_slashed:   u64,      // 8
+    pub disputes_won:       u32,      // 4
+    pub disputes_lost:      u32,      // 4
+    pub last_active_at:     i64,      // 8
+    pub daily_minted:       u64,      // 8  — per-user rate limit (no global counter)
+    pub daily_window_start: i64,      // 8
+    pub bump:               u8,       // 1
+    pub _reserved:          [u8; 64], // 64 — headroom, avoid future realloc
+}
+
+impl ClientRep {
+    // 32+8+8+8+4+4+8+8+8+1+64 = 153
+    pub const SIZE: usize = 153;
+    pub const MAX_DAILY_MINT: u64 = 200;
+
+    /// Reset the daily-minted counter when the 24h window rolls over.
+    pub fn refresh_daily_window(&mut self, now: i64) {
+        if now - self.daily_window_start >= 86_400 {
+            self.daily_minted = 0;
+            self.daily_window_start = now;
+        }
+    }
+
+    /// Tier derived from balance — reuses the relay tier curve for now.
+    /// A client-specific curve can replace this when client repFlow is built.
+    pub fn tier(&self) -> RepFlowTierCode {
+        RepFlowTierCode::from_balance(self.balance)
+    }
+}
