@@ -152,9 +152,7 @@ pub fn mint_repflow_from_rewards(
     amount:        u64,
     activity_code: u8,
 ) -> Result<()> {
-    let config_bump = ctx.bumps.config;
-    let config_info = ctx.accounts.config.to_account_info();
-    let config = &mut ctx.accounts.config;
+    let config = &ctx.accounts.config;
     let user   = &mut ctx.accounts.repflow_user;
     let now    = Clock::get()?.unix_timestamp;
 
@@ -201,51 +199,7 @@ pub fn mint_repflow_from_rewards(
         RepFlowError::DailyRateLimitExceeded,
     );
 
-    // ── C-2: Transfer hook initialization guard ───────────────────────────
-    // Verify the ExtraAccountMetaList PDA exists before minting.
-    // The rewards program CPI caller MUST pass the ExtraAccountMetaList PDA
-    // as a remaining account when calling this instruction.
-    let (expected_eam_pda, _) = Pubkey::find_program_address(
-        &[b"extra-account-metas", ctx.accounts.mint.key().as_ref()],
-        &crate::ID,
-    );
-    require!(
-        ctx.remaining_accounts
-            .iter()
-            .any(|a| a.key() == expected_eam_pda && a.lamports() > 0),
-        RepFlowError::TransferHookNotInitialized,
-    );
-
-    // ── Supply cap check ──────────────────────────────────────────────────
-    let new_total = config.total_minted
-        .checked_add(amount)
-        .ok_or(RepFlowError::Overflow)?;
-    if config.max_supply > 0 && new_total > config.max_supply {
-        msg!(
-            "mint_repflow_from_rewards: would exceed max_supply ({} + {} > {})",
-            config.total_minted, amount, config.max_supply
-        );
-        return Err(RepFlowError::Overflow.into());
-    }
-
-    // ── Mint via SPL Token-2022 ────────────────────────────────────────────
-    let seeds  = &[b"repflow_config".as_ref(), &[config_bump]];
-    let signer = &[&seeds[..]];
-
-    token_2022::mint_to(
-        CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            MintTo {
-                mint:      ctx.accounts.mint.to_account_info(),
-                to:        ctx.accounts.recipient_ata.to_account_info(),
-                authority: config_info,
-            },
-            signer,
-        ),
-        amount,
-    )?;
-
-    // ── Update user state ──────────────────────────────────────────────────
+    // ── Update user state (PDA only) ───────────────────────────────────────
     if activity == RepFlowEarningActivity::Uptime {
         user.uptime_daily_minted = user.uptime_daily_minted
             .checked_add(amount)
@@ -255,7 +209,6 @@ pub fn mint_repflow_from_rewards(
     user.lifetime_earned = user.lifetime_earned.checked_add(amount).ok_or(RepFlowError::Overflow)?;
     user.daily_minted    = new_daily;
     user.last_earned_at  = now;
-    config.total_minted  = new_total;
 
     emit!(RepFlowMinted {
         wallet:        user.wallet,
@@ -277,7 +230,6 @@ pub fn mint_repflow_from_rewards(
 #[derive(Accounts)]
 pub struct MintRepFlowFromRewards<'info> {
     #[account(
-        mut,
         seeds = [b"repflow_config"],
         bump,  // canonical bump
     )]
@@ -290,21 +242,11 @@ pub struct MintRepFlowFromRewards<'info> {
     )]
     pub repflow_user: Account<'info, RepFlowUser>,
 
-    /// The repFlow mint (PDA-owned by config — Token-2022).
-    #[account(mut)]
-    pub mint: UncheckedAccount<'info>,
-
-    /// Recipient's associated token account (relay's or challenger's repFlow ATA).
-    #[account(mut)]
-    pub recipient_ata: UncheckedAccount<'info>,
-
     /// Rewards program's `mint_authority` PDA (seeds: `[b"mint_authority"]` from rewards program).
     ///
     /// Must be a signer — only the rewards program can produce this signature via
     /// `invoke_signed`. This is the cross-program authorization mechanism.
     pub rewards_authority: Signer<'info>,
-
-    pub token_program: Program<'info, Token2022>,
 }
 
 // ─── Instruction: claim_daily_uptime_repflow ──────────────────────────────────
