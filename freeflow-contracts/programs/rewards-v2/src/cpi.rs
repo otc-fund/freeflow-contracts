@@ -248,22 +248,22 @@ pub fn cpi_mint_flow<'a>(
 
 /// CPI to repflow-token::mint_repflow_from_rewards.
 ///
-/// Mints `amount` repFlow to `repflow_ata_ai` for the relay.
+/// Credits `amount` repFlow to the relay's `repflow_user` PDA (PDA-only — no SPL).
 /// Signs with rewards-v2's `mint_authority` PDA — repflow-token verifies
 /// this is the rewards program by checking the PDA derivation.
 ///
-/// Activity codes: 1 = Uptime, 2 = Bandwidth (1 repFlow per GB), 6 = DisputeWin.
-#[allow(clippy::too_many_arguments)]
+/// Account layout matching `MintRepFlowFromRewards` in repflow-token:
+///   0: repflow_config   (readonly)
+///   1: repflow_user     (writable)
+///   2: rewards_authority (signer — rewards-v2 PDA [b"mint_authority"])
+///
+/// Activity code is fixed to 2 (Bandwidth).
 #[inline(never)]
 pub fn cpi_mint_repflow_bandwidth<'a>(
     repflow_program_ai:  &AccountInfo<'a>,
     repflow_config_ai:   &AccountInfo<'a>,
     repflow_user_ai:     &AccountInfo<'a>,
-    repflow_mint_ai:     &AccountInfo<'a>,
-    repflow_ata_ai:      &AccountInfo<'a>,
     rewards_authority:   &AccountInfo<'a>,
-    token_program_ai:    &AccountInfo<'a>,
-    repflow_eam_ai:      &AccountInfo<'a>,
     amount:              u64,
     mint_authority_bump: u8,
 ) -> ProgramResult {
@@ -284,15 +284,9 @@ pub fn cpi_mint_repflow_bandwidth<'a>(
     let ix = Instruction {
         program_id: *repflow_program_ai.key,
         accounts: vec![
-            AccountMeta::new(*repflow_config_ai.key,  false),
-            AccountMeta::new(*repflow_user_ai.key,    false),
-            AccountMeta::new(*repflow_mint_ai.key,    false),
-            AccountMeta::new(*repflow_ata_ai.key,     false),
-            AccountMeta::new_readonly(*rewards_authority.key, true),
-            AccountMeta::new_readonly(*token_program_ai.key,  false),
-            // ExtraAccountMetaList PDA, passed as a remaining account; repflow-token's
-            // mint_repflow_from_rewards requires it (TransferHookNotInitialized otherwise).
-            AccountMeta::new_readonly(*repflow_eam_ai.key,    false),
+            AccountMeta::new_readonly(*repflow_config_ai.key, false), // 0: config (readonly)
+            AccountMeta::new(*repflow_user_ai.key,            false), // 1: repflow_user
+            AccountMeta::new_readonly(*rewards_authority.key, true),  // 2: rewards_authority (signer)
         ],
         data,
     };
@@ -302,11 +296,7 @@ pub fn cpi_mint_repflow_bandwidth<'a>(
         &[
             repflow_config_ai.clone(),
             repflow_user_ai.clone(),
-            repflow_mint_ai.clone(),
-            repflow_ata_ai.clone(),
             rewards_authority.clone(),
-            token_program_ai.clone(),
-            repflow_eam_ai.clone(),
             repflow_program_ai.clone(),
         ],
         &[&[b"mint_authority", &[mint_authority_bump]]],
@@ -323,23 +313,16 @@ pub fn cpi_mint_repflow_bandwidth<'a>(
 /// PDA (seeds `[b"slash_authority"]` from this program) signs the CPI, which
 /// repflow-token verifies to ensure only rewards-v2 can call this instruction.
 ///
-/// Account layout matching `SlashRepFlowFromRewards` in repflow-token:
-///   0: repflow_config   (writable)
+/// Account layout matching `SlashRepFlowFromRewards` in repflow-token (PDA-only):
+///   0: repflow_config   (readonly)
 ///   1: repflow_user     (writable)
-///   2: repflow_mint     (writable)
-///   3: repflow_ata      (writable — relay's Token-2022 ATA)
-///   4: slash_authority  (signer   — rewards-v2 PDA [b"slash_authority"])
-///   5: token_program
-#[allow(clippy::too_many_arguments)]
+///   2: slash_authority  (signer   — rewards-v2 PDA [b"slash_authority"])
 #[inline(never)]
 pub fn cpi_slash_repflow<'a>(
     repflow_program_ai:    &AccountInfo<'a>,
     repflow_config_ai:     &AccountInfo<'a>,
     repflow_user_ai:       &AccountInfo<'a>,
     slash_authority_ai:    &AccountInfo<'a>,
-    token_program_ai:      &AccountInfo<'a>,
-    relay_repflow_mint_ai: &AccountInfo<'a>,
-    relay_repflow_ata_ai:  &AccountInfo<'a>,
     amount:                u64,
     slash_authority_bump:  u8,
 ) -> ProgramResult {
@@ -358,27 +341,22 @@ pub fn cpi_slash_repflow<'a>(
     let ix = Instruction {
         program_id: *repflow_program_ai.key,
         accounts: vec![
-            AccountMeta::new(         *repflow_config_ai.key,     false), // 0: config
-            AccountMeta::new(         *repflow_user_ai.key,       false), // 1: repflow_user
-            AccountMeta::new(         *relay_repflow_mint_ai.key, false), // 2: mint
-            AccountMeta::new(         *relay_repflow_ata_ai.key,  false), // 3: user_ata
-            AccountMeta::new_readonly(*slash_authority_ai.key,    true),  // 4: slash_authority (signer)
-            AccountMeta::new_readonly(*token_program_ai.key,      false), // 5: token_program
+            AccountMeta::new_readonly(*repflow_config_ai.key,  false), // 0: config (readonly)
+            AccountMeta::new(         *repflow_user_ai.key,    false), // 1: repflow_user
+            AccountMeta::new_readonly(*slash_authority_ai.key, true),  // 2: slash_authority (signer)
         ],
         data,
     };
 
-    // M-2: accounts slice must match ix.accounts exactly (6 entries, 0-5).
+    // M-2: accounts slice must match ix.accounts exactly (3 entries, 0-2).
     // repflow_program_ai is the CPI target, not an instruction account — omit it.
     invoke_signed(
         &ix,
         &[
             repflow_config_ai.clone(),
             repflow_user_ai.clone(),
-            relay_repflow_mint_ai.clone(),
-            relay_repflow_ata_ai.clone(),
             slash_authority_ai.clone(),
-            token_program_ai.clone(),
+            repflow_program_ai.clone(),
         ],
         &[&[b"slash_authority", &[slash_authority_bump]]],
     ).map_err(|e| {
