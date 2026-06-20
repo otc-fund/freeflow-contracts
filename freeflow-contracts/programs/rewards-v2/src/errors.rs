@@ -56,6 +56,14 @@ pub enum RewardsError {
     ReleaseExceedsCommitment   = 41,
     ReserveExceedsCommitment   = 42,
     NoClaimHistory             = 43,
+
+    // Reward-rate authority codes:
+    /// CommitClaim's total_amount exceeds rate × usage ceiling.
+    RateCeilingExceeded            = 44,
+    /// UpdateRewardRates called before InitializeRewardRates.
+    RewardRatesNotInitialized      = 45,
+    /// InitializeRewardRates called on an existing PDA.
+    RewardRatesAlreadyInitialized  = 46,
 }
 
 impl From<RewardsError> for ProgramError {
