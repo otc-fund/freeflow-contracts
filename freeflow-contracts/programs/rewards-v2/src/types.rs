@@ -15,6 +15,7 @@ pub struct ClaimCommitment {
     pub client_count:    u32,
     pub total_amount:    u64,
     pub total_bytes:     u64,
+    pub uptime_hours:    u64,
     pub reserved_count:  u32,
     pub released_count:  u32,
     pub released_amount: u64,
@@ -24,7 +25,7 @@ pub struct ClaimCommitment {
     pub bump:            u8,
 }
 
-pub const CLAIM_COMMITMENT_SIZE: usize = 32 + 8 + 32 + 4 + 8 + 8 + 4 + 4 + 8 + 8 + 1 + 8 + 1;
+pub const CLAIM_COMMITMENT_SIZE: usize = 32 + 8 + 32 + 4 + 8 + 8 + 8 + 4 + 4 + 8 + 8 + 1 + 8 + 1; // +8 uptime_hours
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ClaimCommitmentStatus {

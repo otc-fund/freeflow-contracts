@@ -229,6 +229,7 @@ mod tests {
             client_count:    10,
             total_amount:    50_000,
             total_bytes:     10_737_418_240,
+            uptime_hours:    0,
             reserved_count:  5,
             released_count:  3,
             released_amount: 30_000,

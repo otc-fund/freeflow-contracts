@@ -60,6 +60,7 @@ pub enum RewardsInstruction {
         client_count: u32,
         total_amount: u64,
         total_bytes:  u64,
+        uptime_hours: u64,
         claim_epoch:  u64,
     },
     /// 1: ReserveBatch — CPI to user_escrow::hold_client_funds (up to 10 clients per tx).
@@ -137,9 +138,9 @@ pub fn process_instruction(
 
     match instruction {
         RewardsInstruction::CommitClaim {
-            merkle_root, client_count, total_amount, total_bytes, claim_epoch,
+            merkle_root, client_count, total_amount, total_bytes, uptime_hours, claim_epoch,
         } => handlers::process_commit_claim_ix(
-            program_id, accounts, merkle_root, client_count, total_amount, total_bytes, claim_epoch,
+            program_id, accounts, merkle_root, client_count, total_amount, total_bytes, uptime_hours, claim_epoch,
         ),
 
         RewardsInstruction::ReserveBatch { claim_epoch, entries } =>

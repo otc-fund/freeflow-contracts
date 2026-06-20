@@ -111,6 +111,7 @@ pub fn process_commit_claim_ix(
     client_count: u32,
     total_amount: u64,
     total_bytes:  u64,
+    uptime_hours: u64,
     claim_epoch:  u64,
 ) -> ProgramResult {
     let iter            = &mut accounts.iter();
@@ -163,6 +164,7 @@ pub fn process_commit_claim_ix(
         client_count,
         total_amount,
         total_bytes,
+        uptime_hours,
         reserved_count:  0,
         released_count:  0,
         released_amount: 0,

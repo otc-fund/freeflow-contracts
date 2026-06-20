@@ -590,6 +590,7 @@ mod integration {
             client_count:    1,
             total_amount:    1_000_000,
             total_bytes:     1_073_741_824,
+            uptime_hours:    0,
             reserved_count:  1,
             released_count:  0,
             released_amount: 0,
