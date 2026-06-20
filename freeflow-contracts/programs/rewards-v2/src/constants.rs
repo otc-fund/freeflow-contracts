@@ -48,6 +48,15 @@ pub const FLOW_DECIMALS: u32 = 9;
 /// Analogous to LAMPORTS_PER_SOL.  All on-chain mint amounts use this unit.
 pub const BASE_UNITS_PER_FLOW: u64 = 1_000_000_000;
 
+/// Decimal megabyte divisor for routing-rate math (1 MB = 1_000_000 bytes).
+/// 1 GB = 1000 MB ⇒ routing_per_mb=1_000_000 base units ⇒ 1 $FLOW/GB. (Spec OI-5/Option A.)
+pub const MB_DIVISOR: u64 = 1_000_000;
+
+/// RewardRatesAccount defaults (base units).
+pub const DEFAULT_ROUTING_PER_MB:  u64 = 1_000_000;       // 1 $FLOW/GB
+pub const DEFAULT_SEEDING_PER_MB:  u64 = 2_000_000;       // 2 $FLOW/GB
+pub const DEFAULT_UPTIME_PER_HOUR: u64 = 10_000_000_000;  // 10 $FLOW/hr
+
 /// 70% split to relay, 30% to foundation.
 pub const RELAY_SPLIT_PCT:      u64 = 70;
 pub const FOUNDATION_SPLIT_PCT: u64 = 30;

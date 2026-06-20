@@ -126,6 +126,24 @@ pub struct FoundationConfig {
 
 pub const FOUNDATION_CONFIG_SIZE: usize = 32 + 1 + 1;
 
+// ── RewardRatesAccount PDA ──────────────────────────────────────────────────
+// Seeds: [b"reward_rates"]. Foundation-governed; authority == FoundationConfig.foundation_wallet.
+
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RewardRatesAccount {
+    pub authority:        [u8; 32],
+    pub routing_per_mb:   u64,
+    pub seeding_per_mb:   u64,
+    pub uptime_per_hour:  u64,
+    pub flow_price_cents: u64,
+    pub last_updated:     i64,
+    pub change_count:     u64,
+    pub bump:             u8,
+}
+
+pub const REWARD_RATES_SIZE: usize = 32 + 8 + 8 + 8 + 8 + 8 + 8 + 1; // = 81
+const _: () = assert!(REWARD_RATES_SIZE == 81);
+
 // ── TrialMintCap PDA ────────────────────────────────────────────────────────
 // Seeds: [b"trial_mint_cap", relay_pubkey, epoch_le]
 // Per-relay-per-epoch cap: a fresh PDA each epoch so the minted_so_far counter
