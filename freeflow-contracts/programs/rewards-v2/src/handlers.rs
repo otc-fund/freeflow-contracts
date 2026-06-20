@@ -1359,3 +1359,133 @@ pub fn process_slash_trial_fraud_ix(
     );
     Ok(())
 }
+
+// ── Reward-rate authority ──────────────────────────────────────────────────────
+
+/// Read FoundationConfig and require `signer` to be the registered foundation wallet.
+/// `foundation_config_ai` is the [b"foundation_config"] PDA (readonly).
+fn require_foundation_signer(
+    program_id:           &Pubkey,
+    signer:               &AccountInfo,
+    foundation_config_ai: &AccountInfo,
+) -> ProgramResult {
+    if !signer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let (fc_pda, _) = Pubkey::find_program_address(&[b"foundation_config"], program_id);
+    if foundation_config_ai.key != &fc_pda || foundation_config_ai.lamports() == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+    let fc = FoundationConfig::try_from_slice(&foundation_config_ai.data.borrow())
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    if fc.foundation_wallet != signer.key.to_bytes() {
+        return Err(ProgramError::IllegalOwner);
+    }
+    Ok(())
+}
+
+// ── 8: InitializeRewardRates ───────────────────────────────────────────────────
+
+/// InitializeRewardRates: foundation creates the reward_rates PDA once.
+///
+/// Accounts:
+///   0: foundation_wallet  (signer, payer)
+///   1: reward_rates       (writable, PDA [b"reward_rates"])
+///   2: system_program
+///   3: foundation_config  (readonly, PDA [b"foundation_config"])
+pub fn process_initialize_reward_rates(
+    program_id:       &Pubkey,
+    accounts:         &[AccountInfo],
+    routing_per_mb:   u64,
+    seeding_per_mb:   u64,
+    uptime_per_hour:  u64,
+    flow_price_cents: u64,
+) -> ProgramResult {
+    let iter                 = &mut accounts.iter();
+    let foundation_wallet    = next_account_info(iter)?;
+    let reward_rates_ai      = next_account_info(iter)?;
+    let system_prog          = next_account_info(iter)?;
+    let foundation_config_ai = next_account_info(iter)?;
+
+    require_foundation_signer(program_id, foundation_wallet, foundation_config_ai)?;
+
+    let (pda, bump) = Pubkey::find_program_address(&[b"reward_rates"], program_id);
+    if reward_rates_ai.key != &pda {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if reward_rates_ai.lamports() > 0 {
+        return Err(RewardsError::RewardRatesAlreadyInitialized.into());
+    }
+
+    create_pda_account(
+        foundation_wallet, reward_rates_ai, system_prog, program_id,
+        &[b"reward_rates", &[bump]],
+        REWARD_RATES_SIZE,
+    )?;
+
+    let clock = Clock::get()?;
+    let rates = RewardRatesAccount {
+        authority:        foundation_wallet.key.to_bytes(),
+        routing_per_mb:   if routing_per_mb  > 0 { routing_per_mb  } else { DEFAULT_ROUTING_PER_MB  },
+        seeding_per_mb:   if seeding_per_mb  > 0 { seeding_per_mb  } else { DEFAULT_SEEDING_PER_MB  },
+        uptime_per_hour:  if uptime_per_hour > 0 { uptime_per_hour } else { DEFAULT_UPTIME_PER_HOUR },
+        flow_price_cents,
+        last_updated:     clock.unix_timestamp,
+        change_count:     0,
+        bump,
+    };
+    save_account(reward_rates_ai, &rates)?;
+    msg!(
+        "InitializeRewardRates: routing_per_mb={} uptime_per_hour={} flow_price_cents={}",
+        rates.routing_per_mb, rates.uptime_per_hour, rates.flow_price_cents,
+    );
+    Ok(())
+}
+
+// ── 9: UpdateRewardRates ───────────────────────────────────────────────────────
+
+/// UpdateRewardRates: foundation updates the reward_rates PDA.
+///
+/// Accounts:
+///   0: foundation_wallet  (signer)
+///   1: reward_rates       (writable, PDA [b"reward_rates"])
+///   2: foundation_config  (readonly, PDA [b"foundation_config"])
+pub fn process_update_reward_rates(
+    program_id:       &Pubkey,
+    accounts:         &[AccountInfo],
+    routing_per_mb:   u64,
+    seeding_per_mb:   u64,
+    uptime_per_hour:  u64,
+    flow_price_cents: u64,
+) -> ProgramResult {
+    let iter                 = &mut accounts.iter();
+    let foundation_wallet    = next_account_info(iter)?;
+    let reward_rates_ai      = next_account_info(iter)?;
+    let foundation_config_ai = next_account_info(iter)?;
+
+    require_foundation_signer(program_id, foundation_wallet, foundation_config_ai)?;
+
+    let (pda, _) = Pubkey::find_program_address(&[b"reward_rates"], program_id);
+    if reward_rates_ai.key != &pda {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if reward_rates_ai.lamports() == 0 {
+        return Err(RewardsError::RewardRatesNotInitialized.into());
+    }
+
+    let mut rates = RewardRatesAccount::try_from_slice(&reward_rates_ai.data.borrow())
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    let clock = Clock::get()?;
+    rates.routing_per_mb   = if routing_per_mb  > 0 { routing_per_mb  } else { rates.routing_per_mb };
+    rates.seeding_per_mb   = if seeding_per_mb  > 0 { seeding_per_mb  } else { rates.seeding_per_mb };
+    rates.uptime_per_hour  = if uptime_per_hour > 0 { uptime_per_hour } else { rates.uptime_per_hour };
+    rates.flow_price_cents = flow_price_cents; // 0 is a valid "unset" price
+    rates.last_updated     = clock.unix_timestamp;
+    rates.change_count     = rates.change_count.saturating_add(1);
+    save_account(reward_rates_ai, &rates)?;
+    msg!(
+        "UpdateRewardRates: routing_per_mb={} uptime_per_hour={} change_count={}",
+        rates.routing_per_mb, rates.uptime_per_hour, rates.change_count,
+    );
+    Ok(())
+}

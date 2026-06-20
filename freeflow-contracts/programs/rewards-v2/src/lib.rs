@@ -111,6 +111,20 @@ pub enum RewardsInstruction {
         device_uuid:      [u8; 16],
         device_signature: [u8; 64],
     },
+    /// 8: InitializeRewardRates — foundation creates the reward_rates PDA once.
+    InitializeRewardRates {
+        routing_per_mb:   u64,
+        seeding_per_mb:   u64,
+        uptime_per_hour:  u64,
+        flow_price_cents: u64,
+    },
+    /// 9: UpdateRewardRates — foundation updates the reward_rates PDA.
+    UpdateRewardRates {
+        routing_per_mb:   u64,
+        seeding_per_mb:   u64,
+        uptime_per_hour:  u64,
+        flow_price_cents: u64,
+    },
 }
 
 pub fn process_instruction(
@@ -157,5 +171,17 @@ pub fn process_instruction(
             handlers::process_slash_trial_fraud_ix(
                 program_id, accounts, claim_epoch, device_uuid, device_signature,
             ),
+
+        RewardsInstruction::InitializeRewardRates {
+            routing_per_mb, seeding_per_mb, uptime_per_hour, flow_price_cents,
+        } => handlers::process_initialize_reward_rates(
+            program_id, accounts, routing_per_mb, seeding_per_mb, uptime_per_hour, flow_price_cents,
+        ),
+
+        RewardsInstruction::UpdateRewardRates {
+            routing_per_mb, seeding_per_mb, uptime_per_hour, flow_price_cents,
+        } => handlers::process_update_reward_rates(
+            program_id, accounts, routing_per_mb, seeding_per_mb, uptime_per_hour, flow_price_cents,
+        ),
     }
 }
