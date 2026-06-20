@@ -394,15 +394,13 @@ fn compute_claim_hash(
 ///   5:  token_program
 ///   6:  flow_mint            (writable)
 ///   7:  repflow_program
-///   8:  repflow_config       (writable)
-///   9:  relay_repflow_user   (writable) — for balance check + repFlow mint
-///   10: repflow_mint         (writable)
-///   11: relay_repflow_ata    (writable)
-///   12: slash_authority_pda
-///   13: reward_account_relay     (writable)
-///   14: reward_account_treasury  (writable)
-///   15: system_program
-///   16+: per release × 5: [user_wallet, claim_state, user_escrow, fund_hold, user_escrow_token]
+///   8:  repflow_config       (readonly) — PDA-only, no shared-counter write
+///   9:  relay_repflow_user   (writable) — for balance check + repFlow credit
+///   10: slash_authority_pda
+///   11: reward_account_relay     (writable)
+///   12: reward_account_treasury  (writable)
+///   13: system_program
+///   14+: per release × 5: [user_wallet, claim_state, user_escrow, fund_hold, user_escrow_token]
 pub fn process_release_claim_ix(
     program_id:  &Pubkey,
     accounts:    &[AccountInfo],
@@ -420,16 +418,10 @@ pub fn process_release_claim_ix(
     let repflow_program       = next_account_info(iter)?;
     let repflow_config        = next_account_info(iter)?;
     let relay_repflow_user    = next_account_info(iter)?;
-    let repflow_mint          = next_account_info(iter)?;
-    let relay_repflow_ata     = next_account_info(iter)?;
     let _slash_authority      = next_account_info(iter)?;
     let reward_relay          = next_account_info(iter)?;
     let reward_treasury       = next_account_info(iter)?;
     let system_prog           = next_account_info(iter)?;
-    // Token-2022 program + repFlow ExtraAccountMetaList PDA — forwarded to the
-    // repflow-token CPI. `token_program` above is SPL Token ($FLOW mint only).
-    let token_2022_program    = next_account_info(iter)?;
-    let repflow_eam           = next_account_info(iter)?;
 
     if !relay_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -555,8 +547,7 @@ pub fn process_release_claim_ix(
         if repflow_amount > 0 {
             cpi_mint_repflow_bandwidth(
                 repflow_program, repflow_config, relay_repflow_user,
-                repflow_mint, relay_repflow_ata, service_authority, token_2022_program,
-                repflow_eam, repflow_amount, authority_bump,
+                service_authority, repflow_amount, authority_bump,
             )?;
         }
 
@@ -644,15 +635,12 @@ pub fn process_release_claim_ix(
 ///   4:  service_authority    (mint_authority PDA)
 ///   5:  spender_registry
 ///   6:  repflow_program
-///   7:  repflow_config
+///   7:  repflow_config       (readonly) — PDA-only slash, no SPL burn
 ///   8:  relay_repflow_user   (writable)
 ///   9:  slash_authority_pda
-///   10: repflow_mint         (writable)
-///   11: relay_repflow_ata    (writable)
-///   12: token_program
-///   13: system_program
-///   14: fund_hold            (writable, FundHold PDA in user_escrow keyed by claim_hash)
-///   15: user_escrow          (writable, UserEscrow PDA for the client)
+///   10: system_program
+///   11: fund_hold            (writable, FundHold PDA in user_escrow keyed by claim_hash)
+///   12: user_escrow          (writable, UserEscrow PDA for the client)
 #[allow(clippy::too_many_arguments)]
 pub fn process_client_dispute_ix(
     program_id:          &Pubkey,
@@ -679,9 +667,6 @@ pub fn process_client_dispute_ix(
     let repflow_config   = next_account_info(iter)?;
     let relay_repflow_user = next_account_info(iter)?;
     let slash_authority  = next_account_info(iter)?;
-    let repflow_mint     = next_account_info(iter)?;
-    let relay_repflow_ata = next_account_info(iter)?;
-    let token_program    = next_account_info(iter)?;
     let system_prog      = next_account_info(iter)?;
     let fund_hold_ai     = next_account_info(iter)?;
     let user_escrow_ai   = next_account_info(iter)?;
@@ -797,15 +782,12 @@ pub fn process_client_dispute_ix(
 
     let (_, slash_bump) = Pubkey::find_program_address(&[b"slash_authority"], program_id);
 
-    // CPI slash (stub — requires repflow-token update).
+    // CPI slash — PDA-only (no SPL burn).
     cpi_slash_repflow(
         repflow_program,
         repflow_config,
         relay_repflow_user,
         slash_authority,
-        token_program,
-        repflow_mint,
-        relay_repflow_ata,
         slash_amount,
         slash_bump,
     ).map_err(|_| RewardsError::SlashFailed)?;
@@ -855,12 +837,10 @@ pub fn process_client_dispute_ix(
 ///   3: flow_mint            (writable)
 ///   4: service_authority    (mint_authority PDA)
 ///   5: repflow_program
-///   6: repflow_config       (writable)
+///   6: repflow_config       (readonly) — PDA-only credit, no SPL mint
 ///   7: relay_repflow_user   (writable)
-///   8: repflow_mint         (writable)
-///   9: relay_repflow_ata    (writable)
-///   10: reward_account_relay     (writable)
-///   11: reward_account_treasury  (writable)
+///   8: reward_account_relay     (writable)
+///   9: reward_account_treasury  (writable)
 pub fn process_claim_pending_ix(
     program_id:  &Pubkey,
     accounts:    &[AccountInfo],
@@ -875,14 +855,8 @@ pub fn process_claim_pending_ix(
     let repflow_program    = next_account_info(iter)?;
     let repflow_config     = next_account_info(iter)?;
     let relay_repflow_user = next_account_info(iter)?;
-    let repflow_mint       = next_account_info(iter)?;
-    let relay_repflow_ata  = next_account_info(iter)?;
     let reward_relay       = next_account_info(iter)?;
     let reward_treasury    = next_account_info(iter)?;
-    // Token-2022 program + repFlow ExtraAccountMetaList PDA — forwarded to the
-    // repflow-token CPI. `token_program` above is SPL Token ($FLOW mint only).
-    let token_2022_program = next_account_info(iter)?;
-    let repflow_eam        = next_account_info(iter)?;
 
     if !relay_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -918,8 +892,7 @@ pub fn process_claim_pending_ix(
     if cb.pending_repflow > 0 {
         cpi_mint_repflow_bandwidth(
             repflow_program, repflow_config, relay_repflow_user,
-            repflow_mint, relay_repflow_ata, service_authority, token_2022_program,
-            repflow_eam, cb.pending_repflow, authority_bump,
+            service_authority, cb.pending_repflow, authority_bump,
         )?;
     }
 
@@ -949,15 +922,13 @@ pub fn process_claim_pending_ix(
 ///   4:  flow_mint             (writable)
 ///   5:  service_authority     (mint_authority PDA)
 ///   6:  repflow_program
-///   7:  repflow_config        (writable)
+///   7:  repflow_config        (readonly) — PDA-only credit, no SPL mint
 ///   8:  relay_repflow_user    (writable)
-///   9:  repflow_mint          (writable)
-///   10: relay_repflow_ata     (writable)
-///   11: reward_account_relay  (writable)
-///   12: reward_account_treasury (writable)
-///   13: trial_mint_cap        (writable, PDA)
-///   14: system_program
-///   15+: per release × 2: [claim_state (writable), trial_usage_pda (writable)]
+///   9:  reward_account_relay  (writable)
+///   10: reward_account_treasury (writable)
+///   11: trial_mint_cap        (writable, PDA)
+///   12: system_program
+///   13+: per release × 2: [claim_state (writable), trial_usage_pda (writable)]
 pub fn process_release_trial_claim_ix(
     program_id:  &Pubkey,
     accounts:    &[AccountInfo],
@@ -974,18 +945,10 @@ pub fn process_release_trial_claim_ix(
     let repflow_program     = next_account_info(iter)?;
     let repflow_config      = next_account_info(iter)?;
     let relay_repflow_user  = next_account_info(iter)?;
-    let repflow_mint        = next_account_info(iter)?;
-    let relay_repflow_ata   = next_account_info(iter)?;
     let reward_relay        = next_account_info(iter)?;
     let reward_treasury     = next_account_info(iter)?;
     let trial_mint_cap_ai   = next_account_info(iter)?;
     let system_prog         = next_account_info(iter)?;
-    // Token-2022 program + repFlow ExtraAccountMetaList PDA — forwarded to the
-    // repflow-token CPI (which validates `Program<'info, Token2022>` and requires
-    // the EAM PDA as a remaining account). The `token_program` above is SPL Token,
-    // used only for the $FLOW mint; it must NOT be forwarded to repflow-token.
-    let token_2022_program  = next_account_info(iter)?;
-    let repflow_eam         = next_account_info(iter)?;
 
     if !relay_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -1223,8 +1186,7 @@ pub fn process_release_trial_claim_ix(
     if repflow_amount > 0 {
         cpi_mint_repflow_bandwidth(
             repflow_program, repflow_config, relay_repflow_user,
-            repflow_mint, relay_repflow_ata, service_authority, token_2022_program,
-            repflow_eam, repflow_amount, authority_bump,
+            service_authority, repflow_amount, authority_bump,
         )?;
     }
 
@@ -1305,11 +1267,8 @@ pub fn process_set_trial_enabled_ix(
 ///   3: relay_repflow_user   (writable)
 ///   4: slash_authority_pda
 ///   5: repflow_program
-///   6: repflow_config
-///   7: repflow_mint         (writable)
-///   8: relay_repflow_ata    (writable)
-///   9: token_program
-///   10: system_program
+///   6: repflow_config       (readonly) — PDA-only slash, no SPL burn
+///   7: system_program
 pub fn process_slash_trial_fraud_ix(
     program_id:       &Pubkey,
     accounts:         &[AccountInfo],
@@ -1325,9 +1284,6 @@ pub fn process_slash_trial_fraud_ix(
     let slash_authority      = next_account_info(iter)?;
     let repflow_program      = next_account_info(iter)?;
     let repflow_config       = next_account_info(iter)?;
-    let repflow_mint         = next_account_info(iter)?;
-    let relay_repflow_ata    = next_account_info(iter)?;
-    let token_program        = next_account_info(iter)?;
     let system_prog          = next_account_info(iter)?;
 
     if !foundation_wallet.is_signer {
@@ -1389,9 +1345,6 @@ pub fn process_slash_trial_fraud_ix(
         repflow_config,
         relay_repflow_user,
         slash_authority,
-        token_program,
-        repflow_mint,
-        relay_repflow_ata,
         slash_amount,
         slash_bump,
     ).map_err(|_| RewardsError::SlashFailed)?;
