@@ -41,6 +41,8 @@ mod test_merkle;
 mod test_e2e;
 #[cfg(test)]
 mod test_trial;
+#[cfg(test)]
+mod test_rates;
 
 use types::{ClientReleaseOnChain, ReserveBatchEntry};
 
