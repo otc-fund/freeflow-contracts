@@ -94,6 +94,11 @@ fn read_repflow_balance(repflow_user_ai: &AccountInfo) -> Result<u64, ProgramErr
     Ok(balance)
 }
 
+/// OI-2 cutover flag. `false` during rollout (ceiling enforced only when the
+/// reward_rates PDA is supplied); flip to `true` in Phase E once all relays pass
+/// the account, making the rate account mandatory on every CommitClaim.
+const REWARD_RATES_REQUIRED: bool = false;
+
 // ── 0: CommitClaim ───────────────────────────────────────────────────────────
 
 /// CommitClaim: relay publishes Merkle root committing to all client batches.
@@ -102,6 +107,7 @@ fn read_repflow_balance(repflow_user_ai: &AccountInfo) -> Result<u64, ProgramErr
 ///   0: relay_wallet      (signer, payer)
 ///   1: claim_commitment  (writable, PDA — will be created)
 ///   2: system_program
+///   3: reward_rates      (readonly, optional, PDA [b"reward_rates"]) — rate ceiling
 ///
 /// No repFlow gate. Any relay can commit.
 pub fn process_commit_claim_ix(
@@ -121,6 +127,33 @@ pub fn process_commit_claim_ix(
 
     if !relay_wallet.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // ── Rate ceiling (spec §5.2) ──────────────────────────────────────────────
+    // total_amount must not exceed routing_per_mb·bytes/MB_DIVISOR + uptime_per_hour·uptime_hours.
+    // reward_rates is an optional 4th account during rollout (REWARD_RATES_REQUIRED=false).
+    let reward_rates_ai = iter.next();
+    if let Some(rr_ai) = reward_rates_ai {
+        let (rr_pda, _) = Pubkey::find_program_address(&[b"reward_rates"], program_id);
+        if rr_ai.key == &rr_pda && rr_ai.lamports() > 0 {
+            let rr = RewardRatesAccount::try_from_slice(&rr_ai.data.borrow())
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+            let routing_ceiling =
+                (total_bytes as u128 * rr.routing_per_mb as u128 / MB_DIVISOR as u128) as u64;
+            let uptime_ceiling = uptime_hours.saturating_mul(rr.uptime_per_hour);
+            let max_amount = routing_ceiling.saturating_add(uptime_ceiling);
+            if total_amount > max_amount {
+                msg!(
+                    "CommitClaim: RateCeilingExceeded total_amount={} > max={} (routing={} uptime={})",
+                    total_amount, max_amount, routing_ceiling, uptime_ceiling,
+                );
+                return Err(RewardsError::RateCeilingExceeded.into());
+            }
+        } else if REWARD_RATES_REQUIRED {
+            return Err(RewardsError::RewardRatesNotInitialized.into());
+        }
+    } else if REWARD_RATES_REQUIRED {
+        return Err(RewardsError::RewardRatesNotInitialized.into());
     }
 
     // Verify claim_epoch matches current epoch.
