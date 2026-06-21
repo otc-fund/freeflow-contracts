@@ -317,8 +317,16 @@ fn process_unstake(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResu
         return Err(ProgramError::IllegalOwner);
     }
 
-    if state.status == 0 {
-        msg!("Cannot unstake while relay is active (status=Locked)");
+    if state.status != 1 {
+        msg!("Cannot unstake: must Deregister first (status={})", state.status);
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let clock = solana_program::clock::Clock::get()?;
+    if clock.unix_timestamp < state.locked_at + COOLDOWN_SECS {
+        msg!(
+            "Cooldown not elapsed: {}s remaining",
+            state.locked_at + COOLDOWN_SECS - clock.unix_timestamp
+        );
         return Err(ProgramError::InvalidAccountData);
     }
 
