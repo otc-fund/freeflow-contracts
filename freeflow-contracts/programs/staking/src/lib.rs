@@ -63,6 +63,10 @@ pub const NETWORK_AUTHORITY_PUBKEY: &str =
 
 solana_program::declare_id!("7N1JRX3LY3goVAZCyaJyH7kpZ3kboZvh3jteDmCq6Dz4");
 
+/// Cooldown (seconds) between Deregister and Unstake. 0 on devnet bring-up;
+/// raise for mainnet (e.g. 7 * 86_400).
+pub const COOLDOWN_SECS: i64 = 0;
+
 entrypoint!(process_instruction);
 
 pub fn process_instruction(
@@ -80,6 +84,9 @@ pub fn process_instruction(
         StakingInstruction::Unstake => {
             process_unstake(program_id, accounts)
         }
+        StakingInstruction::Deregister => {
+            process_deregister(program_id, accounts)
+        }
         StakingInstruction::Slash { slash_lamports, reason } => {
             process_slash(program_id, accounts, slash_lamports, reason)
         }
@@ -94,6 +101,9 @@ pub enum StakingInstruction {
     Unstake,
     /// Governance-invoked slash.
     Slash { slash_lamports: u64, reason: u8 },
+    /// Relay-signed: transition Locked -> Unlocked and start the unstake cooldown.
+    /// MUST stay last so Borsh tags remain Stake=0, Unstake=1, Slash=2, Deregister=3.
+    Deregister,
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
@@ -346,6 +356,50 @@ fn process_unstake(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResu
     }
 
     msg!("Unstaked: {} $FLOW token base units returned", returnable);
+    Ok(())
+}
+
+/// Relay-signed transition Locked -> Unlocked. Anchors the unstake cooldown by
+/// rewriting `locked_at` to the current time (reused as last-state-change ts).
+///
+/// Accounts:
+///   [0] relay_wallet   signer, writable
+///   [1] stake_account  writable — PDA("stake", relay_wallet)
+fn process_deregister(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let relay_wallet  = next_account_info(accounts_iter)?;
+    let stake_account = next_account_info(accounts_iter)?;
+
+    if !relay_wallet.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if stake_account.owner != program_id {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+    let (stake_pda, _) = Pubkey::find_program_address(
+        &[b"stake", relay_wallet.key.as_ref()],
+        program_id,
+    );
+    if stake_pda != *stake_account.key {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mut data  = stake_account.try_borrow_mut_data()?;
+    let mut state = StakeAccount::try_from_slice(&data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    if state.relay_wallet != relay_wallet.key.to_bytes() {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if state.status != 0 {
+        msg!("Not locked (status={}) — nothing to deregister", state.status);
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let clock = solana_program::clock::Clock::get()?;
+    state.status    = 1;                    // Unlocked
+    state.locked_at = clock.unix_timestamp; // reused as last-state-change ts (cooldown anchor)
+    state.serialize(&mut &mut data[..])?;
+    msg!("Deregistered: stake unlocked; cooldown {}s", COOLDOWN_SECS);
     Ok(())
 }
 
