@@ -309,7 +309,7 @@ fn process_unstake(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResu
     }
 
     let data  = stake_account.try_borrow_data()?;
-    let state = StakeAccount::try_from_slice(&data)
+    let mut state = StakeAccount::try_from_slice(&data)
         .map_err(|_| ProgramError::InvalidAccountData)?;
     drop(data);
 
@@ -362,6 +362,15 @@ fn process_unstake(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResu
             &[&[b"stake", relay_wallet.key.as_ref(), &[stake_bump]]],
         )?;
     }
+
+    // Zero the recorded stake so post-unstake reads report no active stake.
+    // The account is kept (status stays Unlocked) rather than closed, so the GUI
+    // reads staked_lamports=0 instead of falling through to the relay boot-shim
+    // that triggers on an absent stake account. A re-stake (process_stake top-up
+    // branch, status != 0) rewrites the full state.
+    state.staked_lamports = 0;
+    let mut data = stake_account.try_borrow_mut_data()?;
+    state.serialize(&mut &mut data[..])?;
 
     msg!("Unstaked: {} $FLOW token base units returned", returnable);
     Ok(())
