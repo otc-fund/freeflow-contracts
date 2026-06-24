@@ -16,6 +16,7 @@ pub mod burn;
 pub mod client_rep;
 pub mod error;
 pub mod mint;
+pub mod reachability;
 pub mod state;
 pub mod transfer_hook;
 
@@ -31,6 +32,15 @@ declare_id!("8K4GhPEQ1yy9vdTaMPTL83G5qr5ZHZiBm2VBQ58jJs5w");
 /// Rewards program ID — used in `mint_repflow_from_rewards` to verify that the
 /// CPI caller's authority PDA is derived from the rewards program.
 pub const REWARDS_PROGRAM_ID: Pubkey = pubkey!("26pFEqpZYeG5xxmAMc74ZsANo6Kdduf5HYq5qk7Y34eT");
+
+/// Foundation Ed25519 attestation authority (deadweight-relay reachability gate).
+/// MUST equal the foundation's signing-key pubkey (logged at foundation startup as
+/// `foundation_pubkey`, also configured relay-side as `foundation_vk`). Rotating
+/// this key requires a program upgrade (matches the existing const-authority
+/// pattern). PLACEHOLDER — replace with the real 32 pubkey bytes before deploy
+/// (Task B6).
+pub const REACHABILITY_AUTHORITY: Pubkey =
+    pubkey!("11111111111111111111111111111111");
 
 #[program]
 pub mod repflow_token {

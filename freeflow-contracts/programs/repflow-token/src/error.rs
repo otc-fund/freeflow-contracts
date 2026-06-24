@@ -132,4 +132,14 @@ pub enum RepFlowError {
     /// Only attestations from the current 24-hour window are accepted.
     #[msg("Proof-of-Service period_start is too old (> 24h ago)")]
     PeriodTooOld,
+
+    // ── Reachability attestation (deadweight-relay gate) ───────────────────────
+
+    /// No valid foundation-signed reachability attestation for today's date bucket
+    /// was found in the transaction. The relay's sidecar must fetch a fresh
+    /// attestation (the foundation only signs for relays it has actively probed as
+    /// reachable from the internet) and submit it as an Ed25519SigVerify
+    /// instruction alongside the claim.
+    #[msg("relay not proven reachable by foundation attestation")]
+    Unreachable,
 }
