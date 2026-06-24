@@ -413,7 +413,8 @@ pub fn claim_daily_uptime_repflow(
     // PoS transition window: optional during the rollout grace period, then
     // mandatory. Set REACH_TRANSITION_END = (deploy_unix + 604_800) before deploy.
     {
-        const REACH_TRANSITION_END: i64 = 1_800_000_000; // placeholder — set in B6
+        // Deploy 2026-06-24 + 7-day rollout grace; hard-enforced after 2026-07-01 15:02 UTC.
+        const REACH_TRANSITION_END: i64 = 1_782_918_164;
         let verdict = crate::reachability::verify_reachability_attestation(
             &ctx.accounts.instructions.to_account_info(),
             &ctx.accounts.relay_wallet.key(),

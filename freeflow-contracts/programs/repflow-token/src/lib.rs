@@ -37,10 +37,11 @@ pub const REWARDS_PROGRAM_ID: Pubkey = pubkey!("26pFEqpZYeG5xxmAMc74ZsANo6Kdduf5
 /// MUST equal the foundation's signing-key pubkey (logged at foundation startup as
 /// `foundation_pubkey`, also configured relay-side as `foundation_vk`). Rotating
 /// this key requires a program upgrade (matches the existing const-authority
-/// pattern). PLACEHOLDER — replace with the real 32 pubkey bytes before deploy
-/// (Task B6).
+/// pattern). Set to the live DreamHost foundation signing key (hex
+/// e98d6642b1227c109ea08d038bc3ee33b3bd84ff9496ae30b17efe014d72e85f) on
+/// 2026-06-24 deploy.
 pub const REACHABILITY_AUTHORITY: Pubkey =
-    pubkey!("11111111111111111111111111111111");
+    pubkey!("Gih3nPAgpBm2kzdZfHKXDcyjSART189na3rgfphbEDHg");
 
 #[program]
 pub mod repflow_token {
