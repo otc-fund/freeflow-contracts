@@ -407,6 +407,25 @@ pub fn claim_daily_uptime_repflow(
         }
     }
 
+    // ── Reachability attestation gate (deadweight-relay fix) ───────────────
+    // The relay must include a fresh foundation-signed reachability attestation
+    // (Ed25519SigVerify ix) for (relay_wallet, today's date_bucket). Mirrors the
+    // PoS transition window: optional during the rollout grace period, then
+    // mandatory. Set REACH_TRANSITION_END = (deploy_unix + 604_800) before deploy.
+    {
+        const REACH_TRANSITION_END: i64 = 1_800_000_000; // placeholder — set in B6
+        let verdict = crate::reachability::verify_reachability_attestation(
+            &ctx.accounts.instructions.to_account_info(),
+            &ctx.accounts.relay_wallet.key(),
+            now,
+        );
+        if now > REACH_TRANSITION_END {
+            verdict?; // hard-enforced
+        } else if verdict.is_err() {
+            msg!("reachability attestation absent/invalid (transition window — allowed)");
+        }
+    }
+
     // ── Update user state (PDA only — no SPL, no shared counter) ───────────
     user.balance             = user.balance.checked_add(amount).ok_or(RepFlowError::Overflow)?;
     user.lifetime_earned     = user.lifetime_earned.checked_add(amount).ok_or(RepFlowError::Overflow)?;
@@ -450,6 +469,12 @@ pub struct ClaimDailyUptimeRepflow<'info> {
 
     /// The relay's wallet — signer — proves the relay is online (liveness).
     pub relay_wallet: Signer<'info>,
+
+    /// Instructions sysvar — lets the handler introspect the Ed25519 attestation
+    /// instruction in this transaction (reachability gate).
+    /// CHECK: address-checked below; only read via the instructions sysvar API.
+    #[account(address = anchor_lang::solana_program::sysvar::instructions::ID)]
+    pub instructions: UncheckedAccount<'info>,
 }
 
 // ─── Instruction: submit_proof_of_service ────────────────────────────────────
