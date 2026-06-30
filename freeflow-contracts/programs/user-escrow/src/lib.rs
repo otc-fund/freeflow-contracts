@@ -12,6 +12,8 @@
 //!   initialize_registry         — Foundation initialises spender registry
 //!   update_spender_registry     — Foundation multisig adds/removes spenders
 //!   purchase_and_escrow         — Phase 1: user pays → $FLOW from treasury → escrow
+//!   purchase_and_escrow_treasury— Phase 1, treasury-signed: server credits escrow
+//!                                  for an off-chain (credit-card) payment, no user signer
 //!   purchase_and_escrow_phase2  — Phase 2: user DEX-bought $FLOW → escrow
 //!   spend_from_escrow           — Registry-verified spender burns $FLOW from escrow
 //!
@@ -26,6 +28,7 @@
 //!   Relay paid via 70:30 split on mint (rewards contract) — NOT via spend_from_escrow.
 
 use anchor_lang::prelude::*;
+use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Burn, Mint, Token, TokenAccount, Transfer};
 
 declare_id!("7PzcA2sNDzrvhTNLFScWZuNKS4g7jCCghsowZA9RsZ26");
@@ -235,6 +238,65 @@ pub mod user_escrow {
             flow_amount:      flow_lamports,
             escrow_balance:   escrow.balance,
             referral_reward,
+        });
+
+        Ok(())
+    }
+
+    // ── P1c: Treasury-signed purchase (credit-card flow, no user signer) ──────
+
+    /// Same economics as `purchase_and_escrow`, but the FOUNDATION wallet (not the user)
+    /// signs and pays rent. Used by the payment-server webhook to credit a user's
+    /// escrow after an off-chain credit-card charge settles — the user's wallet is
+    /// not online/co-signing at that point, so they cannot be a Signer here.
+    ///
+    /// Source of $FLOW is the foundation's own token account (`foundation_token`),
+    /// signed by `foundation` directly — no treasury_authority PDA indirection needed.
+    ///
+    /// Access gated by `foundation: address = FOUNDATION_PUBKEY` — same trust
+    /// boundary as the existing admin instructions (`update_spender_registry`).
+    pub fn purchase_and_escrow_treasury(
+        ctx:            Context<PurchaseAndEscrowTreasury>,
+        user:           Pubkey,
+        payment_amount: u64,
+        payment_type:   PaymentType,
+    ) -> Result<()> {
+        require!(payment_amount > 0, EscrowError::InvalidPaymentAmount);
+
+        let flow_lamports = payment_amount
+            .checked_mul(1_000_000_000)
+            .and_then(|v| v.checked_div(10))
+            .ok_or(EscrowError::InvalidPaymentAmount)?;
+
+        require!(flow_lamports > 0, EscrowError::InvalidPaymentAmount);
+
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from:      ctx.accounts.foundation_token.to_account_info(),
+                    to:        ctx.accounts.user_escrow_token.to_account_info(),
+                    authority: ctx.accounts.foundation.to_account_info(),
+                },
+            ),
+            flow_lamports,
+        )?;
+
+        let escrow           = &mut ctx.accounts.user_escrow;
+        escrow.user          = user;
+        escrow.balance       = escrow
+            .balance
+            .checked_add(flow_lamports)
+            .ok_or(EscrowError::InvalidPaymentAmount)?;
+        escrow.last_topup_ts = Clock::get()?.unix_timestamp as u64;
+
+        emit!(PurchaseAndEscrowed {
+            user,
+            payment_type,
+            payment_amount,
+            flow_amount:      flow_lamports,
+            escrow_balance:   escrow.balance,
+            referral_reward:  0,
         });
 
         Ok(())
@@ -746,6 +808,49 @@ pub struct PurchaseAndEscrow<'info> {
     /// CHECK: ReferralConfig PDA from the referral program. Raw bytes read at offsets [0..10].
     ///        Pass `SystemProgram::id()` when `referrer` is `None`.
     pub referral_config: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+#[instruction(user: Pubkey)]
+pub struct PurchaseAndEscrowTreasury<'info> {
+    /// Foundation keypair (server-held). Must equal FOUNDATION_PUBKEY.
+    /// Pays rent for new PDAs; signs the $FLOW transfer from its own token account.
+    #[account(mut, address = FOUNDATION_PUBKEY @ EscrowError::NotFoundation)]
+    pub foundation: Signer<'info>,
+
+    /// Foundation's $FLOW token account (source of funds).
+    /// Authority = foundation wallet directly; foundation signs the transfer.
+    #[account(
+        mut,
+        token::mint = token_mint,
+        token::authority = foundation
+    )]
+    pub foundation_token: Account<'info, TokenAccount>,
+
+    /// User's escrow account (created on first purchase, reused on subsequent).
+    #[account(
+        init_if_needed,
+        payer = foundation,
+        space = 8 + 32 + 8 + 17 + 8 + 8,
+        seeds = [b"user_escrow", user.as_ref()],
+        bump
+    )]
+    pub user_escrow: Account<'info, UserEscrow>,
+
+    /// ATA for the user's escrowed $FLOW (authority = user_escrow PDA).
+    /// Derived deterministically: ATA(user_escrow_pda, token_mint).
+    #[account(
+        init_if_needed,
+        payer = foundation,
+        associated_token::mint = token_mint,
+        associated_token::authority = user_escrow
+    )]
+    pub user_escrow_token: Account<'info, TokenAccount>,
+
+    pub token_mint:               Account<'info, Mint>,
+    pub token_program:            Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program:           Program<'info, System>,
 }
 
 #[derive(Accounts)]
