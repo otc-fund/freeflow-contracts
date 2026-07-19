@@ -141,10 +141,16 @@ pub const USER_RELAY_CLAIM_STATE_SIZE: usize = 32 + 32 + 8 + 8 + 8 + 8 + 1;
 pub struct FoundationConfig {
     pub foundation_wallet: [u8; 32],
     pub trial_enabled:     bool,
+    /// Kill switch for relay uptime rewards.
+    ///
+    /// Separate from the rate because zero is unrepresentable in the rate
+    /// encoding: UpdateRewardRates treats uptime_per_hour == 0 as "keep
+    /// existing", so zeroing the rate silently no-ops.
+    pub uptime_enabled:    bool,
     pub bump:              u8,
 }
 
-pub const FOUNDATION_CONFIG_SIZE: usize = 32 + 1 + 1;
+pub const FOUNDATION_CONFIG_SIZE: usize = 32 + 1 + 1 + 1;
 
 // ── RewardRatesAccount PDA ──────────────────────────────────────────────────
 // Seeds: [b"reward_rates"]. Foundation-governed; authority == FoundationConfig.foundation_wallet.
@@ -308,5 +314,28 @@ mod relay_claim_meta_tests {
         let bytes = borsh::to_vec(&m).expect("serialise");
         let back = RelayClaimMeta::try_from_slice(&bytes).expect("deserialise");
         assert_eq!(back, m);
+    }
+}
+
+#[cfg(test)]
+mod foundation_config_tests {
+    use super::*;
+
+    #[test]
+    fn size_matches_serialised_length() {
+        let fc = FoundationConfig {
+            foundation_wallet: [9u8; 32],
+            trial_enabled:     true,
+            uptime_enabled:    true,
+            bump:              255,
+        };
+        assert_eq!(borsh::to_vec(&fc).expect("serialise").len(), FOUNDATION_CONFIG_SIZE);
+    }
+
+    #[test]
+    fn grew_by_one_byte() {
+        // Existing on-chain account is 34 bytes; the realloc in
+        // process_set_uptime_enabled_ix exists because of this.
+        assert_eq!(FOUNDATION_CONFIG_SIZE, 35);
     }
 }
