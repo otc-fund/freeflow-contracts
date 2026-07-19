@@ -139,11 +139,23 @@ impl RepFlowUser {
         self.tier().voting_power()
     }
 
-    /// Reset daily mint window if it has expired.
+    /// Reset daily mint window when the UTC date bucket rolls over.
     ///
     /// Also resets `uptime_daily_minted` so the 50/day uptime sub-limit renews each window.
+    ///
+    /// The window is a **fixed UTC day bucket** (`now / 86_400`), not an elapsed-time
+    /// check against the previous mint. An elapsed check re-anchors `daily_window_start`
+    /// to the mint timestamp, so a caller minting on a 24h period can never accumulate
+    /// the full 86_400s: transaction latency and `Clock` drift make the on-chain delta
+    /// land just short, the window never rolls, and every subsequent uptime claim fails
+    /// with `UptimeDailyCapExceeded`. Bucketing is immune to both, and matches the
+    /// `date_bucket` convention already used by `submit_proof_of_service`.
+    ///
+    /// `daily_window_start` keeps its timestamp representation (no layout change).
+    /// Accounts written under the old elapsed scheme roll over on their next call,
+    /// since a stale timestamp always falls in an earlier bucket.
     pub fn refresh_daily_window(&mut self, now: i64) {
-        if now - self.daily_window_start >= Self::SECS_PER_DAY {
+        if now / Self::SECS_PER_DAY != self.daily_window_start / Self::SECS_PER_DAY {
             self.daily_minted        = 0;
             self.uptime_daily_minted = 0;
             self.daily_window_start  = now;
@@ -309,9 +321,12 @@ impl ClientRep {
     pub const SIZE: usize = 153;
     pub const MAX_DAILY_MINT: u64 = 200;
 
-    /// Reset the daily-minted counter when the 24h window rolls over.
+    /// Reset the daily-minted counter when the UTC date bucket rolls over.
+    ///
+    /// Uses the same fixed-bucket scheme as [`RepFlowUser::refresh_daily_window`] —
+    /// see there for why an elapsed-time check starves callers on a 24h period.
     pub fn refresh_daily_window(&mut self, now: i64) {
-        if now - self.daily_window_start >= 86_400 {
+        if now / RepFlowUser::SECS_PER_DAY != self.daily_window_start / RepFlowUser::SECS_PER_DAY {
             self.daily_minted = 0;
             self.daily_window_start = now;
         }
@@ -321,5 +336,80 @@ impl ClientRep {
     /// A client-specific curve can replace this when client repFlow is built.
     pub fn tier(&self) -> RepFlowTierCode {
         RepFlowTierCode::from_balance(self.balance)
+    }
+}
+
+#[cfg(test)]
+mod daily_window_tests {
+    use super::*;
+
+    fn user(window_start: i64, uptime_minted: u64) -> RepFlowUser {
+        RepFlowUser {
+            wallet:              Pubkey::default(),
+            balance:             0,
+            lifetime_earned:     0,
+            lifetime_slashed:    0,
+            daily_minted:        uptime_minted,
+            daily_window_start:  window_start,
+            slash_count:         0,
+            last_earned_at:      0,
+            milestones_claimed:  0,
+            bump:                0,
+            uptime_daily_minted: uptime_minted,
+        }
+    }
+
+    /// Regression: a relay claiming on a 24h period lands a few seconds *short*
+    /// of 86_400 on-chain (tx latency + Clock drift). The old elapsed-time check
+    /// refused to roll the window, leaving uptime_daily_minted pinned at 50 so
+    /// every subsequent claim failed with UptimeDailyCapExceeded.
+    #[test]
+    fn rolls_over_when_next_day_arrives_slightly_under_86400s() {
+        // 86_400 = midnight UTC. Mint at 00:00:10, next attempt 86_395s later
+        // (00:00:05 the following day) - 5s short of a full day elapsed.
+        let first  = 86_400 + 10;
+        let second = first + 86_395;
+        assert!(second - first < 86_400, "precondition: under a full day elapsed");
+
+        let mut u = user(first, 50);
+        u.refresh_daily_window(second);
+
+        assert_eq!(u.uptime_daily_minted, 0, "uptime sub-limit must renew on the new UTC day");
+        assert_eq!(u.daily_minted, 0, "daily cap must renew on the new UTC day");
+        assert_eq!(u.daily_window_start, second);
+    }
+
+    /// The cap must still hold within a single UTC day, even after >23h elapsed.
+    #[test]
+    fn does_not_roll_over_within_the_same_utc_day() {
+        let first  = 86_400;           // 00:00:00
+        let second = first + 86_399;   // 23:59:59 same day
+        let mut u = user(first, 50);
+        u.refresh_daily_window(second);
+
+        assert_eq!(u.uptime_daily_minted, 50, "same UTC day - cap must not renew");
+        assert_eq!(u.daily_window_start, first, "anchor must not move within a day");
+    }
+
+    /// Accounts written under the old elapsed scheme carry a stale timestamp;
+    /// it always falls in an earlier bucket, so they roll over on first touch.
+    #[test]
+    fn legacy_account_with_stale_anchor_rolls_over() {
+        let mut u = user(1_700_000_000, 50);
+        u.refresh_daily_window(1_700_000_000 + 10 * 86_400);
+        assert_eq!(u.uptime_daily_minted, 0);
+    }
+
+    /// ClientRep shares the bucket scheme.
+    #[test]
+    fn client_rep_rolls_over_on_new_utc_day() {
+        let mut c = ClientRep {
+            wallet: Pubkey::default(), balance: 0, lifetime_earned: 0,
+            lifetime_slashed: 0, disputes_won: 0, disputes_lost: 0,
+            last_active_at: 0, daily_minted: 200,
+            daily_window_start: 86_400 + 10, bump: 0, _reserved: [0u8; 64],
+        };
+        c.refresh_daily_window(86_400 + 10 + 86_395);
+        assert_eq!(c.daily_minted, 0);
     }
 }
