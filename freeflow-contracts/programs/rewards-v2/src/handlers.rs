@@ -96,13 +96,43 @@ fn read_repflow_balance(repflow_user_ai: &AccountInfo) -> Result<u64, ProgramErr
 
 // ── 0: CommitClaim ───────────────────────────────────────────────────────────
 
+/// Clamp reported uptime to what is provably claimable.
+///
+/// Both bounds are required. `elapsed` alone bounds time *passed*, not time
+/// *served*: a relay offline 30 days would claim 720h it never served, minted
+/// immediately with no dispute window. The per-epoch cap alone would let a
+/// relay commit epochs back to back and claim the maximum on each.
+///
+/// `last_committed_at == None` means the relay has no prior epoch: it earns
+/// zero uptime. A bootstrap allowance was rejected as sybil-multipliable —
+/// every fresh wallet would draw a free grant.
+pub fn clamp_uptime_hours(
+    reported:          u64,
+    now:               i64,
+    last_committed_at: Option<i64>,
+    enabled:           bool,
+) -> u64 {
+    if !enabled {
+        return 0;
+    }
+    let Some(last) = last_committed_at else { return 0 };
+    let elapsed_hours = now.saturating_sub(last).max(0) as u64 / 3600;
+    reported.min(elapsed_hours).min(MAX_UPTIME_HOURS_PER_EPOCH)
+}
+
 /// CommitClaim: relay publishes Merkle root committing to all client batches.
 ///
 /// Accounts:
-///   0: relay_wallet      (signer, payer)
-///   1: claim_commitment  (writable, PDA — will be created)
+///   0: relay_wallet      (signer, writable, payer)
+///   1: claim_commitment  (writable, PDA [b"claim_commitment", relay, epoch_le] — created)
 ///   2: system_program
-///   3: reward_rates      (readonly, optional, PDA [b"reward_rates"]) — rate ceiling
+///   3: reward_rates      (readonly, MANDATORY, PDA [b"reward_rates"]) — the pinned rate
+///   4: relay_meta        (writable, PDA [b"relay_meta", relay] — created on first commit)
+///   5: foundation_config (readonly, PDA [b"foundation_config"]) — uptime kill switch
+///
+/// The relay supplies quantities only (`total_bytes`, `uptime_hours`); the
+/// program derives every amount from the foundation-governed rate and pins that
+/// rate into the commitment.
 ///
 /// No repFlow gate. Any relay can commit.
 pub fn process_commit_claim_ix(
@@ -110,7 +140,6 @@ pub fn process_commit_claim_ix(
     accounts:     &[AccountInfo],
     merkle_root:  [u8; 32],
     client_count: u32,
-    total_amount: u64,
     total_bytes:  u64,
     uptime_hours: u64,
     claim_epoch:  u64,
@@ -124,36 +153,53 @@ pub fn process_commit_claim_ix(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // ── Rate ceiling (spec §5.2) ──────────────────────────────────────────────
-    // total_amount must not exceed routing_per_mb·bytes/MB_DIVISOR + uptime_per_hour·uptime_hours.
-    // reward_rates is an optional 4th account during rollout (REWARD_RATES_REQUIRED=false).
-    let reward_rates_ai = iter.next();
-    if let Some(rr_ai) = reward_rates_ai {
-        let (rr_pda, _) = Pubkey::find_program_address(&[b"reward_rates"], program_id);
-        if rr_ai.key == &rr_pda && rr_ai.lamports() > 0 {
-            let rr = RewardRatesAccount::try_from_slice(&rr_ai.data.borrow())
-                .map_err(|_| ProgramError::InvalidAccountData)?;
-            let routing_ceiling =
-                (total_bytes as u128 * rr.routing_per_mb as u128 / MB_DIVISOR as u128) as u64;
-            let uptime_ceiling = uptime_hours.saturating_mul(rr.uptime_per_hour);
-            let max_amount = routing_ceiling.saturating_add(uptime_ceiling);
-            if total_amount > max_amount {
-                msg!(
-                    "CommitClaim: RateCeilingExceeded total_amount={} > max={} (routing={} uptime={})",
-                    total_amount, max_amount, routing_ceiling, uptime_ceiling,
-                );
-                return Err(RewardsError::RateCeilingExceeded.into());
-            }
-        } else if REWARD_RATES_REQUIRED {
-            return Err(RewardsError::RewardRatesNotInitialized.into());
-        }
-    } else if REWARD_RATES_REQUIRED {
+    // ── Mandatory reward rates (spec §5.2) ────────────────────────────────────
+    // reward_rates is REQUIRED (REWARD_RATES_REQUIRED=true) and key-validated.
+    // It was optional during rollout, which meant a relay could send a 3-account
+    // CommitClaim and skip rate enforcement entirely.
+    let reward_rates_ai = next_account_info(iter)?;
+    let (rr_pda, _) = Pubkey::find_program_address(&[b"reward_rates"], program_id);
+    if reward_rates_ai.key != &rr_pda || reward_rates_ai.lamports() == 0 {
         return Err(RewardsError::RewardRatesNotInitialized.into());
     }
+    let rr = RewardRatesAccount::try_from_slice(&reward_rates_ai.data.borrow())
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    // ── Relay meta (monotonic clamp basis) ────────────────────────────────────
+    let relay_meta_ai = next_account_info(iter)?;
+    let (rm_pda, rm_bump) = Pubkey::find_program_address(
+        &[b"relay_meta", relay_wallet.key.as_ref()], program_id,
+    );
+    if relay_meta_ai.key != &rm_pda {
+        return Err(RewardsError::RelayMetaInvalid.into());
+    }
+    let last_committed_at: Option<i64> = if relay_meta_ai.lamports() == 0 {
+        None
+    } else {
+        Some(RelayClaimMeta::try_from_slice(&relay_meta_ai.data.borrow())
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            .last_committed_at)
+    };
+
+    // ── Kill switch ───────────────────────────────────────────────────────────
+    let foundation_config_ai = next_account_info(iter)?;
+    let (fc_pda, _) = Pubkey::find_program_address(&[b"foundation_config"], program_id);
+    if foundation_config_ai.key != &fc_pda {
+        return Err(ProgramError::InvalidArgument);
+    }
+    let uptime_enabled = if foundation_config_ai.lamports() == 0 {
+        true // config not yet created — default enabled
+    } else {
+        FoundationConfig::try_from_slice(&foundation_config_ai.data.borrow())
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            .uptime_enabled
+    };
+
+    let clock = Clock::get()?;
+    let now = clock.unix_timestamp;
 
     // Verify claim_epoch matches current epoch.
-    let clock = Clock::get()?;
-    let current_epoch = clock.unix_timestamp as u64 / EPOCH_SECS;
+    let current_epoch = now as u64 / EPOCH_SECS;
     if claim_epoch != current_epoch {
         msg!(
             "CommitClaim: epoch mismatch — provided {} current {}",
@@ -176,6 +222,18 @@ pub fn process_commit_claim_ix(
         return Err(RewardsError::EpochAlreadyCommitted.into());
     }
 
+    // ── Derive value; the relay supplied none ─────────────────────────────────
+    let clamped_hours = clamp_uptime_hours(uptime_hours, now, last_committed_at, uptime_enabled);
+    let bandwidth_amount =
+        (total_bytes as u128 * rr.routing_per_mb as u128 / MB_DIVISOR as u128) as u64;
+    let uptime_amount = clamped_hours.saturating_mul(rr.uptime_per_hour);
+
+    msg!(
+        "CommitClaim: bandwidth={} uptime={} (hours {}->{}) routing_per_mb={} uptime_per_hour={}",
+        bandwidth_amount, uptime_amount, uptime_hours, clamped_hours,
+        rr.routing_per_mb, rr.uptime_per_hour,
+    );
+
     create_pda_account(
         relay_wallet,
         commitment_ai,
@@ -190,26 +248,45 @@ pub fn process_commit_claim_ix(
         claim_epoch,
         merkle_root,
         client_count,
-        total_amount,
+        bandwidth_amount,
+        uptime_amount,
         total_bytes,
-        uptime_hours,
+        uptime_hours:    clamped_hours,
+        routing_per_mb:  rr.routing_per_mb,
+        uptime_per_hour: rr.uptime_per_hour,
+        committed_at:    now,
+        uptime_paid:     false,
         reserved_count:  0,
         released_count:  0,
         released_amount: 0,
         released_bytes:  0,
         status:          ClaimCommitmentStatus::Active,
-        dispute_deadline: clock.unix_timestamp + DISPUTE_WINDOW_SECS,
+        dispute_deadline: now + DISPUTE_WINDOW_SECS,
         bump,
     };
 
     save_account(commitment_ai, &commitment)?;
 
+    // ── Advance the monotonic clamp basis ─────────────────────────────────────
+    if relay_meta_ai.lamports() == 0 {
+        create_pda_account(
+            relay_wallet, relay_meta_ai, system_prog, program_id,
+            &[b"relay_meta", relay_wallet.key.as_ref(), &[rm_bump]],
+            RELAY_CLAIM_META_SIZE,
+        )?;
+    }
+    save_account(relay_meta_ai, &RelayClaimMeta {
+        relay: relay_wallet.key.to_bytes(),
+        last_committed_at: now,
+        bump: rm_bump,
+    })?;
+
     msg!(
-        "CommitClaim: epoch={} root={:?} clients={} amount={}",
+        "CommitClaim: epoch={} root={:?} clients={} bytes={}",
         claim_epoch,
         &merkle_root[..4],
         client_count,
-        total_amount,
+        total_bytes,
     );
     Ok(())
 }
@@ -1518,4 +1595,44 @@ pub fn process_update_reward_rates(
         rates.routing_per_mb, rates.uptime_per_hour, rates.change_count,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    use super::*;
+    const H: i64 = 3600;
+
+    #[test]
+    fn honest_claim_passes_through() {
+        assert_eq!(clamp_uptime_hours(12, 100 * H, Some(88 * H), true), 12);
+    }
+
+    #[test]
+    fn offline_relay_is_capped_at_epoch_max() {
+        // 30 days elapsed. Elapsed-only clamp would allow 720h.
+        let now = 1_000_000 * H;
+        let last = now - 720 * H;
+        assert_eq!(clamp_uptime_hours(720, now, Some(last), true), MAX_UPTIME_HOURS_PER_EPOCH);
+    }
+
+    #[test]
+    fn back_to_back_commits_earn_nothing() {
+        let now = 500 * H;
+        assert_eq!(clamp_uptime_hours(12, now, Some(now), true), 0);
+    }
+
+    #[test]
+    fn first_epoch_earns_zero() {
+        assert_eq!(clamp_uptime_hours(12, 100 * H, None, true), 0);
+    }
+
+    #[test]
+    fn kill_switch_zeroes_uptime() {
+        assert_eq!(clamp_uptime_hours(12, 100 * H, Some(88 * H), false), 0);
+    }
+
+    #[test]
+    fn clock_skew_backwards_is_not_negative() {
+        assert_eq!(clamp_uptime_hours(12, 50 * H, Some(88 * H), true), 0);
+    }
 }

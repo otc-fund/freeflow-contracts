@@ -56,11 +56,15 @@ entrypoint!(process_instruction);
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub enum RewardsInstruction {
     /// 0: CommitClaim — relay publishes Merkle root committing to all client batches.
+    ///
+    /// The relay supplies quantities only. `total_amount` was removed: the
+    /// program derives bandwidth_amount and uptime_amount from the pinned
+    /// foundation-governed rate, so a relay can no longer name its own payout.
+    ///
     /// No repFlow gate. Any relay can commit.
     CommitClaim {
         merkle_root:  [u8; 32],
         client_count: u32,
-        total_amount: u64,
         total_bytes:  u64,
         uptime_hours: u64,
         claim_epoch:  u64,
@@ -140,9 +144,9 @@ pub fn process_instruction(
 
     match instruction {
         RewardsInstruction::CommitClaim {
-            merkle_root, client_count, total_amount, total_bytes, uptime_hours, claim_epoch,
+            merkle_root, client_count, total_bytes, uptime_hours, claim_epoch,
         } => handlers::process_commit_claim_ix(
-            program_id, accounts, merkle_root, client_count, total_amount, total_bytes, uptime_hours, claim_epoch,
+            program_id, accounts, merkle_root, client_count, total_bytes, uptime_hours, claim_epoch,
         ),
 
         RewardsInstruction::ReserveBatch { claim_epoch, entries } =>
