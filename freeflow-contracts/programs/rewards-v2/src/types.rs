@@ -207,3 +207,43 @@ pub struct RepFlowUser {
     pub bump:           u8,
     pub last_slash_at:  i64,
 }
+
+// ── RelayClaimMeta PDA ──────────────────────────────────────────────────────
+// Seeds: [b"relay_meta", relay_wallet].
+//
+// Holds the monotonic timestamp of a relay's most recent CommitClaim, used to
+// clamp uptime_hours to real elapsed time.
+//
+// Deliberately NOT read from a caller-supplied previous commitment: a
+// ClaimCommitment is seeded by (relay, epoch), so a caller could pass an
+// arbitrarily old epoch and manufacture a large elapsed window. A monotonic
+// per-relay record cannot be chosen by the caller.
+
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RelayClaimMeta {
+    pub relay:             [u8; 32],
+    pub last_committed_at: i64,
+    pub bump:              u8,
+}
+
+pub const RELAY_CLAIM_META_SIZE: usize = 32 + 8 + 1;
+
+#[cfg(test)]
+mod relay_claim_meta_tests {
+    use super::*;
+
+    #[test]
+    fn size_matches_serialised_length() {
+        let m = RelayClaimMeta { relay: [7u8; 32], last_committed_at: 1_700_000_000, bump: 254 };
+        let bytes = borsh::to_vec(&m).expect("serialise");
+        assert_eq!(bytes.len(), RELAY_CLAIM_META_SIZE, "SIZE must match Borsh length");
+    }
+
+    #[test]
+    fn roundtrips() {
+        let m = RelayClaimMeta { relay: [3u8; 32], last_committed_at: -1, bump: 1 };
+        let bytes = borsh::to_vec(&m).expect("serialise");
+        let back = RelayClaimMeta::try_from_slice(&bytes).expect("deserialise");
+        assert_eq!(back, m);
+    }
+}
