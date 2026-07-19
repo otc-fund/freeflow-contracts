@@ -13,9 +13,22 @@ pub struct ClaimCommitment {
     pub claim_epoch:     u64,
     pub merkle_root:     [u8; 32],
     pub client_count:    u32,
-    pub total_amount:    u64,
+    /// Derived: total_bytes · routing_per_mb / MB_DIVISOR.
+    /// The ONLY budget releases are checked against.
+    pub bandwidth_amount: u64,
+    /// Derived: clamped uptime_hours · uptime_per_hour.
+    /// Consumed solely by ClaimRelayUptime; never drawn on by releases.
+    pub uptime_amount:   u64,
     pub total_bytes:     u64,
+    /// Post-clamp hours actually credited.
     pub uptime_hours:    u64,
+    /// Rate pinned at commit. An epoch spans three transactions over up to
+    /// seven days; re-reading the live rate would let a mid-epoch governance
+    /// change desync the cumulative checks.
+    pub routing_per_mb:  u64,
+    pub uptime_per_hour: u64,
+    pub committed_at:    i64,
+    pub uptime_paid:     bool,
     pub reserved_count:  u32,
     pub released_count:  u32,
     pub released_amount: u64,
@@ -25,7 +38,13 @@ pub struct ClaimCommitment {
     pub bump:            u8,
 }
 
-pub const CLAIM_COMMITMENT_SIZE: usize = 32 + 8 + 32 + 4 + 8 + 8 + 8 + 4 + 4 + 8 + 8 + 1 + 8 + 1; // +8 uptime_hours
+pub const CLAIM_COMMITMENT_SIZE: usize =
+    32 + 8 + 32 + 4      // relay, epoch, root, client_count
+    + 8 + 8              // bandwidth_amount, uptime_amount
+    + 8 + 8              // total_bytes, uptime_hours
+    + 8 + 8 + 8 + 1      // routing_per_mb, uptime_per_hour, committed_at, uptime_paid
+    + 4 + 4 + 8 + 8      // reserved/released counts and totals
+    + 1 + 8 + 1;         // status, dispute_deadline, bump
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ClaimCommitmentStatus {
@@ -227,6 +246,50 @@ pub struct RelayClaimMeta {
 }
 
 pub const RELAY_CLAIM_META_SIZE: usize = 32 + 8 + 1;
+
+#[cfg(test)]
+mod claim_commitment_tests {
+    use super::*;
+
+    fn sample() -> ClaimCommitment {
+        ClaimCommitment {
+            relay_pubkey:     [1u8; 32],
+            claim_epoch:      42,
+            merkle_root:      [2u8; 32],
+            client_count:     3,
+            bandwidth_amount: 5_000_000_000,
+            uptime_amount:    120_000_000_000,
+            total_bytes:      5_000_000_000,
+            uptime_hours:     12,
+            routing_per_mb:   1_000_000,
+            uptime_per_hour:  10_000_000_000,
+            committed_at:     1_700_000_000,
+            uptime_paid:      false,
+            reserved_count:   0,
+            released_count:   0,
+            released_amount:  0,
+            released_bytes:   0,
+            status:           ClaimCommitmentStatus::Active,
+            dispute_deadline: 1_700_604_800,
+            bump:             255,
+        }
+    }
+
+    #[test]
+    fn size_matches_serialised_length() {
+        let bytes = borsh::to_vec(&sample()).expect("serialise");
+        assert_eq!(bytes.len(), CLAIM_COMMITMENT_SIZE);
+    }
+
+    #[test]
+    fn budgets_are_separate_fields() {
+        // Regression: a single conflated total_amount let releases (bandwidth
+        // only) draw on the uptime allowance.
+        let c = sample();
+        assert_ne!(c.bandwidth_amount, c.uptime_amount);
+        assert_eq!(c.released_amount, 0);
+    }
+}
 
 #[cfg(test)]
 mod relay_claim_meta_tests {
