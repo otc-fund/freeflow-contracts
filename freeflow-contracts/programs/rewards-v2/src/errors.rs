@@ -64,6 +64,13 @@ pub enum RewardsError {
     RewardRatesNotInitialized      = 45,
     /// InitializeRewardRates called on an existing PDA.
     RewardRatesAlreadyInitialized  = 46,
+
+    /// Uptime rewards are disabled by the foundation kill switch.
+    UptimeRewardsDisabled          = 47,
+    /// ClaimRelayUptime already ran for this epoch.
+    UptimeAlreadyPaid              = 48,
+    /// relay_meta account is not the expected PDA.
+    RelayMetaInvalid               = 49,
 }
 
 impl From<RewardsError> for ProgramError {

@@ -75,3 +75,18 @@ pub const FREE_TRIAL_DURATION_SECS: u64 = 2_592_000;
 /// Basis: a relay routing the full 10 GB trial bandwidth earns ≈ 40 $FLOW
 /// (at $0.025/FLOW rate).  The 100 $FLOW cap allows 2.5× headroom.
 pub const MAX_TRIAL_MINT_PER_RELAY_PER_EPOCH: u64 = 100 * BASE_UNITS_PER_FLOW; // 100 $FLOW
+
+/// Absolute per-epoch ceiling on claimable uptime, in hours.
+///
+/// Twice the 12h FixedUtc cycle, so a relay that misses one cycle can still
+/// claim what it earned. Required *alongside* the elapsed-time clamp: elapsed
+/// alone bounds time passed, not time served, so a relay offline for 30 days
+/// would otherwise claim 720 hours it never served.
+pub const MAX_UPTIME_HOURS_PER_EPOCH: u64 = 24;
+
+/// The reward_rates PDA is mandatory on CommitClaim.
+///
+/// Was false during rollout, which made the rate ceiling optional: a relay
+/// sending a 3-account CommitClaim skipped enforcement entirely and
+/// total_amount was unbounded. All relays pass the account, so this is safe.
+pub const REWARD_RATES_REQUIRED: bool = true;

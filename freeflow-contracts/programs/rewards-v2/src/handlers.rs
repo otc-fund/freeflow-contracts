@@ -94,11 +94,6 @@ fn read_repflow_balance(repflow_user_ai: &AccountInfo) -> Result<u64, ProgramErr
     Ok(balance)
 }
 
-/// OI-2 cutover flag. `false` during rollout (ceiling enforced only when the
-/// reward_rates PDA is supplied); flip to `true` in Phase E once all relays pass
-/// the account, making the rate account mandatory on every CommitClaim.
-const REWARD_RATES_REQUIRED: bool = false;
-
 // ── 0: CommitClaim ───────────────────────────────────────────────────────────
 
 /// CommitClaim: relay publishes Merkle root committing to all client batches.
