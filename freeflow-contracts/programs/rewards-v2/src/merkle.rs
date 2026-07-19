@@ -53,16 +53,19 @@ pub fn hash_pair(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 ///                    || session_id[16]
 ///                    || batch_nonce[8]     (= highest_seq in ReserveBatchEntry)
 ///                    || batch_hash[32]     (= merkle_leaf_hash in ReserveBatchEntry)
-///                    || total_amount[8]
 ///                    || total_bytes[8]
 ///                    || record_count[4])
 /// ```
+///
+/// **No `amount` field.** The relay commits only to quantities (bytes,
+/// record_count); the payable amount is derived on-chain from `total_bytes`
+/// and a pinned rate. This keeps the relay from ever asserting a currency
+/// figure directly in the leaf.
 pub fn compute_merkle_leaf_hash(
     client_pubkey: &[u8; 32],
     session_id:    &[u8; 16],
     batch_nonce:   u64,
     batch_hash:    &[u8; 32],
-    total_amount:  u64,
     total_bytes:   u64,
     record_count:  u32,
 ) -> [u8; 32] {
@@ -72,7 +75,6 @@ pub fn compute_merkle_leaf_hash(
         session_id.as_slice(),
         &batch_nonce.to_le_bytes(),
         batch_hash.as_slice(),
-        &total_amount.to_le_bytes(),
         &total_bytes.to_le_bytes(),
         &record_count.to_le_bytes(),
     ]).to_bytes()
@@ -101,7 +103,6 @@ pub fn compute_merkle_leaf_hash_from_entry(entry: &ReserveBatchEntry) -> [u8; 32
         &entry.session_id,
         entry.highest_seq,
         &batch_hash,
-        entry.amount,
         entry.bytes,
         entry.record_count,
     )
@@ -121,8 +122,33 @@ pub fn compute_merkle_leaf_hash_from_release(release: &ClientReleaseOnChain) -> 
         &release.session_id,
         release.batch_nonce,
         &batch_hash,
-        release.total_amount,
         release.total_bytes,
         release.record_count,
     )
+}
+
+#[cfg(test)]
+mod leaf_without_amount_tests {
+    use super::*;
+
+    #[test]
+    fn leaf_is_stable_and_amount_free() {
+        let client  = [1u8; 32];
+        let session = [2u8; 16];
+        let batch   = [3u8; 32];
+        let a = compute_merkle_leaf_hash(&client, &session, 5, &batch, 1_000_000, 7);
+        let b = compute_merkle_leaf_hash(&client, &session, 5, &batch, 1_000_000, 7);
+        assert_eq!(a, b, "leaf must be deterministic");
+    }
+
+    #[test]
+    fn bytes_still_bind_the_leaf() {
+        // bytes is now the sole quantity driving value, so it must be committed.
+        let client  = [1u8; 32];
+        let session = [2u8; 16];
+        let batch   = [3u8; 32];
+        let a = compute_merkle_leaf_hash(&client, &session, 5, &batch, 1_000_000, 7);
+        let b = compute_merkle_leaf_hash(&client, &session, 5, &batch, 2_000_000, 7);
+        assert_ne!(a, b, "different bytes must produce different leaves");
+    }
 }
