@@ -24,7 +24,10 @@ mod integration {
         handlers::derive_reward_amount,
         id,
         process_instruction,
-        types::{ClaimCommitment, RewardRatesAccount, CLAIM_COMMITMENT_SIZE, REWARD_RATES_SIZE},
+        types::{
+            ClaimCommitment, RelayClaimMeta, RewardRatesAccount, CLAIM_COMMITMENT_SIZE,
+            RELAY_CLAIM_META_SIZE, REWARD_RATES_SIZE,
+        },
         RewardsInstruction,
     };
 
@@ -295,6 +298,82 @@ mod integration {
         // zero (see handlers::clamp_tests::first_epoch_earns_zero).
         assert_eq!(c.uptime_hours, 0, "first epoch for a relay must earn zero uptime");
         assert_eq!(c.uptime_amount, 0);
+    }
+
+    /// Finding 1 (final security review): a lamport-griefed `relay_meta` must
+    /// not brick the relay.
+    ///
+    /// `[b"relay_meta", relay]` is derivable by anyone from a public relay
+    /// pubkey and does not exist for any relay yet. An attacker transfers
+    /// rent-worth of lamports to it; the account then exists **system-owned
+    /// with zero data length**. Under the old `lamports() == 0` initialisation
+    /// test CommitClaim took the "already initialised" branch,
+    /// `RelayClaimMeta::try_from_slice` failed on the empty buffer, and that
+    /// relay could never commit again — all bandwidth, trial, and uptime
+    /// revenue stopped permanently with no in-program recovery.
+    ///
+    /// This is the actual attack, planted verbatim.
+    #[tokio::test]
+    async fn commit_claim_survives_lamport_griefed_relay_meta() {
+        use solana_sdk::account::Account;
+
+        let relay = Keypair::new();
+        let mut pt = program_test();
+
+        // Relay pays for its own commitment PDA.
+        pt.add_account(relay.pubkey(), Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        });
+
+        // The grief: a bare transfer, no allocation. 890 lamports is the
+        // figure from the review — the exact amount is irrelevant, only that
+        // it is non-zero.
+        pt.add_account(relay_meta_pda(&relay.pubkey()), Account {
+            lamports: 890,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        });
+
+        let (mut banks, payer, bh) = pt.start().await;
+        setup_rates(&mut banks, &payer, bh).await;
+        let epoch = current_epoch(&mut banks).await;
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[commit_ix(&relay.pubkey(), epoch, true)],
+            Some(&relay.pubkey()), &[&relay], bh,
+        )).await.expect(
+            "CommitClaim must succeed against a lamport-funded, system-owned, \
+             zero-length relay_meta — otherwise the relay is permanently DoS'd",
+        );
+
+        // The PDA must have been adopted properly: reassigned to the program,
+        // allocated to full size, and holding a readable clamp basis.
+        let acct = banks.get_account(relay_meta_pda(&relay.pubkey())).await
+            .expect("rpc").expect("relay_meta must exist after CommitClaim");
+        assert_eq!(acct.owner, id(), "relay_meta must be assigned to the program");
+        assert_eq!(
+            acct.data.len(), RELAY_CLAIM_META_SIZE,
+            "relay_meta must be allocated to its full size",
+        );
+        let meta = RelayClaimMeta::try_from_slice(&acct.data[..RELAY_CLAIM_META_SIZE])
+            .expect("relay_meta must deserialize");
+        assert_eq!(meta.relay, relay.pubkey().to_bytes());
+        assert!(meta.last_committed_at > 0, "clamp basis must be recorded");
+
+        // And it must be rent-exempt, not left collectable at the attacker's
+        // 890 lamports.
+        let rent = banks.get_rent().await.expect("rent sysvar");
+        assert!(
+            acct.lamports >= rent.minimum_balance(RELAY_CLAIM_META_SIZE),
+            "relay_meta must be topped up to rent-exemption",
+        );
     }
 
     #[tokio::test]

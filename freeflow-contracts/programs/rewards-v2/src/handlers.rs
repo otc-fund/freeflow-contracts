@@ -66,6 +66,60 @@ fn create_pda_account<'a>(
 }
 
 
+/// Is a PDA initialised *by this program*?
+///
+/// Ownership + data length — never lamports. A PDA address is derivable by
+/// anyone from public inputs, so anyone can `transfer` rent to it; that leaves
+/// the account **system-owned with zero data length** while `lamports() != 0`.
+/// A lamports-based test reads that as "initialised", then deserialisation
+/// fails on the empty buffer and the instruction is permanently unusable for
+/// that PDA. Only the system program can allocate or assign, and only with the
+/// PDA's own signature, so ownership is the one signal an attacker cannot forge.
+fn is_pda_initialized(owner: &Pubkey, data_len: usize, program_id: &Pubkey) -> bool {
+    owner == program_id && data_len > 0
+}
+
+/// Initialise a PDA that may already hold lamports.
+///
+/// `create_pda_account` cannot be used where the address is attacker-reachable:
+/// `system_instruction::create_account` fails with `AccountAlreadyInUse` once
+/// the target has any balance, so a rent-sized transfer to a derivable PDA
+/// would permanently block its creation. `allocate` + `assign` is the standard
+/// pattern that works whether or not the account was pre-funded.
+///
+/// Tops the account up to rent-exemption first (from `payer`), so an account
+/// pre-funded with less than rent — or not funded at all — still ends up
+/// rent-exempt rather than collectable.
+fn init_pda_allow_prefunded<'a>(
+    payer:       &AccountInfo<'a>,
+    new_account: &AccountInfo<'a>,
+    system_prog: &AccountInfo<'a>,
+    program_id:  &Pubkey,
+    seeds:       &[&[u8]],
+    space:       usize,
+) -> ProgramResult {
+    let required  = Rent::get()?.minimum_balance(space);
+    let shortfall = required.saturating_sub(new_account.lamports());
+    if shortfall > 0 {
+        invoke(
+            &system_instruction::transfer(payer.key, new_account.key, shortfall),
+            &[payer.clone(), new_account.clone(), system_prog.clone()],
+        )?;
+    }
+
+    invoke_signed(
+        &system_instruction::allocate(new_account.key, space as u64),
+        &[new_account.clone(), system_prog.clone()],
+        &[seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(new_account.key, program_id),
+        &[new_account.clone(), system_prog.clone()],
+        &[seeds],
+    )?;
+    Ok(())
+}
+
 fn save_account<T: BorshSerialize>(account_ai: &AccountInfo, data: &T) -> ProgramResult {
     let bytes = borsh::to_vec(data).map_err(|_| ProgramError::InvalidAccountData)?;
     let mut acct_data = account_ai.data.borrow_mut();
@@ -186,12 +240,25 @@ pub fn process_commit_claim_ix(
     if relay_meta_ai.key != &rm_pda {
         return Err(RewardsError::RelayMetaInvalid.into());
     }
-    let last_committed_at: Option<i64> = if relay_meta_ai.lamports() == 0 {
-        None
-    } else {
+    // Computed ONCE, before the read, and reused verbatim at the write site
+    // below — if the read and the write could disagree about whether the PDA
+    // exists, one of the two branches is always wrong.
+    //
+    // Lamports are deliberately not the signal: `[b"relay_meta", relay]` is
+    // derivable from a public relay pubkey, so anyone can transfer rent to it
+    // and leave it system-owned with zero data. Under a `lamports() == 0` test
+    // that account read as "initialised", `try_from_slice` failed on the empty
+    // buffer, and the relay could never CommitClaim again — a permanent halt of
+    // all bandwidth, trial, and uptime revenue for the price of the transfer.
+    let relay_meta_initialized =
+        is_pda_initialized(relay_meta_ai.owner, relay_meta_ai.data_len(), program_id);
+
+    let last_committed_at: Option<i64> = if relay_meta_initialized {
         Some(RelayClaimMeta::try_from_slice(&relay_meta_ai.data.borrow())
             .map_err(|_| ProgramError::InvalidAccountData)?
             .last_committed_at)
+    } else {
+        None
     };
 
     // ── Kill switch ───────────────────────────────────────────────────────────
@@ -284,8 +351,10 @@ pub fn process_commit_claim_ix(
     save_account(commitment_ai, &commitment)?;
 
     // ── Advance the monotonic clamp basis ─────────────────────────────────────
-    if relay_meta_ai.lamports() == 0 {
-        create_pda_account(
+    if !relay_meta_initialized {
+        // allocate + assign rather than create_account: the account may already
+        // hold attacker-supplied lamports, which create_account rejects.
+        init_pda_allow_prefunded(
             relay_wallet, relay_meta_ai, system_prog, program_id,
             &[b"relay_meta", relay_wallet.key.as_ref(), &[rm_bump]],
             RELAY_CLAIM_META_SIZE,
@@ -525,6 +594,55 @@ mod derive_amount_tests {
         // routing_per_mb = 1_000_000 means one base unit per byte, so a
         // sub-MB byte count is NOT rounded away.
         assert_eq!(derive(999, 1_000_000), 999);
+    }
+}
+
+#[cfg(test)]
+mod pda_init_predicate_tests {
+    use super::*;
+    use solana_program::system_program;
+
+    /// The attack this predicate exists to defeat.
+    ///
+    /// `[b"relay_meta", relay]` is derivable by anyone from a public relay
+    /// pubkey. A bare lamport transfer to it produces exactly this state:
+    /// system-owned, zero data length, non-zero lamports. The old
+    /// `lamports() == 0` test classified it as INITIALISED, then
+    /// `RelayClaimMeta::try_from_slice` failed on the 0-byte buffer and every
+    /// subsequent CommitClaim for that relay returned InvalidAccountData —
+    /// permanent revenue DoS, no in-program recovery.
+    #[test]
+    fn lamport_funded_but_unallocated_account_is_uninitialized() {
+        let program_id = Pubkey::new_unique();
+        assert!(
+            !is_pda_initialized(&system_program::ID, 0, &program_id),
+            "a system-owned zero-length account must read as UNINITIALISED \
+             however many lamports it holds",
+        );
+    }
+
+    #[test]
+    fn program_owned_with_data_is_initialized() {
+        let program_id = Pubkey::new_unique();
+        assert!(is_pda_initialized(&program_id, RELAY_CLAIM_META_SIZE, &program_id));
+    }
+
+    /// An account at the same address owned by some *other* program must never
+    /// be deserialised as ours.
+    #[test]
+    fn foreign_owned_account_is_uninitialized() {
+        let program_id = Pubkey::new_unique();
+        assert!(!is_pda_initialized(
+            &Pubkey::new_unique(), RELAY_CLAIM_META_SIZE, &program_id,
+        ));
+    }
+
+    /// Both halves of the predicate are load-bearing: ownership alone would
+    /// accept a zero-length account and fail the same way lamports did.
+    #[test]
+    fn program_owned_zero_length_is_uninitialized() {
+        let program_id = Pubkey::new_unique();
+        assert!(!is_pda_initialized(&program_id, 0, &program_id));
     }
 }
 
