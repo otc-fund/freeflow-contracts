@@ -14,7 +14,7 @@
 //!   7  SlashTrialFraud     — foundation slashes relay for fabricated trial claims
 //!   8  InitializeRewardRates — foundation creates the reward_rates PDA
 //!   9  UpdateRewardRates   — foundation updates the reward_rates PDA
-//!  10  (reserved)          — ClaimRelayUptime
+//!  10  ClaimRelayUptime    — relay mints its own uptime reward for an epoch
 //!  11  SetUptimeEnabled    — foundation kill switch for relay uptime rewards
 //!
 //! ## Architecture
@@ -140,14 +140,14 @@ pub enum RewardsInstruction {
         uptime_per_hour:  u64,
         flow_price_cents: u64,
     },
-    /// 10: reserved for ClaimRelayUptime.
+    /// 10: ClaimRelayUptime — relay mints its own uptime reward for an epoch.
     ///
-    /// Borsh derives the discriminant from declaration order and the variants
-    /// carry fields, so Rust will not accept an explicit discriminant — slot 10
-    /// has to be physically occupied for SetUptimeEnabled to land on 11. This
-    /// placeholder is replaced by the real ClaimRelayUptime handler; until then
-    /// it is rejected as invalid instruction data.
-    ReservedClaimRelayUptime,
+    /// Pays `ClaimCommitment.uptime_amount`, pinned at CommitClaim time from
+    /// the foundation-governed rate. Separate budget from `bandwidth_amount`;
+    /// releases never draw on it. One-shot per epoch via `uptime_paid`.
+    ClaimRelayUptime {
+        claim_epoch: u64,
+    },
     /// 11: SetUptimeEnabled — foundation-only kill switch for uptime rewards.
     SetUptimeEnabled {
         enabled: bool,
@@ -211,8 +211,8 @@ pub fn process_instruction(
             program_id, accounts, routing_per_mb, seeding_per_mb, uptime_per_hour, flow_price_cents,
         ),
 
-        RewardsInstruction::ReservedClaimRelayUptime =>
-            Err(ProgramError::InvalidInstructionData),
+        RewardsInstruction::ClaimRelayUptime { claim_epoch } =>
+            handlers::process_claim_relay_uptime_ix(program_id, accounts, claim_epoch),
 
         RewardsInstruction::SetUptimeEnabled { enabled } =>
             handlers::process_set_uptime_enabled_ix(program_id, accounts, enabled),

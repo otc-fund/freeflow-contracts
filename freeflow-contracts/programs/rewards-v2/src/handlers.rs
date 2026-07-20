@@ -1664,6 +1664,442 @@ pub fn process_update_reward_rates(
     Ok(())
 }
 
+// ── 10: ClaimRelayUptime ─────────────────────────────────────────────────────
+
+/// 70/30 split matching `process_release_claim_ix`: relay gets the floor,
+/// treasury gets the remainder. M-1: deriving treasury as the remainder
+/// (rather than `amount * FOUNDATION_SPLIT_PCT / 100`) avoids truncation
+/// loss — the two parts always sum back to `amount`.
+fn split_relay_treasury(amount: u64) -> (u64, u64) {
+    let relay_amount    = amount * RELAY_SPLIT_PCT / 100;
+    let treasury_amount = amount - relay_amount;
+    (relay_amount, treasury_amount)
+}
+
+/// 10: ClaimRelayUptime — mint the relay's own uptime reward for an epoch.
+///
+/// Replaces the synthetic self-client usage record, which had no UserEscrow,
+/// failed ReserveBatch, and was paid only by riding the free-trial release
+/// path. Uptime has no counterparty and therefore no dispute window.
+///
+/// `commitment.uptime_amount` was derived and clamped at CommitClaim time
+/// (Task 7) from `uptime_hours * uptime_per_hour` pinned at commit — this
+/// handler pays that pinned value verbatim. It never recomputes from the live
+/// `reward_rates` PDA and never draws on `commitment.bandwidth_amount`, which
+/// is a separate budget reserved for ReleaseClaim.
+///
+/// Accounts:
+///   0: relay_wallet       (signer)
+///   1: commitment         (writable, PDA [b"claim_commitment", relay, epoch_le])
+///   2: foundation_config  (readonly, PDA [b"foundation_config"]) — uptime kill switch
+///   3: relay_repflow_user (readonly) — repFlow gate (2001)
+///   4: token_program
+///   5: flow_mint          (writable)
+///   6: service_authority  (mint_authority PDA)
+///   7: reward_relay       (writable)
+///   8: reward_treasury    (writable)
+pub fn process_claim_relay_uptime_ix(
+    program_id:  &Pubkey,
+    accounts:    &[AccountInfo],
+    claim_epoch: u64,
+) -> ProgramResult {
+    let iter                 = &mut accounts.iter();
+    let relay_wallet         = next_account_info(iter)?;
+    let commitment_ai        = next_account_info(iter)?;
+    let foundation_config_ai = next_account_info(iter)?;
+    let relay_repflow_user   = next_account_info(iter)?;
+    let token_program        = next_account_info(iter)?;
+    let flow_mint            = next_account_info(iter)?;
+    let service_authority    = next_account_info(iter)?;
+    let reward_relay         = next_account_info(iter)?;
+    let reward_treasury      = next_account_info(iter)?;
+
+    if !relay_wallet.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let (c_pda, _) = Pubkey::find_program_address(
+        &[b"claim_commitment", relay_wallet.key.as_ref(), &claim_epoch.to_le_bytes()],
+        program_id,
+    );
+    if commitment_ai.key != &c_pda {
+        return Err(ProgramError::InvalidArgument);
+    }
+    let mut commitment: ClaimCommitment =
+        ClaimCommitment::try_from_slice(&commitment_ai.data.borrow())
+            .map_err(|_| RewardsError::ClaimCommitmentNotFound)?;
+
+    if commitment.relay_pubkey != relay_wallet.key.to_bytes() {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if commitment.uptime_paid {
+        return Err(RewardsError::UptimeAlreadyPaid.into());
+    }
+
+    // Re-checked here even though CommitClaim already checked it (clamps
+    // uptime_hours to 0 when disabled): an emergency stop must halt epochs
+    // that were already committed, rather than waiting out the rate-pinning
+    // semantics that let a committed uptime_amount survive to this point.
+    let (fc_pda, _) = Pubkey::find_program_address(&[b"foundation_config"], program_id);
+    if foundation_config_ai.key != &fc_pda {
+        return Err(ProgramError::InvalidArgument);
+    }
+    let uptime_enabled = if foundation_config_ai.lamports() == 0 {
+        true // config not yet created — default enabled, matches CommitClaim
+    } else {
+        // Legacy-tolerant — see read_foundation_config_compat. A strict
+        // FoundationConfig::try_from_slice fails on the live 34-byte PDA.
+        read_foundation_config_compat(&foundation_config_ai.data.borrow())?.uptime_enabled
+    };
+    if !uptime_enabled {
+        return Err(RewardsError::UptimeRewardsDisabled.into());
+    }
+
+    let amount = commitment.uptime_amount;
+    if amount == 0 {
+        // Nothing to pay — still latch uptime_paid so a zero-uptime epoch
+        // cannot be retried forever.
+        commitment.uptime_paid = true;
+        save_account(commitment_ai, &commitment)?;
+        msg!("ClaimRelayUptime: nothing to pay for epoch {}", claim_epoch);
+        return Ok(());
+    }
+
+    let repflow_balance = read_repflow_balance(relay_repflow_user)?;
+    if repflow_balance < MIN_RELAY_REPFLOW {
+        return Err(RewardsError::RepFlowGateNotMet.into());
+    }
+
+    let (_, authority_bump) = Pubkey::find_program_address(&[b"mint_authority"], program_id);
+    let (relay_amount, treasury_amount) = split_relay_treasury(amount);
+    cpi_mint_flow(token_program, flow_mint, reward_relay, service_authority, relay_amount, authority_bump)?;
+    cpi_mint_flow(token_program, flow_mint, reward_treasury, service_authority, treasury_amount, authority_bump)?;
+
+    commitment.uptime_paid = true;
+    save_account(commitment_ai, &commitment)?;
+
+    msg!(
+        "ClaimRelayUptime: epoch={} hours={} amount={} relay={} treasury={}",
+        claim_epoch, commitment.uptime_hours, amount, relay_amount, treasury_amount,
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod claim_relay_uptime_tests {
+    use super::split_relay_treasury;
+
+    /// 70/30 split: relay gets the floor of 70%, treasury gets the exact
+    /// remainder so the parts always sum back to the original amount — no
+    /// truncation loss (M-1), matching `process_release_claim_ix`.
+    #[test]
+    fn split_relay_treasury_sums_to_amount_no_truncation_loss() {
+        // Not evenly divisible by 100 — the case truncation would lose units on.
+        let amount = 1_000_000_007u64;
+        let (relay, treasury) = split_relay_treasury(amount);
+        assert_eq!(relay + treasury, amount, "split must never lose base units");
+        assert_eq!(relay, amount * 70 / 100, "relay gets the floor of 70%");
+        assert_eq!(treasury, amount - relay, "treasury is the exact remainder");
+    }
+
+    #[test]
+    fn split_relay_treasury_zero_amount() {
+        assert_eq!(split_relay_treasury(0), (0, 0));
+    }
+
+    #[test]
+    fn split_relay_treasury_evenly_divisible() {
+        // 10 $FLOW at 9 decimals: evenly divisible by 100, so no remainder
+        // rounding is exercised — sanity check the 70/30 ratio itself.
+        let amount = 10_000_000_000u64;
+        let (relay, treasury) = split_relay_treasury(amount);
+        assert_eq!(relay, 7_000_000_000);
+        assert_eq!(treasury, 3_000_000_000);
+        assert_eq!(relay + treasury, amount);
+    }
+
+    #[test]
+    fn split_relay_treasury_one_base_unit_all_goes_to_treasury() {
+        // 1 * 70 / 100 == 0 (integer division) — the smallest possible
+        // nonzero amount rounds the relay's share down to zero, and the
+        // remainder formula must still hand that unit to treasury rather
+        // than dropping it.
+        let (relay, treasury) = split_relay_treasury(1);
+        assert_eq!(relay, 0);
+        assert_eq!(treasury, 1);
+    }
+}
+
+/// Full-runtime tests for `process_claim_relay_uptime_ix`.
+///
+/// Only paths that resolve before the mint CPI are covered here — matching
+/// the rest of the suite's convention (see test_trial.rs's module doc):
+/// reaching `cpi_mint_flow` would require the SPL-Token program loaded.
+/// The zero-amount path is a genuine full success path (`Ok(())`) since it
+/// returns before ever calling `cpi_mint_flow`.
+#[cfg(test)]
+mod claim_relay_uptime_integration_tests {
+    use super::*;
+    use solana_program_test::*;
+    use solana_sdk::{
+        account::Account,
+        instruction::{AccountMeta, Instruction},
+        signature::{Keypair, Signer},
+        transaction::Transaction,
+    };
+
+    use crate::{id, process_instruction, RewardsInstruction};
+
+    fn program_test() -> ProgramTest {
+        ProgramTest::new("freeflow_rewards_v2", id(), processor!(process_instruction))
+    }
+
+    fn encode_ix(ix: &RewardsInstruction) -> Vec<u8> {
+        borsh::to_vec(ix).expect("borsh encode")
+    }
+
+    fn commitment_pda(relay: &Pubkey, epoch: u64) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[b"claim_commitment", relay.as_ref(), &epoch.to_le_bytes()],
+            &id(),
+        )
+    }
+
+    fn foundation_config_pda() -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[b"foundation_config"], &id())
+    }
+
+    /// Pre-populated `ClaimCommitment` account with controllable `uptime_amount`
+    /// and `uptime_paid`, matching what CommitClaim (Task 7) would have written.
+    fn commitment_account(
+        relay:         &Pubkey,
+        epoch:         u64,
+        uptime_amount: u64,
+        uptime_paid:   bool,
+        bump:          u8,
+    ) -> Account {
+        let c = ClaimCommitment {
+            relay_pubkey:    relay.to_bytes(),
+            claim_epoch:     epoch,
+            merkle_root:     [0u8; 32],
+            client_count:    0,
+            bandwidth_amount: 0,
+            uptime_amount,
+            total_bytes:     0,
+            uptime_hours:    3,
+            routing_per_mb:  DEFAULT_ROUTING_PER_MB,
+            uptime_per_hour: DEFAULT_UPTIME_PER_HOUR,
+            committed_at:    0,
+            uptime_paid,
+            reserved_count:  0,
+            released_count:  0,
+            released_amount: 0,
+            released_bytes:  0,
+            status:          ClaimCommitmentStatus::Active,
+            dispute_deadline: 0,
+            bump,
+        };
+        let data = borsh::to_vec(&c).expect("borsh commitment");
+        let mut padded = vec![0u8; CLAIM_COMMITMENT_SIZE];
+        padded[..data.len()].copy_from_slice(&data);
+        Account { lamports: 1_000_000, data: padded, owner: id(), executable: false, rent_epoch: 0 }
+    }
+
+    fn foundation_config_account(wallet: &Pubkey, uptime_enabled: bool, bump: u8) -> Account {
+        let fc = FoundationConfig {
+            foundation_wallet: wallet.to_bytes(),
+            trial_enabled: true,
+            uptime_enabled,
+            bump,
+        };
+        let data = borsh::to_vec(&fc).expect("borsh fc");
+        let mut padded = vec![0u8; FOUNDATION_CONFIG_SIZE];
+        padded[..data.len()].copy_from_slice(&data);
+        Account { lamports: 1_000_000, data: padded, owner: id(), executable: false, rent_epoch: 0 }
+    }
+
+    /// repFlow user account layout matching `read_repflow_balance`: 8-byte
+    /// Anchor discriminator + 32-byte wallet + 8-byte balance LE.
+    fn repflow_user_account(balance: u64) -> Account {
+        let mut data = vec![0u8; 48];
+        data[40..48].copy_from_slice(&balance.to_le_bytes());
+        Account { lamports: 1_000_000, data, owner: id(), executable: false, rent_epoch: 0 }
+    }
+
+    /// Build a `ClaimRelayUptime` instruction in the exact account order Task
+    /// 13's off-chain caller must use: relay_wallet, commitment,
+    /// foundation_config, relay_repflow_user, token_program, flow_mint,
+    /// service_authority, reward_relay, reward_treasury. Accounts past index
+    /// 3 are stubs, sufficient for tests that resolve before the mint CPI.
+    fn claim_relay_uptime_ix(
+        relay:             &Keypair,
+        commitment_pk:     Pubkey,
+        foundation_cfg_pk: Pubkey,
+        repflow_user_pk:   Pubkey,
+        claim_epoch:       u64,
+    ) -> Instruction {
+        let stub = Keypair::new().pubkey();
+        Instruction {
+            program_id: id(),
+            accounts: vec![
+                AccountMeta::new(relay.pubkey(), true),             // [0] relay_wallet
+                AccountMeta::new(commitment_pk, false),              // [1] commitment
+                AccountMeta::new_readonly(foundation_cfg_pk, false), // [2] foundation_config
+                AccountMeta::new_readonly(repflow_user_pk, false),   // [3] relay_repflow_user
+                AccountMeta::new_readonly(stub, false),              // [4] token_program
+                AccountMeta::new(stub, false),                       // [5] flow_mint
+                AccountMeta::new_readonly(stub, false),              // [6] service_authority
+                AccountMeta::new(stub, false),                       // [7] reward_relay
+                AccountMeta::new(stub, false),                       // [8] reward_treasury
+            ],
+            data: encode_ix(&RewardsInstruction::ClaimRelayUptime { claim_epoch }),
+        }
+    }
+
+    async fn fund(banks: &mut BanksClient, payer: &Keypair, relay: &Pubkey, bh: solana_sdk::hash::Hash) {
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(&payer.pubkey(), relay, 1_000_000_000)],
+            Some(&payer.pubkey()), &[payer], bh,
+        )).await.expect("fund relay");
+    }
+
+    /// The `uptime_paid` one-shot guard: a commitment already marked paid
+    /// must reject a second ClaimRelayUptime for the same epoch, before ever
+    /// touching the foundation kill switch, the repFlow gate, or minting.
+    #[tokio::test]
+    async fn rejects_replay_when_already_paid() {
+        let relay = Keypair::new();
+        let claim_epoch = 500u64;
+        let (c_pda, c_bump) = commitment_pda(&relay.pubkey(), claim_epoch);
+        let (fc_pda, _) = foundation_config_pda();
+
+        let mut pt = program_test();
+        pt.add_account(c_pda, commitment_account(&relay.pubkey(), claim_epoch, 10_000_000_000, true, c_bump));
+        // foundation_config intentionally left unfunded: uptime_paid is
+        // checked first, so this account must never be read.
+        let repflow_pk = Keypair::new().pubkey();
+
+        let (mut banks, payer, bh) = pt.start().await;
+        fund(&mut banks, &payer, &relay.pubkey(), bh).await;
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let ix = claim_relay_uptime_ix(&relay, c_pda, fc_pda, repflow_pk, claim_epoch);
+        let result = banks.process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&relay.pubkey()), &[&relay], bh,
+        )).await;
+        assert!(result.is_err(), "UptimeAlreadyPaid must reject a replayed claim");
+    }
+
+    /// The foundation kill switch (`uptime_enabled = false`) must halt a
+    /// ClaimRelayUptime even for an epoch already committed — the deliberate
+    /// re-check documented on `process_claim_relay_uptime_ix`: an emergency
+    /// stop must halt already-committed epochs, not just future commits.
+    #[tokio::test]
+    async fn rejects_when_uptime_disabled() {
+        let relay = Keypair::new();
+        let claim_epoch = 501u64;
+        let (c_pda, c_bump) = commitment_pda(&relay.pubkey(), claim_epoch);
+        let (fc_pda, fc_bump) = foundation_config_pda();
+
+        let mut pt = program_test();
+        pt.add_account(c_pda, commitment_account(&relay.pubkey(), claim_epoch, 10_000_000_000, false, c_bump));
+        pt.add_account(fc_pda, foundation_config_account(&relay.pubkey(), false /* disabled */, fc_bump));
+        let repflow_pk = Keypair::new().pubkey();
+
+        let (mut banks, payer, bh) = pt.start().await;
+        fund(&mut banks, &payer, &relay.pubkey(), bh).await;
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let ix = claim_relay_uptime_ix(&relay, c_pda, fc_pda, repflow_pk, claim_epoch);
+        let result = banks.process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&relay.pubkey()), &[&relay], bh,
+        )).await;
+        assert!(result.is_err(), "UptimeRewardsDisabled must reject the claim");
+    }
+
+    /// repFlow gate (2001): rejected even after the zero-amount short-circuit
+    /// doesn't apply — resolved before ever reaching the mint CPI.
+    #[tokio::test]
+    async fn rejects_when_repflow_below_gate() {
+        let relay = Keypair::new();
+        let claim_epoch = 504u64;
+        let (c_pda, c_bump) = commitment_pda(&relay.pubkey(), claim_epoch);
+        let (fc_pda, fc_bump) = foundation_config_pda();
+
+        let mut pt = program_test();
+        pt.add_account(c_pda, commitment_account(&relay.pubkey(), claim_epoch, 10_000_000_000, false, c_bump));
+        pt.add_account(fc_pda, foundation_config_account(&relay.pubkey(), true, fc_bump));
+        let repflow_pk = Keypair::new().pubkey();
+        pt.add_account(repflow_pk, repflow_user_account(MIN_RELAY_REPFLOW - 1));
+
+        let (mut banks, payer, bh) = pt.start().await;
+        fund(&mut banks, &payer, &relay.pubkey(), bh).await;
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let ix = claim_relay_uptime_ix(&relay, c_pda, fc_pda, repflow_pk, claim_epoch);
+        let result = banks.process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&relay.pubkey()), &[&relay], bh,
+        )).await;
+        assert!(result.is_err(), "RepFlowGateNotMet must reject the claim below the 2001 gate");
+    }
+
+    /// Zero-amount epoch: no repFlow gate, no mint CPI — just latch
+    /// `uptime_paid = true` so the epoch can't be retried forever. This is a
+    /// genuine full success path, unlike the other tests in this module.
+    #[tokio::test]
+    async fn zero_amount_marks_paid_without_minting() {
+        let relay = Keypair::new();
+        let claim_epoch = 502u64;
+        let (c_pda, c_bump) = commitment_pda(&relay.pubkey(), claim_epoch);
+        let (fc_pda, fc_bump) = foundation_config_pda();
+
+        let mut pt = program_test();
+        pt.add_account(c_pda, commitment_account(&relay.pubkey(), claim_epoch, 0 /* zero */, false, c_bump));
+        pt.add_account(fc_pda, foundation_config_account(&relay.pubkey(), true, fc_bump));
+        // repFlow account deliberately absent — must never be read on the zero path.
+        let repflow_pk = Keypair::new().pubkey();
+
+        let (mut banks, payer, bh) = pt.start().await;
+        fund(&mut banks, &payer, &relay.pubkey(), bh).await;
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let ix = claim_relay_uptime_ix(&relay, c_pda, fc_pda, repflow_pk, claim_epoch);
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&relay.pubkey()), &[&relay], bh,
+        )).await.expect("zero-amount ClaimRelayUptime must succeed without minting");
+
+        let acct = banks.get_account(c_pda).await.expect("rpc").expect("commitment exists");
+        let c = ClaimCommitment::try_from_slice(&acct.data[..CLAIM_COMMITMENT_SIZE]).expect("deser");
+        assert!(c.uptime_paid, "zero-amount epoch must still latch uptime_paid");
+    }
+
+    /// A commitment account not at `[claim_commitment, relay, epoch]` must be
+    /// rejected — guards against a caller passing an arbitrary account in the
+    /// commitment slot.
+    #[tokio::test]
+    async fn rejects_commitment_account_at_wrong_pda() {
+        let relay = Keypair::new();
+        let claim_epoch = 503u64;
+        let wrong_pk = Keypair::new().pubkey(); // NOT the derived PDA
+        let (fc_pda, fc_bump) = foundation_config_pda();
+
+        let mut pt = program_test();
+        pt.add_account(wrong_pk, commitment_account(&relay.pubkey(), claim_epoch, 10_000_000_000, false, 255));
+        pt.add_account(fc_pda, foundation_config_account(&relay.pubkey(), true, fc_bump));
+        let repflow_pk = Keypair::new().pubkey();
+
+        let (mut banks, payer, bh) = pt.start().await;
+        fund(&mut banks, &payer, &relay.pubkey(), bh).await;
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let ix = claim_relay_uptime_ix(&relay, wrong_pk, fc_pda, repflow_pk, claim_epoch);
+        let result = banks.process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&relay.pubkey()), &[&relay], bh,
+        )).await;
+        assert!(result.is_err(), "commitment account not at the derived PDA must be rejected");
+    }
+}
+
 // ── 11: SetUptimeEnabled ─────────────────────────────────────────────────────
 
 /// Size of the pre-upgrade `FoundationConfig` account, before `uptime_enabled`
@@ -1939,6 +2375,49 @@ mod foundation_config_migration_tests {
         .expect("borsh encode");
         assert_eq!(encoded[0], 11, "SetUptimeEnabled must stay at discriminant 11");
         assert_eq!(encoded, vec![11, 0]);
+    }
+
+    /// ClaimRelayUptime replaced the `ReservedClaimRelayUptime` placeholder
+    /// IN PLACE at slot 10 (Task 12). If it had instead been appended after
+    /// SetUptimeEnabled, it would land on 12, orphan slot 10, and silently
+    /// break every off-chain caller built against this discriminant.
+    #[test]
+    fn claim_relay_uptime_is_discriminant_10_on_the_wire() {
+        let encoded = borsh::to_vec(&crate::RewardsInstruction::ClaimRelayUptime {
+            claim_epoch: 7,
+        })
+        .expect("borsh encode");
+        assert_eq!(encoded[0], 10, "ClaimRelayUptime must occupy discriminant 10");
+        assert_eq!(encoded, vec![10, 7, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    /// Guards the full run of early discriminants against having shifted —
+    /// not just 10 and 11 in isolation.
+    #[test]
+    fn early_discriminants_0_through_9_unchanged() {
+        use crate::RewardsInstruction as I;
+        assert_eq!(borsh::to_vec(&I::CommitClaim {
+            merkle_root: [0u8; 32], client_count: 0, total_bytes: 0, uptime_hours: 0, claim_epoch: 0,
+        }).unwrap()[0], 0);
+        assert_eq!(borsh::to_vec(&I::ReserveBatch { claim_epoch: 0, entries: vec![] }).unwrap()[0], 1);
+        assert_eq!(borsh::to_vec(&I::ReleaseClaim { claim_epoch: 0, releases: vec![] }).unwrap()[0], 2);
+        assert_eq!(borsh::to_vec(&I::ClientDispute {
+            claim_epoch: 0, client_pubkey: [0u8; 32], session_id: [0u8; 16], batch_nonce: 0,
+            original_batch_hash: [0u8; 32], total_bytes: 0, record_count: 0,
+            client_signature: [0u8; 64], merkle_proof: vec![],
+        }).unwrap()[0], 3);
+        assert_eq!(borsh::to_vec(&I::ClaimPendingRewards { claim_epoch: 0 }).unwrap()[0], 4);
+        assert_eq!(borsh::to_vec(&I::ReleaseTrialClaim { claim_epoch: 0, releases: vec![] }).unwrap()[0], 5);
+        assert_eq!(borsh::to_vec(&I::SetTrialEnabled { enabled: false }).unwrap()[0], 6);
+        assert_eq!(borsh::to_vec(&I::SlashTrialFraud {
+            claim_epoch: 0, device_uuid: [0u8; 16], device_signature: [0u8; 64],
+        }).unwrap()[0], 7);
+        assert_eq!(borsh::to_vec(&I::InitializeRewardRates {
+            routing_per_mb: 0, seeding_per_mb: 0, uptime_per_hour: 0, flow_price_cents: 0,
+        }).unwrap()[0], 8);
+        assert_eq!(borsh::to_vec(&I::UpdateRewardRates {
+            routing_per_mb: 0, seeding_per_mb: 0, uptime_per_hour: 0, flow_price_cents: 0,
+        }).unwrap()[0], 9);
     }
 
     #[test]
