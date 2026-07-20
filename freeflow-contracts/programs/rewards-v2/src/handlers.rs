@@ -76,6 +76,19 @@ fn save_account<T: BorshSerialize>(account_ai: &AccountInfo, data: &T) -> Progra
     Ok(())
 }
 
+/// Derive a $FLOW amount from bytes and a pinned per-MB rate.
+///
+/// Saturating throughout: `bytes` is relay-supplied and unbounded within u64,
+/// and a bare `as u64` on the u128 quotient silently wraps (verified reachable:
+/// 2e19 wrapped to 1_553_255_926_290_448_384).
+pub fn derive_reward_amount(bytes: u64, routing_per_mb: u64) -> u64 {
+    (bytes as u128)
+        .saturating_mul(routing_per_mb as u128)
+        .checked_div(MB_DIVISOR as u128)
+        .unwrap_or(0)
+        .min(u64::MAX as u128) as u64
+}
+
 /// Read the repFlow balance from a repflow-token RepFlowUser Anchor account.
 /// Anchor accounts have an 8-byte discriminator prefix — skip it.
 fn read_repflow_balance(repflow_user_ai: &AccountInfo) -> Result<u64, ProgramError> {
@@ -228,11 +241,7 @@ pub fn process_commit_claim_ix(
     // is governance-set, so the u128 product can exceed u64::MAX. Saturate rather
     // than wrap — bandwidth_amount is the only budget releases are checked against,
     // so a wrapped value would corrupt the cap.
-    let bandwidth_amount = (total_bytes as u128)
-        .saturating_mul(rr.routing_per_mb as u128)
-        .checked_div(MB_DIVISOR as u128)
-        .unwrap_or(0)
-        .min(u64::MAX as u128) as u64;
+    let bandwidth_amount = derive_reward_amount(total_bytes, rr.routing_per_mb);
     let uptime_amount = clamped_hours.saturating_mul(rr.uptime_per_hour);
 
     msg!(
@@ -414,11 +423,7 @@ pub fn process_reserve_batch_ix(
         // than wrap, matching process_commit_claim_ix exactly so the two derivations
         // cannot drift — bandwidth_amount is the only budget reserves are checked
         // against, so a wrapped value would corrupt the cap.
-        let derived_amount = (entry.bytes as u128)
-            .saturating_mul(commitment.routing_per_mb as u128)
-            .checked_div(MB_DIVISOR as u128)
-            .unwrap_or(0)
-            .min(u64::MAX as u128) as u64;
+        let derived_amount = derive_reward_amount(entry.bytes, commitment.routing_per_mb);
 
         // CPI: hold_client_funds.
         cpi_hold_client_funds(
@@ -493,11 +498,7 @@ mod derive_amount_tests {
     use super::*;
 
     fn derive(bytes: u64, routing_per_mb: u64) -> u64 {
-        (bytes as u128)
-            .saturating_mul(routing_per_mb as u128)
-            .checked_div(MB_DIVISOR as u128)
-            .unwrap_or(0)
-            .min(u64::MAX as u128) as u64
+        derive_reward_amount(bytes, routing_per_mb)
     }
 
     #[test]
@@ -637,21 +638,25 @@ pub fn process_release_claim_ix(
             return Err(RewardsError::AlreadyReleased.into());
         }
 
-        // 4. Cumulative cap check.
+        // 4. Derive value from bytes and the pinned rate; the relay supplies none.
+        let derived_amount = derive_reward_amount(release.total_bytes, commitment.routing_per_mb);
+
+        // 5. Cumulative cap check. Capped by bandwidth_amount — the budget
+        // releases may draw on — not the uptime allowance.
         let new_amount = commitment.released_amount
-            .checked_add(release.total_amount)
+            .checked_add(derived_amount)
             .ok_or(RewardsError::ArithmeticOverflow)?;
         let new_bytes = commitment.released_bytes
             .checked_add(release.total_bytes)
             .ok_or(RewardsError::ArithmeticOverflow)?;
-        if new_amount > commitment.total_amount {
+        if new_amount > commitment.bandwidth_amount {
             return Err(RewardsError::ReleaseExceedsCommitment.into());
         }
         if new_bytes > commitment.total_bytes {
             return Err(RewardsError::ReleaseExceedsCommitment.into());
         }
 
-        // 5. Compute claim_hash and CPI burn_held_funds.
+        // 6. Compute claim_hash and CPI burn_held_funds.
         let claim_hash = compute_claim_hash(
             &release.client_pubkey, &release.session_id, release.batch_nonce, &leaf_hash,
         );
@@ -681,7 +686,7 @@ pub fn process_release_claim_ix(
         save_account(claim_state_ai, &claim_state)?;
 
         total_released_amount = total_released_amount
-            .checked_add(release.total_amount)
+            .checked_add(derived_amount)
             .ok_or(RewardsError::ArithmeticOverflow)?;
         total_released_bytes = total_released_bytes
             .checked_add(release.total_bytes)
@@ -1152,13 +1157,6 @@ pub fn process_release_trial_claim_ix(
         let claim_state_ai = next_account_info(iter)?;
         let trial_usage_ai = next_account_info(iter)?;
 
-        // Relay uptime self-claim: session_id has epoch_secs repeated in both halves
-        // (set by UsageTracker::build_uptime_record: [epoch_secs_le || epoch_secs_le]).
-        // Regular trial client session IDs are random UUIDs; probability of false match ≈ 1/2^64.
-        // Skip TrialUsage checks (10 GB cap + 30-day expiry don't apply to relay uptime)
-        // and exclude from TrialMintCap (which is a free-trial-fraud limit, not uptime).
-        let is_relay_self_uptime = release.session_id[..8] == release.session_id[8..];
-
         // Verify Merkle proof.
         let leaf_hash = compute_merkle_leaf_hash_from_release(release);
         if !verify_merkle_proof(leaf_hash, &release.merkle_proof, commitment.merkle_root) {
@@ -1201,79 +1199,79 @@ pub fn process_release_trial_claim_ix(
             return Err(RewardsError::AlreadyReleased.into());
         }
 
-        // Cumulative cap.
+        // Derive value from bytes and the pinned rate; the relay supplies none.
+        let derived_amount = derive_reward_amount(release.total_bytes, commitment.routing_per_mb);
+
+        // Cumulative cap. Capped by bandwidth_amount — the budget releases may
+        // draw on — not the uptime allowance.
         let new_amount = commitment.released_amount
-            .checked_add(release.total_amount)
+            .checked_add(derived_amount)
             .ok_or(RewardsError::ArithmeticOverflow)?;
         let new_bytes = commitment.released_bytes
             .checked_add(release.total_bytes)
             .ok_or(RewardsError::ArithmeticOverflow)?;
-        if new_amount > commitment.total_amount {
+        if new_amount > commitment.bandwidth_amount {
             return Err(RewardsError::ReleaseExceedsCommitment.into());
         }
         if new_bytes > commitment.total_bytes {
             return Err(RewardsError::ReleaseExceedsCommitment.into());
         }
 
-        if !is_relay_self_uptime {
-            // ── Trial client path: enforce TrialUsage PDA (10 GB cap, 30-day expiry) ──
-            let (trial_usage_pda, tu_bump) = Pubkey::find_program_address(
-                &[b"trial_usage", &release.client_pubkey],
-                program_id,
-            );
-            if trial_usage_ai.key != &trial_usage_pda {
+        // ── Trial client path: enforce TrialUsage PDA (10 GB cap, 30-day expiry) ──
+        let (trial_usage_pda, tu_bump) = Pubkey::find_program_address(
+            &[b"trial_usage", &release.client_pubkey],
+            program_id,
+        );
+        if trial_usage_ai.key != &trial_usage_pda {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        if trial_usage_ai.lamports() == 0 {
+            create_pda_account(
+                relay_wallet, trial_usage_ai, system_prog, program_id,
+                &[b"trial_usage", &release.client_pubkey, &[tu_bump]],
+                TRIAL_USAGE_SIZE,
+            )?;
+            let trial_usage = TrialUsage {
+                user_pubkey:   release.client_pubkey,
+                used_bytes:    release.total_bytes,
+                claimed_bytes: 0,
+                device_uuid:   release.device_uuid,
+                first_seen_ts: now,
+                last_usage_ts: now,
+                expires_at:    now + FREE_TRIAL_DURATION_SECS,
+                cap_bytes:     FREE_TRIAL_BYTES,
+                bump:          tu_bump,
+            };
+            save_account(trial_usage_ai, &trial_usage)?;
+        } else {
+            let mut trial_usage: TrialUsage =
+                TrialUsage::try_from_slice(&trial_usage_ai.data.borrow())
+                    .map_err(|_| ProgramError::InvalidAccountData)?;
+
+            if trial_usage.expires_at <= now {
+                return Err(RewardsError::TrialExpired.into());
+            }
+            let new_claimed = trial_usage.claimed_bytes
+                .checked_add(release.total_bytes)
+                .ok_or(RewardsError::ArithmeticOverflow)?;
+            if new_claimed > trial_usage.cap_bytes {
+                return Err(RewardsError::TrialCapExceeded.into());
+            }
+            if trial_usage.device_uuid != release.device_uuid {
                 return Err(ProgramError::InvalidArgument);
             }
-
-            if trial_usage_ai.lamports() == 0 {
-                create_pda_account(
-                    relay_wallet, trial_usage_ai, system_prog, program_id,
-                    &[b"trial_usage", &release.client_pubkey, &[tu_bump]],
-                    TRIAL_USAGE_SIZE,
-                )?;
-                let trial_usage = TrialUsage {
-                    user_pubkey:   release.client_pubkey,
-                    used_bytes:    release.total_bytes,
-                    claimed_bytes: 0,
-                    device_uuid:   release.device_uuid,
-                    first_seen_ts: now,
-                    last_usage_ts: now,
-                    expires_at:    now + FREE_TRIAL_DURATION_SECS,
-                    cap_bytes:     FREE_TRIAL_BYTES,
-                    bump:          tu_bump,
-                };
-                save_account(trial_usage_ai, &trial_usage)?;
-            } else {
-                let mut trial_usage: TrialUsage =
-                    TrialUsage::try_from_slice(&trial_usage_ai.data.borrow())
-                        .map_err(|_| ProgramError::InvalidAccountData)?;
-
-                if trial_usage.expires_at <= now {
-                    return Err(RewardsError::TrialExpired.into());
-                }
-                let new_claimed = trial_usage.claimed_bytes
-                    .checked_add(release.total_bytes)
-                    .ok_or(RewardsError::ArithmeticOverflow)?;
-                if new_claimed > trial_usage.cap_bytes {
-                    return Err(RewardsError::TrialCapExceeded.into());
-                }
-                if trial_usage.device_uuid != release.device_uuid {
-                    return Err(ProgramError::InvalidArgument);
-                }
-                trial_usage.claimed_bytes = new_claimed;
-                trial_usage.used_bytes    = trial_usage.used_bytes
-                    .saturating_add(release.total_bytes);
-                trial_usage.last_usage_ts = now;
-                save_account(trial_usage_ai, &trial_usage)?;
-            }
-
-            // Only trial clients count against TrialMintCap.
-            trial_cap_amount = trial_cap_amount
-                .checked_add(release.total_amount)
-                .ok_or(RewardsError::ArithmeticOverflow)?;
+            trial_usage.claimed_bytes = new_claimed;
+            trial_usage.used_bytes    = trial_usage.used_bytes
+                .saturating_add(release.total_bytes);
+            trial_usage.last_usage_ts = now;
+            save_account(trial_usage_ai, &trial_usage)?;
         }
-        // Relay self-uptime: trial_usage_ai slot is still consumed from the
-        // accounts iterator above but not touched — caller passes a dummy account.
+
+        // Only trial clients count against TrialMintCap.
+        trial_cap_amount = trial_cap_amount
+            .checked_add(derived_amount)
+            .ok_or(RewardsError::ArithmeticOverflow)?;
 
         commitment.released_count  += 1;
         commitment.released_amount  = new_amount;
@@ -1283,7 +1281,7 @@ pub fn process_release_trial_claim_ix(
         save_account(claim_state_ai, &claim_state)?;
 
         total_released_amount = total_released_amount
-            .checked_add(release.total_amount)
+            .checked_add(derived_amount)
             .ok_or(RewardsError::ArithmeticOverflow)?;
         total_released_bytes = total_released_bytes
             .checked_add(release.total_bytes)
@@ -1319,7 +1317,7 @@ pub fn process_release_trial_claim_ix(
             .map_err(|_| ProgramError::InvalidAccountData)?
     };
 
-    // Cap applies only to free-trial client amounts — relay self-uptime is excluded.
+    // Cap applies to all free-trial client amounts released this epoch.
     let new_minted = tmc.minted_so_far
         .checked_add(trial_cap_amount)
         .ok_or(RewardsError::ArithmeticOverflow)?;

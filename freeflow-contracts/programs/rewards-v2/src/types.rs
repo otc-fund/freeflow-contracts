@@ -73,7 +73,6 @@ pub struct ClientReleaseOnChain {
     pub client_pubkey:    [u8; 32],
     pub session_id:       [u8; 16],
     pub batch_nonce:      u64,
-    pub total_amount:     u64,
     pub total_bytes:      u64,
     pub merkle_proof:     Vec<[u8; 32]>,
     pub client_signature: [u8; 64],
