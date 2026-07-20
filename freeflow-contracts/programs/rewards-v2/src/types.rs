@@ -60,7 +60,6 @@ pub enum ClaimCommitmentStatus {
 pub struct ReserveBatchEntry {
     pub client_pubkey:    [u8; 32],
     pub highest_seq:      u64,
-    pub amount:           u64,
     pub bytes:            u64,
     pub merkle_leaf_hash: [u8; 32],
     pub session_id:       [u8; 16],

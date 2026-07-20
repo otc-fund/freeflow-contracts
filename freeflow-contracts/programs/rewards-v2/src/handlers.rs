@@ -408,6 +408,18 @@ pub fn process_reserve_batch_ix(
         // Note: fund_hold PDA is derived by user_escrow program, not rewards-v2.
         // We pass the account as provided; user_escrow validates the seeds internally.
 
+        // Value is derived, never accepted. The relay reports bytes only.
+        // `entry.bytes` is relay-supplied and unbounded within u64, and `routing_per_mb`
+        // is governance-set, so the u128 product can exceed u64::MAX. Saturate rather
+        // than wrap, matching process_commit_claim_ix exactly so the two derivations
+        // cannot drift — bandwidth_amount is the only budget reserves are checked
+        // against, so a wrapped value would corrupt the cap.
+        let derived_amount = (entry.bytes as u128)
+            .saturating_mul(commitment.routing_per_mb as u128)
+            .checked_div(MB_DIVISOR as u128)
+            .unwrap_or(0)
+            .min(u64::MAX as u128) as u64;
+
         // CPI: hold_client_funds.
         cpi_hold_client_funds(
             escrow_program,
@@ -418,7 +430,7 @@ pub fn process_reserve_batch_ix(
             fund_hold_ai,
             spender_registry,
             system_prog,
-            entry.amount,
+            derived_amount,
             claim_hash,
             entry.session_id,
             authority_bump,
@@ -445,12 +457,12 @@ pub fn process_reserve_batch_ix(
         };
 
         reservation.reserved = reservation.reserved
-            .checked_add(entry.amount)
+            .checked_add(derived_amount)
             .ok_or(RewardsError::ArithmeticOverflow)?;
         save_account(reservation_ai, &reservation)?;
 
         total_entry_amount = total_entry_amount
-            .checked_add(entry.amount)
+            .checked_add(derived_amount)
             .ok_or(RewardsError::ArithmeticOverflow)?;
         total_entry_bytes = total_entry_bytes
             .checked_add(entry.bytes)
@@ -460,7 +472,7 @@ pub fn process_reserve_batch_ix(
     }
 
     // Aggregate totals cap check.
-    if total_entry_amount > commitment.total_amount {
+    if total_entry_amount > commitment.bandwidth_amount {
         return Err(RewardsError::ReserveExceedsCommitment.into());
     }
     if total_entry_bytes > commitment.total_bytes {
@@ -474,6 +486,37 @@ pub fn process_reserve_batch_ix(
         claim_epoch, entries.len(), total_entry_amount,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod derive_amount_tests {
+    use super::*;
+
+    fn derive(bytes: u64, routing_per_mb: u64) -> u64 {
+        (bytes as u128)
+            .saturating_mul(routing_per_mb as u128)
+            .checked_div(MB_DIVISOR as u128)
+            .unwrap_or(0)
+            .min(u64::MAX as u128) as u64
+    }
+
+    #[test]
+    fn one_gb_at_default_rate_is_one_flow() {
+        assert_eq!(derive(1_000_000_000, 1_000_000), 1_000_000_000);
+    }
+
+    #[test]
+    fn per_client_sum_never_exceeds_aggregate() {
+        // floor(a/d) + floor(b/d) <= floor((a+b)/d) — the per-entry cap can
+        // never overrun the aggregate bandwidth_amount.
+        let (a, b, rate) = (1_500_001u64, 2_500_001u64, 1_000_000u64);
+        assert!(derive(a, rate) + derive(b, rate) <= derive(a + b, rate));
+    }
+
+    #[test]
+    fn sub_mb_truncates_to_zero() {
+        assert_eq!(derive(999, 1_000_000), 0);
+    }
 }
 
 // ── Helper: compute claim_hash ────────────────────────────────────────────────
