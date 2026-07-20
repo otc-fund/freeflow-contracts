@@ -84,13 +84,17 @@ pub enum RewardsInstruction {
     },
     /// 3: ClientDispute — client disputes forged batches.
     /// Tiered repFlow slash on relay. Client funds released.
+    ///
+    /// `total_amount` was removed: the Merkle leaf no longer commits to a
+    /// currency figure, so the dispute reconstructs the leaf from
+    /// quantities only (client_pubkey, session_id, highest_seq, batch_hash,
+    /// total_bytes, record_count).
     ClientDispute {
         claim_epoch:         u64,
         client_pubkey:       [u8; 32],
         session_id:          [u8; 16],
         batch_nonce:         u64,
         original_batch_hash: [u8; 32],
-        total_amount:        u64,
         total_bytes:         u64,
         record_count:        u32,
         client_signature:    [u8; 64],
@@ -157,11 +161,11 @@ pub fn process_instruction(
 
         RewardsInstruction::ClientDispute {
             claim_epoch, client_pubkey, session_id, batch_nonce,
-            original_batch_hash, total_amount, total_bytes, record_count,
+            original_batch_hash, total_bytes, record_count,
             client_signature, merkle_proof,
         } => handlers::process_client_dispute_ix(
             program_id, accounts, claim_epoch, client_pubkey, session_id, batch_nonce,
-            original_batch_hash, total_amount, total_bytes, record_count,
+            original_batch_hash, total_bytes, record_count,
             client_signature, merkle_proof,
         ),
 

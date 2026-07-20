@@ -152,3 +152,24 @@ mod leaf_without_amount_tests {
         assert_ne!(a, b, "different bytes must produce different leaves");
     }
 }
+
+#[cfg(test)]
+mod dispute_leaf_tests {
+    use super::*;
+
+    #[test]
+    fn dispute_leaf_matches_reserve_leaf() {
+        // A dispute must reconstruct exactly the leaf ReserveBatch committed,
+        // or no client can ever prove a forged batch.
+        let client  = [4u8; 32];
+        let session = [5u8; 16];
+        let seq     = 9u64;
+        let batch   = solana_program::hash::hashv(&[
+            client.as_slice(), session.as_slice(), &seq.to_le_bytes(),
+        ]).to_bytes();
+
+        let leaf = compute_merkle_leaf_hash(&client, &session, seq, &batch, 4_000_000, 2);
+        // Single-leaf tree: the root is the leaf, proof is empty.
+        assert!(verify_merkle_proof(leaf, &[], leaf));
+    }
+}

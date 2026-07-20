@@ -812,7 +812,6 @@ pub fn process_client_dispute_ix(
     session_id:          [u8; 16],
     batch_nonce:         u64,
     original_batch_hash: [u8; 32],
-    total_amount:        u64,
     total_bytes:         u64,
     record_count:        u32,
     client_signature:    [u8; 64],
@@ -877,7 +876,7 @@ pub fn process_client_dispute_ix(
     // fund_hold guard below and the eventual cpi_release_funds call).
     let expected_leaf = compute_merkle_leaf_hash(
         &client_pubkey, &session_id, batch_nonce, &original_batch_hash,
-        total_amount, total_bytes, record_count,
+        total_bytes, record_count,
     );
     let claim_hash = compute_claim_hash(&client_pubkey, &session_id, batch_nonce, &expected_leaf);
 
@@ -1391,6 +1390,7 @@ pub fn process_set_trial_enabled_ix(
         FoundationConfig {
             foundation_wallet: foundation_wallet.key.to_bytes(),
             trial_enabled: enabled,
+            uptime_enabled: true, // default enabled, matches CommitClaim's pre-creation default
             bump: fc_bump,
         }
     } else {
