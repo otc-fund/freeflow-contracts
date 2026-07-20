@@ -1814,8 +1814,10 @@ fn split_relay_treasury(amount: u64) -> (u64, u64) {
 ///   4: token_program
 ///   5: flow_mint          (writable)
 ///   6: service_authority  (mint_authority PDA)
-///   7: reward_relay       (writable)
-///   8: reward_treasury    (writable)
+///   7: reward_relay       (writable) — unconstrained; relay's own 70%
+///   8: reward_treasury    (writable) — MUST be
+///      `ATA(foundation_config.foundation_wallet, flow_mint)` under the classic
+///      SPL Token program, else `InvalidTreasuryAccount`.
 pub fn process_claim_relay_uptime_ix(
     program_id:  &Pubkey,
     accounts:    &[AccountInfo],
@@ -1862,13 +1864,17 @@ pub fn process_claim_relay_uptime_ix(
     if foundation_config_ai.key != &fc_pda {
         return Err(ProgramError::InvalidArgument);
     }
-    let uptime_enabled = if foundation_config_ai.lamports() == 0 {
-        true // config not yet created — default enabled, matches CommitClaim
+    // `None` when the config PDA does not exist yet. Read once — the treasury
+    // constraint below needs `wallet` from the same view.
+    let foundation_config = if foundation_config_ai.lamports() == 0 {
+        None
     } else {
         // Legacy-tolerant — see read_foundation_config_compat. A strict
         // FoundationConfig::try_from_slice fails on the live 34-byte PDA.
-        read_foundation_config_compat(&foundation_config_ai.data.borrow())?.uptime_enabled
+        Some(read_foundation_config_compat(&foundation_config_ai.data.borrow())?)
     };
+    // config not yet created — default enabled, matches CommitClaim
+    let uptime_enabled = foundation_config.as_ref().map_or(true, |fc| fc.uptime_enabled);
     if !uptime_enabled {
         return Err(RewardsError::UptimeRewardsDisabled.into());
     }
@@ -1887,6 +1893,43 @@ pub fn process_claim_relay_uptime_ix(
     if repflow_balance < MIN_RELAY_REPFLOW {
         return Err(RewardsError::RepFlowGateNotMet.into());
     }
+
+    // Pin the 30% share to the foundation's own token account.
+    //
+    // `cpi_mint_flow` validates nothing about its destination, so without this
+    // a relay could pass a second account it controls as `reward_treasury` and
+    // keep 100% of its uptime reward instead of 70%.
+    //
+    // Derived from `foundation_config.foundation_wallet` rather than hardcoded
+    // so the constraint survives a treasury or foundation-wallet rotation with
+    // no program upgrade. $FLOW is a classic SPL mint — see SPL_TOKEN_PROGRAM_ID.
+    //
+    // Fail closed when the config PDA is absent: there is no wallet to derive
+    // from, and paying an unconstrained treasury is exactly the hole this
+    // closes. The live PDA exists, so no real claim is affected.
+    let foundation_wallet = foundation_config
+        .as_ref()
+        .map(|fc| fc.wallet)
+        .ok_or(RewardsError::InvalidTreasuryAccount)?;
+    let (expected_treasury, _) = Pubkey::find_program_address(
+        &[
+            foundation_wallet.as_ref(),
+            SPL_TOKEN_PROGRAM_ID.as_ref(),
+            flow_mint.key.as_ref(),
+        ],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    );
+    if reward_treasury.key != &expected_treasury {
+        msg!(
+            "ClaimRelayUptime: reward_treasury {} is not the foundation ATA {}",
+            reward_treasury.key, expected_treasury,
+        );
+        return Err(RewardsError::InvalidTreasuryAccount.into());
+    }
+    // NOTE: `reward_relay` is deliberately NOT constrained. The relay is the
+    // legitimate beneficiary of its own 70%, so directing that to any account
+    // it controls harms nobody, and requiring an ATA there would break relays
+    // paid into a non-ATA token account.
 
     let (_, authority_bump) = Pubkey::find_program_address(&[b"mint_authority"], program_id);
     let (relay_amount, treasury_amount) = split_relay_treasury(amount);
@@ -1958,6 +2001,7 @@ mod claim_relay_uptime_tests {
 #[cfg(test)]
 mod claim_relay_uptime_integration_tests {
     use super::*;
+    use solana_program::{program_option::COption, program_pack::Pack};
     use solana_program_test::*;
     use solana_sdk::{
         account::Account,
@@ -2057,6 +2101,30 @@ mod claim_relay_uptime_integration_tests {
         claim_epoch:       u64,
     ) -> Instruction {
         let stub = Keypair::new().pubkey();
+        claim_relay_uptime_ix_full(
+            relay, commitment_pk, foundation_cfg_pk, repflow_user_pk,
+            stub /* token_program */, stub /* flow_mint */,
+            stub /* service_authority */, stub /* reward_relay */,
+            stub /* reward_treasury */, claim_epoch,
+        )
+    }
+
+    /// Same instruction with every account under test control, so the mint-path
+    /// tests can supply a real SPL mint, a real token program, and a chosen
+    /// `reward_treasury`.
+    #[allow(clippy::too_many_arguments)]
+    fn claim_relay_uptime_ix_full(
+        relay:             &Keypair,
+        commitment_pk:     Pubkey,
+        foundation_cfg_pk: Pubkey,
+        repflow_user_pk:   Pubkey,
+        token_program_pk:  Pubkey,
+        flow_mint_pk:      Pubkey,
+        service_auth_pk:   Pubkey,
+        reward_relay_pk:   Pubkey,
+        reward_treasury_pk: Pubkey,
+        claim_epoch:       u64,
+    ) -> Instruction {
         Instruction {
             program_id: id(),
             accounts: vec![
@@ -2064,14 +2132,63 @@ mod claim_relay_uptime_integration_tests {
                 AccountMeta::new(commitment_pk, false),              // [1] commitment
                 AccountMeta::new_readonly(foundation_cfg_pk, false), // [2] foundation_config
                 AccountMeta::new_readonly(repflow_user_pk, false),   // [3] relay_repflow_user
-                AccountMeta::new_readonly(stub, false),              // [4] token_program
-                AccountMeta::new(stub, false),                       // [5] flow_mint
-                AccountMeta::new_readonly(stub, false),              // [6] service_authority
-                AccountMeta::new(stub, false),                       // [7] reward_relay
-                AccountMeta::new(stub, false),                       // [8] reward_treasury
+                AccountMeta::new_readonly(token_program_pk, false),  // [4] token_program
+                AccountMeta::new(flow_mint_pk, false),               // [5] flow_mint
+                AccountMeta::new_readonly(service_auth_pk, false),   // [6] service_authority
+                AccountMeta::new(reward_relay_pk, false),            // [7] reward_relay
+                AccountMeta::new(reward_treasury_pk, false),         // [8] reward_treasury
             ],
             data: encode_ix(&RewardsInstruction::ClaimRelayUptime { claim_epoch }),
         }
+    }
+
+    /// The address the handler derives for `reward_treasury`. Written out here
+    /// rather than reusing the handler's own constants so the test would catch
+    /// a wrong program id baked into `constants.rs`.
+    fn foundation_ata(foundation_wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
+        let ata_program = Pubkey::new_from_array([
+            140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131,
+            11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
+        ]);
+        Pubkey::find_program_address(
+            &[foundation_wallet.as_ref(), spl_token::id().as_ref(), mint.as_ref()],
+            &ata_program,
+        ).0
+    }
+
+    /// A real, initialized SPL mint whose mint authority is the program's
+    /// `mint_authority` PDA — what `cpi_mint_flow` signs as.
+    fn flow_mint_account(mint_authority: &Pubkey) -> Account {
+        let mut data = vec![0u8; spl_token::state::Mint::LEN];
+        spl_token::state::Mint {
+            mint_authority: COption::Some(*mint_authority),
+            supply: 0,
+            decimals: FLOW_DECIMALS as u8,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        }.pack_into_slice(&mut data);
+        Account { lamports: 10_000_000, data, owner: spl_token::id(), executable: false, rent_epoch: 0 }
+    }
+
+    /// A real, initialized SPL token account holding zero of `mint`.
+    fn spl_token_account(mint: &Pubkey, owner: &Pubkey) -> Account {
+        let mut data = vec![0u8; spl_token::state::Account::LEN];
+        spl_token::state::Account {
+            mint: *mint,
+            owner: *owner,
+            amount: 0,
+            delegate: COption::None,
+            state: spl_token::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        }.pack_into_slice(&mut data);
+        Account { lamports: 10_000_000, data, owner: spl_token::id(), executable: false, rent_epoch: 0 }
+    }
+
+    async fn token_balance(banks: &mut BanksClient, pk: Pubkey) -> u64 {
+        let acct = banks.get_account(pk).await.expect("rpc").expect("token account exists");
+        spl_token::state::Account::unpack(&acct.data).expect("unpack token account").amount
     }
 
     async fn fund(banks: &mut BanksClient, payer: &Keypair, relay: &Pubkey, bh: solana_sdk::hash::Hash) {
@@ -2215,6 +2332,121 @@ mod claim_relay_uptime_integration_tests {
             &[ix], Some(&relay.pubkey()), &[&relay], bh,
         )).await;
         assert!(result.is_err(), "commitment account not at the derived PDA must be rejected");
+    }
+
+    /// Shared fixture for the two treasury-constraint tests. Everything is
+    /// identical between them except which account is passed as
+    /// `reward_treasury`, so the only variable driving the outcome is the
+    /// constraint under test.
+    struct UptimeMintFixture {
+        relay:        Keypair,
+        foundation:   Pubkey,
+        claim_epoch:  u64,
+        amount:       u64,
+        flow_mint:    Pubkey,
+        service_auth: Pubkey,
+        relay_token:  Pubkey,
+        c_pda:        Pubkey,
+        fc_pda:       Pubkey,
+        repflow_pk:   Pubkey,
+        pt:           ProgramTest,
+    }
+
+    fn uptime_mint_fixture(claim_epoch: u64) -> UptimeMintFixture {
+        let relay       = Keypair::new();
+        let foundation  = Keypair::new().pubkey();
+        let amount      = 10_000_000_000u64; // 10 $FLOW → 7 relay / 3 treasury
+        let (c_pda, c_bump)   = commitment_pda(&relay.pubkey(), claim_epoch);
+        let (fc_pda, fc_bump) = foundation_config_pda();
+        let (service_auth, _) = Pubkey::find_program_address(&[b"mint_authority"], &id());
+        let flow_mint   = Keypair::new().pubkey();
+        // Deliberately NOT an ATA: reward_relay is unconstrained by design.
+        let relay_token = Keypair::new().pubkey();
+        let repflow_pk  = Keypair::new().pubkey();
+
+        let mut pt = program_test();
+        pt.add_account(c_pda, commitment_account(&relay.pubkey(), claim_epoch, amount, false, c_bump));
+        pt.add_account(fc_pda, foundation_config_account(&foundation, true, fc_bump));
+        pt.add_account(repflow_pk, repflow_user_account(MIN_RELAY_REPFLOW));
+        pt.add_account(flow_mint, flow_mint_account(&service_auth));
+        pt.add_account(relay_token, spl_token_account(&flow_mint, &relay.pubkey()));
+
+        UptimeMintFixture {
+            relay, foundation, claim_epoch, amount, flow_mint, service_auth,
+            relay_token, c_pda, fc_pda, repflow_pk, pt,
+        }
+    }
+
+    /// Happy path: `reward_treasury` is the correctly derived foundation ATA,
+    /// so the claim mints 70% to the relay and 30% to the foundation. This runs
+    /// all the way through the SPL-Token mint CPI (ProgramTest ships the token
+    /// program in genesis), so it proves the constraint admits the real payout
+    /// rather than merely matching a constant.
+    #[tokio::test]
+    async fn foundation_ata_treasury_mints_seventy_thirty() {
+        let f = uptime_mint_fixture(505);
+        let treasury = foundation_ata(&f.foundation, &f.flow_mint);
+
+        let mut pt = f.pt;
+        pt.add_account(treasury, spl_token_account(&f.flow_mint, &f.foundation));
+
+        let (mut banks, payer, bh) = pt.start().await;
+        fund(&mut banks, &payer, &f.relay.pubkey(), bh).await;
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let ix = claim_relay_uptime_ix_full(
+            &f.relay, f.c_pda, f.fc_pda, f.repflow_pk, spl_token::id(),
+            f.flow_mint, f.service_auth, f.relay_token, treasury, f.claim_epoch,
+        );
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&f.relay.pubkey()), &[&f.relay], bh,
+        )).await.expect("claim with the derived foundation ATA must succeed");
+
+        let (want_relay, want_treasury) = split_relay_treasury(f.amount);
+        assert_eq!(token_balance(&mut banks, f.relay_token).await, want_relay, "relay gets 70%");
+        assert_eq!(token_balance(&mut banks, treasury).await, want_treasury, "foundation gets 30%");
+
+        let acct = banks.get_account(f.c_pda).await.expect("rpc").expect("commitment exists");
+        let c = ClaimCommitment::try_from_slice(&acct.data[..CLAIM_COMMITMENT_SIZE]).expect("deser");
+        assert!(c.uptime_paid, "successful claim must latch uptime_paid");
+    }
+
+    /// The skim this constraint exists to stop: a relay passes a second token
+    /// account **it owns** as `reward_treasury` to capture the foundation's 30%
+    /// on top of its own 70%. Must be rejected with `InvalidTreasuryAccount`,
+    /// and nothing may be minted.
+    #[tokio::test]
+    async fn attacker_controlled_treasury_is_rejected() {
+        let f = uptime_mint_fixture(506);
+        // Owned by the relay, not the foundation — and not at the ATA address.
+        let attacker_treasury = Keypair::new().pubkey();
+
+        let mut pt = f.pt;
+        pt.add_account(attacker_treasury, spl_token_account(&f.flow_mint, &f.relay.pubkey()));
+
+        let (mut banks, payer, bh) = pt.start().await;
+        fund(&mut banks, &payer, &f.relay.pubkey(), bh).await;
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let ix = claim_relay_uptime_ix_full(
+            &f.relay, f.c_pda, f.fc_pda, f.repflow_pk, spl_token::id(),
+            f.flow_mint, f.service_auth, f.relay_token, attacker_treasury, f.claim_epoch,
+        );
+        let err = banks.process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&f.relay.pubkey()), &[&f.relay], bh,
+        )).await.expect_err("attacker-supplied reward_treasury must be rejected");
+
+        let want = format!("Custom({})", RewardsError::InvalidTreasuryAccount as u32);
+        let got  = format!("{err:?}");
+        assert!(got.contains(&want), "expected {want}, got {got}");
+
+        // Fail-closed: the relay's own 70% must not be minted either.
+        assert_eq!(token_balance(&mut banks, f.relay_token).await, 0, "no relay mint on reject");
+        assert_eq!(token_balance(&mut banks, attacker_treasury).await, 0, "no treasury mint on reject");
+
+        let acct = banks.get_account(f.c_pda).await.expect("rpc").expect("commitment exists");
+        let c = ClaimCommitment::try_from_slice(&acct.data[..CLAIM_COMMITMENT_SIZE]).expect("deser");
+        assert!(!c.uptime_paid, "rejected claim must not latch uptime_paid");
     }
 }
 

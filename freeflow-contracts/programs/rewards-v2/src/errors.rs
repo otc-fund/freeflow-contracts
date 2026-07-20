@@ -71,6 +71,11 @@ pub enum RewardsError {
     UptimeAlreadyPaid              = 48,
     /// relay_meta account is not the expected PDA.
     RelayMetaInvalid               = 49,
+
+    /// `reward_treasury` is not the foundation wallet's associated token
+    /// account for the mint being paid. Appended — never renumber the
+    /// variants above: deployed off-chain code maps these by number.
+    InvalidTreasuryAccount         = 50,
 }
 
 impl From<RewardsError> for ProgramError {

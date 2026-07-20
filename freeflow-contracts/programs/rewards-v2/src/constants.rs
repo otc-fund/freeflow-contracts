@@ -13,6 +13,28 @@
 //!   today but could move to `FoundationConfig` in a future upgrade.
 //!   See `docs/FOUNDATION-GOVERNANCE.md` for the migration plan.
 
+use solana_program::pubkey::Pubkey;
+
+/// Classic SPL Token program (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`).
+///
+/// $FLOW is a **classic** SPL mint, not Token-2022 — the live mint
+/// `7w6YxBZmXMZfuS4PJCwDmY5hX98RrpnR7xNEV9Ugwzxc` and the foundation's token
+/// account are both owned by this program. Deriving the foundation ATA with
+/// the Token-2022 id instead would produce an address that does not exist.
+pub const SPL_TOKEN_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
+    6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172,
+    28, 180, 133, 237, 95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
+]);
+
+/// Associated Token Account program (`ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`).
+///
+/// Used only to *derive* the expected foundation treasury address in
+/// `process_claim_relay_uptime_ix`; the program is never CPI'd into.
+pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
+    140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131,
+    11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
+]);
+
 /// Seconds per epoch (12 hours).
 pub const EPOCH_SECS: u64 = 43_200;
 
