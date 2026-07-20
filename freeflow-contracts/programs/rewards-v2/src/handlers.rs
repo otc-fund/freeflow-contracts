@@ -203,9 +203,9 @@ pub fn process_commit_claim_ix(
     let uptime_enabled = if foundation_config_ai.lamports() == 0 {
         true // config not yet created — default enabled
     } else {
-        FoundationConfig::try_from_slice(&foundation_config_ai.data.borrow())
-            .map_err(|_| ProgramError::InvalidAccountData)?
-            .uptime_enabled
+        // Legacy-tolerant: the live PDA may still be the pre-upgrade 34-byte
+        // layout (no `uptime_enabled` field). See read_foundation_config_compat.
+        read_foundation_config_compat(&foundation_config_ai.data.borrow())?.uptime_enabled
     };
 
     let clock = Clock::get()?;
@@ -1137,10 +1137,8 @@ pub fn process_release_trial_claim_ix(
         return Err(RewardsError::EpochComplete.into());
     }
 
-    // Check foundation kill switch.
-    let foundation_config: FoundationConfig =
-        FoundationConfig::try_from_slice(&foundation_config_ai.data.borrow())
-            .map_err(|_| ProgramError::InvalidAccountData)?;
+    // Check foundation kill switch. Legacy-tolerant — see read_foundation_config_compat.
+    let foundation_config = read_foundation_config_compat(&foundation_config_ai.data.borrow())?;
     if !foundation_config.trial_enabled {
         return Err(RewardsError::TrialDisabled.into());
     }
@@ -1402,13 +1400,28 @@ pub fn process_set_trial_enabled_ix(
             bump: fc_bump,
         }
     } else {
-        let fc = FoundationConfig::try_from_slice(&foundation_config_ai.data.borrow())
-            .map_err(|_| ProgramError::InvalidAccountData)?;
+        // Legacy-tolerant read — see read_foundation_config_compat. NOTE: the
+        // write below is intentionally left strict: if this account is still
+        // the pre-upgrade 34-byte layout, `save_account` will fail with
+        // AccountDataTooSmall rather than silently reallocing. Unlike
+        // SetUptimeEnabled (whose accounts already document foundation_wallet
+        // as writable to fund a rent top-up), SetTrialEnabled's account list
+        // only requires foundation_wallet to be a signer — quietly debiting it
+        // here would add an undocumented writability requirement that existing
+        // off-chain callers may not satisfy. Operators should call
+        // SetUptimeEnabled once (it self-migrates the account in place) before
+        // relying on SetTrialEnabled against an unmigrated account.
+        let view = read_foundation_config_compat(&foundation_config_ai.data.borrow())?;
         // Only the registered foundation wallet can toggle.
-        if fc.foundation_wallet != foundation_wallet.key.to_bytes() {
+        if view.wallet != foundation_wallet.key.to_bytes() {
             return Err(ProgramError::IllegalOwner);
         }
-        FoundationConfig { trial_enabled: enabled, ..fc }
+        FoundationConfig {
+            foundation_wallet: view.wallet,
+            trial_enabled: enabled,
+            uptime_enabled: view.uptime_enabled,
+            bump: view.bump,
+        }
     };
 
     save_account(foundation_config_ai, &fc)?;
@@ -1453,11 +1466,9 @@ pub fn process_slash_trial_fraud_ix(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // Verify foundation authority.
-    let fc: FoundationConfig =
-        FoundationConfig::try_from_slice(&foundation_config_ai.data.borrow())
-            .map_err(|_| ProgramError::InvalidAccountData)?;
-    if fc.foundation_wallet != foundation_wallet.key.to_bytes() {
+    // Verify foundation authority. Legacy-tolerant — see read_foundation_config_compat.
+    let fc = read_foundation_config_compat(&foundation_config_ai.data.borrow())?;
+    if fc.wallet != foundation_wallet.key.to_bytes() {
         return Err(ProgramError::IllegalOwner);
     }
 
@@ -1539,9 +1550,9 @@ fn require_foundation_signer(
     if foundation_config_ai.key != &fc_pda || foundation_config_ai.lamports() == 0 {
         return Err(ProgramError::InvalidArgument);
     }
-    let fc = FoundationConfig::try_from_slice(&foundation_config_ai.data.borrow())
-        .map_err(|_| ProgramError::InvalidAccountData)?;
-    if fc.foundation_wallet != signer.key.to_bytes() {
+    // Legacy-tolerant — see read_foundation_config_compat.
+    let fc = read_foundation_config_compat(&foundation_config_ai.data.borrow())?;
+    if fc.wallet != signer.key.to_bytes() {
         return Err(ProgramError::IllegalOwner);
     }
     Ok(())
@@ -1664,8 +1675,25 @@ const FOUNDATION_CONFIG_SIZE_LEGACY: usize = 34;
 
 const _: () = assert!(FOUNDATION_CONFIG_SIZE_LEGACY + 1 == FOUNDATION_CONFIG_SIZE);
 
-/// Read `(foundation_wallet, trial_enabled, bump)` from a raw foundation_config
-/// buffer, tolerating both the pre- and post-upgrade layouts.
+/// Fields read from a raw `foundation_config` buffer by `read_foundation_config_compat`,
+/// tolerating both the pre- and post-upgrade on-chain layouts. A named struct
+/// instead of a tuple so call sites read clearly (`view.uptime_enabled`, not
+/// positional `.2`).
+struct FoundationConfigView {
+    wallet:         [u8; 32],
+    trial_enabled:  bool,
+    uptime_enabled: bool,
+    bump:           u8,
+}
+
+/// Read `foundation_wallet`, `trial_enabled`, `uptime_enabled`, and `bump` from
+/// a raw foundation_config buffer, tolerating both the pre- and post-upgrade
+/// layouts.
+///
+/// On a legacy 34-byte buffer `uptime_enabled` defaults to `true`: a legacy
+/// account predates the kill switch entirely, and defaulting to enabled
+/// preserves existing behaviour (uptime rewards keep flowing) rather than
+/// silently stopping rewards the instant the upgraded program runs.
 ///
 /// **This must be called BEFORE any realloc, and the fields must be read by
 /// explicit offset rather than by deserialising the current struct.** The new
@@ -1674,19 +1702,19 @@ const _: () = assert!(FOUNDATION_CONFIG_SIZE_LEGACY + 1 == FOUNDATION_CONFIG_SIZ
 /// would read the old `bump` as `uptime_enabled` and the fresh zero byte at
 /// index 34 as `bump`, permanently destroying the PDA's bump seed on the live
 /// foundation config.
-fn read_foundation_config_compat(data: &[u8]) -> Result<([u8; 32], bool, u8), ProgramError> {
+fn read_foundation_config_compat(data: &[u8]) -> Result<FoundationConfigView, ProgramError> {
     if data.len() < FOUNDATION_CONFIG_SIZE_LEGACY {
         return Err(ProgramError::InvalidAccountData);
     }
     let mut wallet = [0u8; 32];
     wallet.copy_from_slice(&data[0..32]);
     let trial_enabled = data[32] != 0;
-    let bump = if data.len() >= FOUNDATION_CONFIG_SIZE {
-        data[34] // already migrated
+    let (uptime_enabled, bump) = if data.len() >= FOUNDATION_CONFIG_SIZE {
+        (data[33] != 0, data[34]) // already migrated
     } else {
-        data[33] // pre-upgrade layout
+        (true, data[33]) // pre-upgrade layout predates the kill switch — default enabled
     };
-    Ok((wallet, trial_enabled, bump))
+    Ok(FoundationConfigView { wallet, trial_enabled, uptime_enabled, bump })
 }
 
 /// 11: SetUptimeEnabled — foundation-only kill switch for relay uptime rewards.
@@ -1735,14 +1763,14 @@ pub fn process_set_uptime_enabled_ix(
         // Read the surviving fields by explicit offset BEFORE the realloc. The
         // borrow is scoped so it is dropped here: `realloc` takes
         // `data.borrow_mut()` internally and panics on an outstanding borrow.
-        let (wallet, trial_enabled, bump) = {
+        let view = {
             let data = foundation_config_ai.data.borrow();
             read_foundation_config_compat(&data)?
         };
 
         // Only the registered foundation wallet can toggle. Checked before the
         // realloc so an unauthorised caller never funds a rent top-up.
-        if wallet != foundation_wallet.key.to_bytes() {
+        if view.wallet != foundation_wallet.key.to_bytes() {
             return Err(ProgramError::IllegalOwner);
         }
 
@@ -1768,10 +1796,10 @@ pub fn process_set_uptime_enabled_ix(
         }
 
         FoundationConfig {
-            foundation_wallet: wallet,
-            trial_enabled,
+            foundation_wallet: view.wallet,
+            trial_enabled: view.trial_enabled,
             uptime_enabled: enabled,
-            bump,
+            bump: view.bump,
         }
     };
 
@@ -1816,25 +1844,48 @@ mod foundation_config_migration_tests {
 
     #[test]
     fn legacy_34_byte_buffer_yields_correct_bump() {
-        let (w, trial, bump) = read_foundation_config_compat(&legacy_buf(true, BUMP)).unwrap();
-        assert_eq!(w, WALLET);
-        assert!(trial);
-        assert_eq!(bump, BUMP, "bump must be read from index 33 on the old layout");
+        let view = read_foundation_config_compat(&legacy_buf(true, BUMP)).unwrap();
+        assert_eq!(view.wallet, WALLET);
+        assert!(view.trial_enabled);
+        assert_eq!(view.bump, BUMP, "bump must be read from index 33 on the old layout");
     }
 
     #[test]
     fn new_35_byte_buffer_yields_correct_bump() {
-        let (w, trial, bump) = read_foundation_config_compat(&new_buf(true, false, BUMP)).unwrap();
-        assert_eq!(w, WALLET);
-        assert!(trial);
-        assert_eq!(bump, BUMP, "bump must be read from index 34 on the new layout");
+        let view = read_foundation_config_compat(&new_buf(true, false, BUMP)).unwrap();
+        assert_eq!(view.wallet, WALLET);
+        assert!(view.trial_enabled);
+        assert_eq!(view.bump, BUMP, "bump must be read from index 34 on the new layout");
     }
 
     #[test]
     fn legacy_trial_disabled_round_trips() {
-        let (_, trial, bump) = read_foundation_config_compat(&legacy_buf(false, 251)).unwrap();
-        assert!(!trial);
-        assert_eq!(bump, 251);
+        let view = read_foundation_config_compat(&legacy_buf(false, 251)).unwrap();
+        assert!(!view.trial_enabled);
+        assert_eq!(view.bump, 251);
+    }
+
+    /// A legacy 34-byte account predates the uptime kill switch entirely, so
+    /// the compat reader must default `uptime_enabled` to `true` — otherwise
+    /// the very first CommitClaim against an unmigrated live account would
+    /// silently stop paying uptime rewards instead of just being tolerant of
+    /// the missing field.
+    #[test]
+    fn legacy_34_byte_buffer_defaults_uptime_enabled_true() {
+        let view = read_foundation_config_compat(&legacy_buf(true, BUMP)).unwrap();
+        assert!(view.uptime_enabled, "legacy accounts must default to uptime rewards enabled");
+    }
+
+    /// Once migrated, the real stored `uptime_enabled` value must round-trip —
+    /// both when it is explicitly `false` (kill switch engaged) and `true`,
+    /// so the default-true fallback above never masks a real toggle.
+    #[test]
+    fn new_35_byte_buffer_round_trips_real_uptime_enabled_value() {
+        let disabled = read_foundation_config_compat(&new_buf(true, false, BUMP)).unwrap();
+        assert!(!disabled.uptime_enabled, "explicit false must not be overridden by the legacy default");
+
+        let enabled = read_foundation_config_compat(&new_buf(true, true, BUMP)).unwrap();
+        assert!(enabled.uptime_enabled);
     }
 
     /// Pins the bug that a post-realloc reparse would ship: realloc first, then
@@ -1855,8 +1906,8 @@ mod foundation_config_migration_tests {
         assert!(corrupted.uptime_enabled, "the old bump byte was misread as uptime_enabled");
 
         // The offset reader, given the same pre-realloc bytes, keeps the bump.
-        let (_, _, bump) = read_foundation_config_compat(&legacy_buf(true, 1)).unwrap();
-        assert_eq!(bump, 1);
+        let view = read_foundation_config_compat(&legacy_buf(true, 1)).unwrap();
+        assert_eq!(view.bump, 1);
     }
 
     /// With a canonical high bump the same reparse instead hard-fails: 254 is
@@ -1873,8 +1924,8 @@ mod foundation_config_migration_tests {
         );
 
         // The offset reader handles it without complaint.
-        let (_, _, bump) = read_foundation_config_compat(&legacy_buf(true, BUMP)).unwrap();
-        assert_eq!(bump, BUMP);
+        let view = read_foundation_config_compat(&legacy_buf(true, BUMP)).unwrap();
+        assert_eq!(view.bump, BUMP);
     }
 
     /// Borsh derives the discriminant from declaration order, so inserting a
@@ -1905,9 +1956,9 @@ mod foundation_config_migration_tests {
     fn oversized_buffer_still_reads_bump_at_34() {
         let mut buf = new_buf(false, true, BUMP);
         buf.extend_from_slice(&[0xFF; 8]);
-        let (_, trial, bump) = read_foundation_config_compat(&buf).unwrap();
-        assert!(!trial);
-        assert_eq!(bump, BUMP);
+        let view = read_foundation_config_compat(&buf).unwrap();
+        assert!(!view.trial_enabled);
+        assert_eq!(view.bump, BUMP);
     }
 }
 
