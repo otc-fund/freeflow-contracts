@@ -12,6 +12,10 @@
 //!   5  ReleaseTrialClaim   — direct mint for free trial users (no burn)
 //!   6  SetTrialEnabled     — foundation kill switch for trial releases
 //!   7  SlashTrialFraud     — foundation slashes relay for fabricated trial claims
+//!   8  InitializeRewardRates — foundation creates the reward_rates PDA
+//!   9  UpdateRewardRates   — foundation updates the reward_rates PDA
+//!  10  (reserved)          — ClaimRelayUptime
+//!  11  SetUptimeEnabled    — foundation kill switch for relay uptime rewards
 //!
 //! ## Architecture
 //!   - Raw Borsh (no Anchor) — matches the legacy rewards program style
@@ -136,6 +140,18 @@ pub enum RewardsInstruction {
         uptime_per_hour:  u64,
         flow_price_cents: u64,
     },
+    /// 10: reserved for ClaimRelayUptime.
+    ///
+    /// Borsh derives the discriminant from declaration order and the variants
+    /// carry fields, so Rust will not accept an explicit discriminant — slot 10
+    /// has to be physically occupied for SetUptimeEnabled to land on 11. This
+    /// placeholder is replaced by the real ClaimRelayUptime handler; until then
+    /// it is rejected as invalid instruction data.
+    ReservedClaimRelayUptime,
+    /// 11: SetUptimeEnabled — foundation-only kill switch for uptime rewards.
+    SetUptimeEnabled {
+        enabled: bool,
+    },
 }
 
 pub fn process_instruction(
@@ -194,5 +210,11 @@ pub fn process_instruction(
         } => handlers::process_update_reward_rates(
             program_id, accounts, routing_per_mb, seeding_per_mb, uptime_per_hour, flow_price_cents,
         ),
+
+        RewardsInstruction::ReservedClaimRelayUptime =>
+            Err(ProgramError::InvalidInstructionData),
+
+        RewardsInstruction::SetUptimeEnabled { enabled } =>
+            handlers::process_set_uptime_enabled_ix(program_id, accounts, enabled),
     }
 }

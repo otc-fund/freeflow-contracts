@@ -20,7 +20,7 @@ use solana_program::{
     entrypoint::ProgramResult,
     hash::hashv,
     msg,
-    program::invoke_signed,
+    program::{invoke, invoke_signed},
     program_error::ProgramError,
     pubkey::Pubkey,
     rent::Rent,
@@ -1651,6 +1651,264 @@ pub fn process_update_reward_rates(
         rates.routing_per_mb, rates.uptime_per_hour, rates.change_count,
     );
     Ok(())
+}
+
+// ── 11: SetUptimeEnabled ─────────────────────────────────────────────────────
+
+/// Size of the pre-upgrade `FoundationConfig` account, before `uptime_enabled`
+/// was inserted. The live PDA on devnet/mainnet is still this size.
+///
+///   old (34): foundation_wallet[0..32] | trial_enabled[32] | bump[33]
+///   new (35): foundation_wallet[0..32] | trial_enabled[32] | uptime_enabled[33] | bump[34]
+const FOUNDATION_CONFIG_SIZE_LEGACY: usize = 34;
+
+const _: () = assert!(FOUNDATION_CONFIG_SIZE_LEGACY + 1 == FOUNDATION_CONFIG_SIZE);
+
+/// Read `(foundation_wallet, trial_enabled, bump)` from a raw foundation_config
+/// buffer, tolerating both the pre- and post-upgrade layouts.
+///
+/// **This must be called BEFORE any realloc, and the fields must be read by
+/// explicit offset rather than by deserialising the current struct.** The new
+/// struct inserts `uptime_enabled` at byte 33 — exactly where the old layout
+/// stored `bump`. Reallocing first and then parsing with `FoundationConfig`
+/// would read the old `bump` as `uptime_enabled` and the fresh zero byte at
+/// index 34 as `bump`, permanently destroying the PDA's bump seed on the live
+/// foundation config.
+fn read_foundation_config_compat(data: &[u8]) -> Result<([u8; 32], bool, u8), ProgramError> {
+    if data.len() < FOUNDATION_CONFIG_SIZE_LEGACY {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut wallet = [0u8; 32];
+    wallet.copy_from_slice(&data[0..32]);
+    let trial_enabled = data[32] != 0;
+    let bump = if data.len() >= FOUNDATION_CONFIG_SIZE {
+        data[34] // already migrated
+    } else {
+        data[33] // pre-upgrade layout
+    };
+    Ok((wallet, trial_enabled, bump))
+}
+
+/// 11: SetUptimeEnabled — foundation-only kill switch for relay uptime rewards.
+///
+/// Separate from the rate because zero is unrepresentable: UpdateRewardRates
+/// treats `uptime_per_hour == 0` as "keep existing", so an operator zeroing the
+/// rate would get a success response while the old rate silently persisted.
+///
+/// Accounts:
+///   0: foundation_wallet  (signer, writable — funds the rent top-up)
+///   1: foundation_config  (writable, PDA [b"foundation_config"])
+///   2: system_program
+pub fn process_set_uptime_enabled_ix(
+    program_id: &Pubkey,
+    accounts:   &[AccountInfo],
+    enabled:    bool,
+) -> ProgramResult {
+    let iter                 = &mut accounts.iter();
+    let foundation_wallet    = next_account_info(iter)?;
+    let foundation_config_ai = next_account_info(iter)?;
+    let system_prog          = next_account_info(iter)?;
+
+    if !foundation_wallet.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let (fc_pda, fc_bump) = Pubkey::find_program_address(&[b"foundation_config"], program_id);
+    if foundation_config_ai.key != &fc_pda {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let fc: FoundationConfig = if foundation_config_ai.lamports() == 0 {
+        // First call — initialise config (foundation wallet becomes the authority).
+        create_pda_account(
+            foundation_wallet, foundation_config_ai, system_prog, program_id,
+            &[b"foundation_config", &[fc_bump]],
+            FOUNDATION_CONFIG_SIZE,
+        )?;
+        FoundationConfig {
+            foundation_wallet: foundation_wallet.key.to_bytes(),
+            trial_enabled:  true, // default enabled, matches SetTrialEnabled's default
+            uptime_enabled: enabled,
+            bump: fc_bump,
+        }
+    } else {
+        // Read the surviving fields by explicit offset BEFORE the realloc. The
+        // borrow is scoped so it is dropped here: `realloc` takes
+        // `data.borrow_mut()` internally and panics on an outstanding borrow.
+        let (wallet, trial_enabled, bump) = {
+            let data = foundation_config_ai.data.borrow();
+            read_foundation_config_compat(&data)?
+        };
+
+        // Only the registered foundation wallet can toggle. Checked before the
+        // realloc so an unauthorised caller never funds a rent top-up.
+        if wallet != foundation_wallet.key.to_bytes() {
+            return Err(ProgramError::IllegalOwner);
+        }
+
+        // The pre-upgrade account is one byte short of the new struct;
+        // save_account would fail with AccountDataTooSmall.
+        if foundation_config_ai.data_len() < FOUNDATION_CONFIG_SIZE {
+            let needed = Rent::get()?
+                .minimum_balance(FOUNDATION_CONFIG_SIZE)
+                .saturating_sub(foundation_config_ai.lamports());
+            if needed > 0 {
+                invoke(
+                    &system_instruction::transfer(
+                        foundation_wallet.key, foundation_config_ai.key, needed,
+                    ),
+                    &[
+                        foundation_wallet.clone(),
+                        foundation_config_ai.clone(),
+                        system_prog.clone(),
+                    ],
+                )?;
+            }
+            foundation_config_ai.realloc(FOUNDATION_CONFIG_SIZE, false)?;
+        }
+
+        FoundationConfig {
+            foundation_wallet: wallet,
+            trial_enabled,
+            uptime_enabled: enabled,
+            bump,
+        }
+    };
+
+    save_account(foundation_config_ai, &fc)?;
+    msg!("SetUptimeEnabled: uptime_enabled = {}", enabled);
+    Ok(())
+}
+
+#[cfg(test)]
+mod foundation_config_migration_tests {
+    use super::*;
+
+    const WALLET: [u8; 32] = [0xAB; 32];
+    const BUMP:   u8       = 254;
+
+    /// Pre-upgrade on-chain layout: 34 bytes, bump at index 33.
+    fn legacy_buf(trial_enabled: bool, bump: u8) -> Vec<u8> {
+        let mut v = Vec::with_capacity(FOUNDATION_CONFIG_SIZE_LEGACY);
+        v.extend_from_slice(&WALLET);
+        v.push(trial_enabled as u8);
+        v.push(bump);
+        assert_eq!(v.len(), FOUNDATION_CONFIG_SIZE_LEGACY);
+        v
+    }
+
+    /// Post-upgrade layout: 35 bytes, uptime_enabled at 33, bump at 34.
+    fn new_buf(trial_enabled: bool, uptime_enabled: bool, bump: u8) -> Vec<u8> {
+        borsh::to_vec(&FoundationConfig {
+            foundation_wallet: WALLET,
+            trial_enabled,
+            uptime_enabled,
+            bump,
+        })
+        .expect("borsh encode")
+    }
+
+    #[test]
+    fn new_layout_is_one_byte_longer_than_legacy() {
+        assert_eq!(new_buf(true, true, BUMP).len(), FOUNDATION_CONFIG_SIZE);
+        assert_eq!(FOUNDATION_CONFIG_SIZE, FOUNDATION_CONFIG_SIZE_LEGACY + 1);
+    }
+
+    #[test]
+    fn legacy_34_byte_buffer_yields_correct_bump() {
+        let (w, trial, bump) = read_foundation_config_compat(&legacy_buf(true, BUMP)).unwrap();
+        assert_eq!(w, WALLET);
+        assert!(trial);
+        assert_eq!(bump, BUMP, "bump must be read from index 33 on the old layout");
+    }
+
+    #[test]
+    fn new_35_byte_buffer_yields_correct_bump() {
+        let (w, trial, bump) = read_foundation_config_compat(&new_buf(true, false, BUMP)).unwrap();
+        assert_eq!(w, WALLET);
+        assert!(trial);
+        assert_eq!(bump, BUMP, "bump must be read from index 34 on the new layout");
+    }
+
+    #[test]
+    fn legacy_trial_disabled_round_trips() {
+        let (_, trial, bump) = read_foundation_config_compat(&legacy_buf(false, 251)).unwrap();
+        assert!(!trial);
+        assert_eq!(bump, 251);
+    }
+
+    /// Pins the bug that a post-realloc reparse would ship: realloc first, then
+    /// deserialise with the CURRENT struct. Byte 33 (the old bump) lands in
+    /// `uptime_enabled` and the fresh zero at 34 becomes `bump`.
+    ///
+    /// A bump of 0 or 1 is a valid Borsh bool, so the reparse SUCCEEDS and
+    /// silently writes back a zero bump — the account keeps working until
+    /// something needs the bump seed, then the PDA can never be signed again.
+    #[test]
+    fn post_realloc_reparse_silently_zeroes_a_low_bump() {
+        let mut realloced = legacy_buf(true, 1);
+        realloced.push(0); // realloc zero-fills the new byte
+
+        let corrupted = FoundationConfig::try_from_slice(&realloced)
+            .expect("bump=1 is a valid bool, so this parse succeeds — that is the danger");
+        assert_eq!(corrupted.bump, 0, "the real bump (1) was overwritten by the fresh zero");
+        assert!(corrupted.uptime_enabled, "the old bump byte was misread as uptime_enabled");
+
+        // The offset reader, given the same pre-realloc bytes, keeps the bump.
+        let (_, _, bump) = read_foundation_config_compat(&legacy_buf(true, 1)).unwrap();
+        assert_eq!(bump, 1);
+    }
+
+    /// With a canonical high bump the same reparse instead hard-fails: 254 is
+    /// not a valid Borsh bool. Loud rather than silent, but still a broken
+    /// instruction — recorded so the two failure modes are not confused.
+    #[test]
+    fn post_realloc_reparse_hard_fails_on_a_canonical_bump() {
+        let mut realloced = legacy_buf(true, BUMP); // 254
+        realloced.push(0);
+
+        assert!(
+            FoundationConfig::try_from_slice(&realloced).is_err(),
+            "bump=254 is not a valid bool in the uptime_enabled slot",
+        );
+
+        // The offset reader handles it without complaint.
+        let (_, _, bump) = read_foundation_config_compat(&legacy_buf(true, BUMP)).unwrap();
+        assert_eq!(bump, BUMP);
+    }
+
+    /// Borsh derives the discriminant from declaration order, so inserting a
+    /// variant anywhere above SetUptimeEnabled would silently renumber the
+    /// wire format for every off-chain caller. Pin the encoded byte.
+    #[test]
+    fn set_uptime_enabled_is_discriminant_11_on_the_wire() {
+        let encoded = borsh::to_vec(&crate::RewardsInstruction::SetUptimeEnabled {
+            enabled: false,
+        })
+        .expect("borsh encode");
+        assert_eq!(encoded[0], 11, "SetUptimeEnabled must stay at discriminant 11");
+        assert_eq!(encoded, vec![11, 0]);
+    }
+
+    #[test]
+    fn undersized_buffer_is_rejected() {
+        let short = vec![0u8; FOUNDATION_CONFIG_SIZE_LEGACY - 1];
+        assert!(matches!(
+            read_foundation_config_compat(&short),
+            Err(ProgramError::InvalidAccountData)
+        ));
+    }
+
+    /// A buffer longer than the new layout (future growth) must still find the
+    /// bump at index 34, not at the tail.
+    #[test]
+    fn oversized_buffer_still_reads_bump_at_34() {
+        let mut buf = new_buf(false, true, BUMP);
+        buf.extend_from_slice(&[0xFF; 8]);
+        let (_, trial, bump) = read_foundation_config_compat(&buf).unwrap();
+        assert!(!trial);
+        assert_eq!(bump, BUMP);
+    }
 }
 
 #[cfg(test)]
