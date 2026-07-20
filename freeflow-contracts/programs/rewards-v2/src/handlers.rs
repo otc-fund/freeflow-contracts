@@ -224,8 +224,15 @@ pub fn process_commit_claim_ix(
 
     // ── Derive value; the relay supplied none ─────────────────────────────────
     let clamped_hours = clamp_uptime_hours(uptime_hours, now, last_committed_at, uptime_enabled);
-    let bandwidth_amount =
-        (total_bytes as u128 * rr.routing_per_mb as u128 / MB_DIVISOR as u128) as u64;
+    // `total_bytes` is relay-supplied and unbounded within u64, and `routing_per_mb`
+    // is governance-set, so the u128 product can exceed u64::MAX. Saturate rather
+    // than wrap — bandwidth_amount is the only budget releases are checked against,
+    // so a wrapped value would corrupt the cap.
+    let bandwidth_amount = (total_bytes as u128)
+        .saturating_mul(rr.routing_per_mb as u128)
+        .checked_div(MB_DIVISOR as u128)
+        .unwrap_or(0)
+        .min(u64::MAX as u128) as u64;
     let uptime_amount = clamped_hours.saturating_mul(rr.uptime_per_hour);
 
     msg!(
@@ -1634,5 +1641,12 @@ mod clamp_tests {
     #[test]
     fn clock_skew_backwards_is_not_negative() {
         assert_eq!(clamp_uptime_hours(12, 50 * H, Some(88 * H), true), 0);
+    }
+
+    #[test]
+    fn elapsed_binds_when_below_epoch_max() {
+        // reported=20, elapsed=5, MAX=24 -> elapsed is the binding constraint.
+        let now = 100 * H;
+        assert_eq!(clamp_uptime_hours(20, now, Some(now - 5 * H), true), 5);
     }
 }
