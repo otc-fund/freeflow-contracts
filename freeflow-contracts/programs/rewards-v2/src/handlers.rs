@@ -515,8 +515,16 @@ mod derive_amount_tests {
     }
 
     #[test]
-    fn sub_mb_truncates_to_zero() {
-        assert_eq!(derive(999, 1_000_000), 0);
+    fn truncates_to_zero_below_one_base_unit() {
+        // 999 * 1_000 = 999_000 < MB_DIVISOR (1_000_000), so this floors to 0.
+        assert_eq!(derive(999, 1_000), 0);
+    }
+
+    #[test]
+    fn prorates_continuously_below_one_mb() {
+        // routing_per_mb = 1_000_000 means one base unit per byte, so a
+        // sub-MB byte count is NOT rounded away.
+        assert_eq!(derive(999, 1_000_000), 999);
     }
 }
 
