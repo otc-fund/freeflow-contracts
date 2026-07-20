@@ -4,7 +4,7 @@
 //! |--------------------------|---------------|
 //! | `InitializeRewardRates`  | Creates the 81-byte reward_rates PDA with defaults + authority |
 //! | `UpdateRewardRates`      | Bumps change_count, persists new values; non-foundation signer rejected |
-//! | `CommitClaim` (ceiling)  | At-ceiling succeeds, over-ceiling rejected, absent-PDA fallback-allow |
+//! | `CommitClaim` (derivation) | bandwidth/uptime amounts derived on-chain from pinned rates; mandatory reward_rates account enforced |
 
 #[cfg(test)]
 mod integration {
@@ -21,6 +21,7 @@ mod integration {
 
     use crate::{
         constants::*,
+        handlers::derive_reward_amount,
         id,
         process_instruction,
         types::{ClaimCommitment, RewardRatesAccount, CLAIM_COMMITMENT_SIZE, REWARD_RATES_SIZE},
@@ -46,6 +47,9 @@ mod integration {
             &[b"claim_commitment", relay.as_ref(), &epoch.to_le_bytes()],
             &id(),
         ).0
+    }
+    fn relay_meta_pda(relay: &Pubkey) -> Pubkey {
+        Pubkey::find_program_address(&[b"relay_meta", relay.as_ref()], &id()).0
     }
 
     /// Create the FoundationConfig PDA with `payer` as the foundation wallet
@@ -140,7 +144,14 @@ mod integration {
             Some(&payer.pubkey()), &[&payer], bh,
         )).await.expect("first init ok");
 
-        let bh = banks.get_latest_blockhash().await.unwrap();
+        // Must be a genuinely NEW blockhash, not just a re-fetch: the second
+        // InitializeRewardRates instruction is byte-identical to the first, so
+        // reusing the same blockhash produces the same transaction signature.
+        // The bank then treats it as an already-processed duplicate and
+        // returns success WITHOUT re-invoking the program at all — which used
+        // to make this assertion pass for the wrong reason (no execution, not
+        // a real `RewardRatesAlreadyInitialized` rejection).
+        let bh = banks.get_new_latest_blockhash(&bh).await.expect("advance blockhash");
         let result = banks.process_transaction(Transaction::new_signed_with_payer(
             &[init_rates_ix(&payer.pubkey(), 1_000_000, 2_000_000, 10_000_000_000, 0)],
             Some(&payer.pubkey()), &[&payer], bh,
@@ -200,16 +211,26 @@ mod integration {
         assert!(result.is_err(), "non-foundation signer must not update rates");
     }
 
-    // ── CommitClaim rate ceiling ──────────────────────────────────────────────
+    // ── CommitClaim value derivation ──────────────────────────────────────────
+    //
+    // CommitClaim no longer takes a relay-declared `total_amount` — the
+    // contract derives `bandwidth_amount` from `total_bytes` and the pinned
+    // `routing_per_mb`, so there is nothing left for a relay to over-declare
+    // against a "ceiling". The `RateCeilingExceeded` error this section used
+    // to exercise is now dead: see report for the removed
+    // `commit_claim_above_ceiling_rejected` test.
 
-    /// total_bytes=2 GB × routing_per_mb=1e6 / 1e6 = 2e9 ; uptime 3h × 10 $FLOW = 3e10.
+    /// total_bytes=2 GB × routing_per_mb=1e6 / 1e6 = 2e9 $FLOW-base-units.
     const ROUTING: u64 = 1_000_000;
     const UPTIME: u64 = 10_000_000_000;
     const BYTES: u64 = 2_000_000_000;
     const UPTIME_HOURS: u64 = 3;
-    const CEILING: u64 = 2_000_000_000 + 30_000_000_000; // 32e9
 
-    fn commit_ix(relay: &Pubkey, epoch: u64, total_amount: u64, with_rates: bool) -> Instruction {
+    /// `with_rates=true` supplies the three accounts CommitClaim now requires
+    /// on top of [relay, commitment, system_program]: the mandatory
+    /// reward_rates PDA, the per-relay relay_meta PDA (monotonic clamp basis),
+    /// and the foundation_config PDA (uptime kill switch).
+    fn commit_ix(relay: &Pubkey, epoch: u64, with_rates: bool) -> Instruction {
         let mut accounts = vec![
             AccountMeta::new(*relay, true),
             AccountMeta::new(claim_commitment_pda(relay, epoch), false),
@@ -217,6 +238,8 @@ mod integration {
         ];
         if with_rates {
             accounts.push(AccountMeta::new_readonly(reward_rates_pda(), false));
+            accounts.push(AccountMeta::new(relay_meta_pda(relay), false));
+            accounts.push(AccountMeta::new_readonly(foundation_config_pda(), false));
         }
         Instruction {
             program_id: id(),
@@ -224,7 +247,6 @@ mod integration {
             data: encode_ix(&RewardsInstruction::CommitClaim {
                 merkle_root: [7u8; 32],
                 client_count: 1,
-                total_amount,
                 total_bytes: BYTES,
                 uptime_hours: UPTIME_HOURS,
                 claim_epoch: epoch,
@@ -242,49 +264,52 @@ mod integration {
     }
 
     #[tokio::test]
-    async fn commit_claim_at_ceiling_succeeds() {
+    async fn commit_claim_derives_bandwidth_and_uptime_amounts() {
         let (mut banks, payer, bh) = program_test().start().await;
         setup_rates(&mut banks, &payer, bh).await;
         let epoch = current_epoch(&mut banks).await;
         let bh = banks.get_latest_blockhash().await.unwrap();
 
         banks.process_transaction(Transaction::new_signed_with_payer(
-            &[commit_ix(&payer.pubkey(), epoch, CEILING, true)],
+            &[commit_ix(&payer.pubkey(), epoch, true)],
             Some(&payer.pubkey()), &[&payer], bh,
-        )).await.expect("at-ceiling CommitClaim must succeed");
+        )).await.expect("CommitClaim must succeed with the mandatory rate accounts");
 
         let acct = banks.get_account(claim_commitment_pda(&payer.pubkey(), epoch)).await
             .expect("rpc").expect("commitment exists");
         let c = ClaimCommitment::try_from_slice(&acct.data[..CLAIM_COMMITMENT_SIZE]).expect("deser");
-        assert_eq!(c.uptime_hours, UPTIME_HOURS, "uptime_hours persisted on commitment");
-        assert_eq!(c.total_amount, CEILING);
+
+        // bandwidth_amount is derived on-chain from bytes x the pinned rate —
+        // never a relay-supplied figure. Assert against the same derivation
+        // the contract itself uses, not a hand-computed literal.
+        assert_eq!(
+            c.bandwidth_amount,
+            derive_reward_amount(BYTES, ROUTING),
+            "bandwidth_amount must equal the contract-derived value from total_bytes and routing_per_mb",
+        );
+        assert_eq!(c.routing_per_mb, ROUTING, "pinned rate must match reward_rates at commit time");
+        assert_eq!(c.uptime_per_hour, UPTIME, "pinned uptime rate must match reward_rates at commit time");
+
+        // First-ever CommitClaim for this relay: relay_meta doesn't exist yet,
+        // so clamp_uptime_hours has no elapsed-time basis and must clamp to
+        // zero (see handlers::clamp_tests::first_epoch_earns_zero).
+        assert_eq!(c.uptime_hours, 0, "first epoch for a relay must earn zero uptime");
+        assert_eq!(c.uptime_amount, 0);
     }
 
     #[tokio::test]
-    async fn commit_claim_above_ceiling_rejected() {
-        let (mut banks, payer, bh) = program_test().start().await;
-        setup_rates(&mut banks, &payer, bh).await;
+    async fn commit_claim_without_rates_account_rejected() {
+        // reward_rates is now mandatory (REWARD_RATES_REQUIRED = true): the
+        // fallback-allow path that let a relay skip rate enforcement during
+        // rollout — and previously left `total_amount` unbounded — is gone.
+        let (mut banks, payer, _bh) = program_test().start().await;
         let epoch = current_epoch(&mut banks).await;
         let bh = banks.get_latest_blockhash().await.unwrap();
 
         let result = banks.process_transaction(Transaction::new_signed_with_payer(
-            &[commit_ix(&payer.pubkey(), epoch, CEILING + 1, true)],
+            &[commit_ix(&payer.pubkey(), epoch, false)],
             Some(&payer.pubkey()), &[&payer], bh,
         )).await;
-        assert!(result.is_err(), "over-ceiling CommitClaim must be rejected (RateCeilingExceeded)");
-    }
-
-    #[tokio::test]
-    async fn commit_claim_without_rates_account_succeeds() {
-        // Fallback-allow during rollout: no reward_rates account supplied.
-        let (mut banks, payer, bh) = program_test().start().await;
-        let _ = bh;
-        let epoch = current_epoch(&mut banks).await;
-        let bh = banks.get_latest_blockhash().await.unwrap();
-
-        banks.process_transaction(Transaction::new_signed_with_payer(
-            &[commit_ix(&payer.pubkey(), epoch, u64::MAX / 2, false)],
-            Some(&payer.pubkey()), &[&payer], bh,
-        )).await.expect("CommitClaim without rates account must succeed (fallback-allow)");
+        assert!(result.is_err(), "CommitClaim without the mandatory reward_rates account must fail");
     }
 }

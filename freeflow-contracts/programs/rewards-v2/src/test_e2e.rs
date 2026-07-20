@@ -17,7 +17,7 @@ mod tests {
         k
     }
 
-    fn make_entry(seed: u8, amount: u64, bytes: u64) -> ReserveBatchEntry {
+    fn make_entry(seed: u8, bytes: u64) -> ReserveBatchEntry {
         use solana_program::hash::hashv;
         let client_pubkey = make_client_pubkey(seed);
         let session_id    = [seed; 16];
@@ -27,7 +27,6 @@ mod tests {
         ReserveBatchEntry {
             client_pubkey,
             highest_seq,
-            amount,
             bytes,
             merkle_leaf_hash: batch_hash,
             session_id,
@@ -40,7 +39,6 @@ mod tests {
             client_pubkey:    entry.client_pubkey,
             session_id:       entry.session_id,
             batch_nonce:      entry.highest_seq,
-            total_amount:     entry.amount,
             total_bytes:      entry.bytes,
             merkle_proof:     vec![],  // will be set per test
             client_signature: [1u8; 64], // non-null placeholder
@@ -53,7 +51,7 @@ mod tests {
 
     #[test]
     fn reserve_and_release_leaf_hashes_match() {
-        let entry   = make_entry(1, 1000, 1_073_741_824);
+        let entry   = make_entry(1, 1_073_741_824);
         let release = make_release(&entry);
 
         let entry_hash   = compute_merkle_leaf_hash_from_entry(&entry);
@@ -66,7 +64,7 @@ mod tests {
 
     #[test]
     fn single_client_merkle_proof_end_to_end() {
-        let entry   = make_entry(42, 5000, 2 * 1_073_741_824);
+        let entry   = make_entry(42, 2 * 1_073_741_824);
         let leaf    = compute_merkle_leaf_hash_from_entry(&entry);
 
         // For a single client, root == leaf.
@@ -116,7 +114,7 @@ mod tests {
 
     #[test]
     fn five_client_tree_all_releases_verify() {
-        let entries: Vec<ReserveBatchEntry> = (0u8..5).map(|i| make_entry(i, 1000 * (i as u64 + 1), 1_073_741_824)).collect();
+        let entries: Vec<ReserveBatchEntry> = (0u8..5).map(|i| make_entry(i, 1_073_741_824)).collect();
         let leaves: Vec<[u8; 32]> = entries.iter().map(compute_merkle_leaf_hash_from_entry).collect();
         let root = build_tree(&leaves);
 
@@ -221,15 +219,32 @@ mod tests {
     #[test]
     fn claim_commitment_borsh_round_trip() {
         use borsh::BorshDeserialize;
+        use crate::handlers::derive_reward_amount;
+
+        // bandwidth_amount/uptime_amount are now separate, contract-derived
+        // budgets (no more relay-declared total_amount) — populate them with
+        // realistic values consistent with the on-chain derivation so the
+        // round-trip assertions below are non-vacuous.
+        let total_bytes     = 10_737_418_240u64; // 10 GB
+        let routing_per_mb  = DEFAULT_ROUTING_PER_MB;
+        let uptime_hours    = 12u64;
+        let uptime_per_hour = DEFAULT_UPTIME_PER_HOUR;
+        let bandwidth_amount = derive_reward_amount(total_bytes, routing_per_mb);
+        let uptime_amount    = uptime_hours * uptime_per_hour;
 
         let c = ClaimCommitment {
             relay_pubkey:    [5u8; 32],
             claim_epoch:     42,
             merkle_root:     [6u8; 32],
             client_count:    10,
-            total_amount:    50_000,
-            total_bytes:     10_737_418_240,
-            uptime_hours:    0,
+            bandwidth_amount,
+            uptime_amount,
+            total_bytes,
+            uptime_hours,
+            routing_per_mb,
+            uptime_per_hour,
+            committed_at:    1_700_000_000,
+            uptime_paid:     false,
             reserved_count:  5,
             released_count:  3,
             released_amount: 30_000,
@@ -245,7 +260,16 @@ mod tests {
         assert_eq!(c.claim_epoch,     c2.claim_epoch);
         assert_eq!(c.merkle_root,     c2.merkle_root);
         assert_eq!(c.client_count,    c2.client_count);
-        assert_eq!(c.total_amount,    c2.total_amount);
+        assert_eq!(c.bandwidth_amount, c2.bandwidth_amount);
+        assert_eq!(c.uptime_amount,    c2.uptime_amount);
+        // Stronger than the old relay-declared total_amount check: assert the
+        // round-tripped budget still matches what the contract itself derives
+        // from bytes and the pinned rate.
+        assert_eq!(
+            c2.bandwidth_amount,
+            derive_reward_amount(c2.total_bytes, c2.routing_per_mb),
+            "bandwidth_amount must equal the contract-derived value from total_bytes and routing_per_mb",
+        );
         assert_eq!(c.reserved_count,  c2.reserved_count);
         assert_eq!(c.released_count,  c2.released_count);
         assert_eq!(c.released_amount, c2.released_amount);

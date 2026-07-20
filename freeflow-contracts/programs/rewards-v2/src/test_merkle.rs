@@ -149,20 +149,23 @@ mod tests {
         let batch_nonce = 42u64;
         let batch_hash  = [3u8; 32];
 
-        let h1 = compute_merkle_leaf_hash(&pubkey, &session_id, batch_nonce, &batch_hash, 1000, 500, 5);
-        let h2 = compute_merkle_leaf_hash(&pubkey, &session_id, batch_nonce, &batch_hash, 1000, 500, 5);
+        let h1 = compute_merkle_leaf_hash(&pubkey, &session_id, batch_nonce, &batch_hash, 500, 5);
+        let h2 = compute_merkle_leaf_hash(&pubkey, &session_id, batch_nonce, &batch_hash, 500, 5);
         assert_eq!(h1, h2);
     }
 
     #[test]
-    fn compute_merkle_leaf_hash_sensitive_to_amount() {
+    fn compute_merkle_leaf_hash_sensitive_to_bytes() {
+        // The `amount` argument was removed from the leaf hash (the relay no
+        // longer commits to a currency figure); `total_bytes` is now the sole
+        // quantity driving value, so the leaf must still be sensitive to it.
         let pubkey     = [1u8; 32];
         let session_id = [2u8; 16];
         let batch_hash  = [3u8; 32];
 
-        let h1 = compute_merkle_leaf_hash(&pubkey, &session_id, 42, &batch_hash, 1000, 500, 5);
-        let h2 = compute_merkle_leaf_hash(&pubkey, &session_id, 42, &batch_hash, 1001, 500, 5);
-        assert_ne!(h1, h2, "Leaf hash should differ when total_amount differs");
+        let h1 = compute_merkle_leaf_hash(&pubkey, &session_id, 42, &batch_hash, 1000, 5);
+        let h2 = compute_merkle_leaf_hash(&pubkey, &session_id, 42, &batch_hash, 1001, 5);
+        assert_ne!(h1, h2, "Leaf hash should differ when total_bytes differs");
     }
 
     #[test]
@@ -177,7 +180,6 @@ mod tests {
         let entry = ReserveBatchEntry {
             client_pubkey,
             highest_seq,
-            amount: 5000,
             bytes: 1_073_741_824, // 1 GB
             merkle_leaf_hash,
             session_id,
@@ -210,7 +212,6 @@ mod tests {
             client_pubkey,
             session_id,
             batch_nonce: highest_seq,
-            total_amount: 5000,
             total_bytes: 1_073_741_824,
             merkle_proof: vec![],
             client_signature: [0u8; 64],

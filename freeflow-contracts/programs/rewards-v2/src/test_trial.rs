@@ -301,12 +301,14 @@ mod logic {
         let orig = FoundationConfig {
             foundation_wallet: [7u8; 32],
             trial_enabled:     true,
+            uptime_enabled:    true,
             bump:              253,
         };
         let bytes = borsh::to_vec(&orig).unwrap();
         let copy  = FoundationConfig::try_from_slice(&bytes).unwrap();
         assert_eq!(orig.foundation_wallet, copy.foundation_wallet);
         assert_eq!(orig.trial_enabled,     copy.trial_enabled);
+        assert_eq!(orig.uptime_enabled,    copy.uptime_enabled);
         assert_eq!(orig.bump,              copy.bump);
     }
 
@@ -316,6 +318,7 @@ mod logic {
         let mut fc = FoundationConfig {
             foundation_wallet: [7u8; 32],
             trial_enabled:     true,
+            uptime_enabled:    true,
             bump:              253,
         };
         assert!(fc.trial_enabled);
@@ -336,6 +339,7 @@ mod logic {
         let fc = FoundationConfig {
             foundation_wallet: foundation,
             trial_enabled:     true,
+            uptime_enabled:    true,
             bump:              253,
         };
 
@@ -472,7 +476,6 @@ mod logic {
         let entry = ReserveBatchEntry {
             client_pubkey,
             highest_seq:      batch_nonce,
-            amount:           1_000_000,
             bytes:            1_073_741_824,
             merkle_leaf_hash: batch_hash,
             session_id,
@@ -483,7 +486,6 @@ mod logic {
             client_pubkey,
             session_id,
             batch_nonce,
-            total_amount:     1_000_000,
             total_bytes:      1_073_741_824,
             merkle_proof:     vec![],
             client_signature: [1u8; 64],
@@ -567,6 +569,7 @@ mod integration {
         let fc = FoundationConfig {
             foundation_wallet: wallet.to_bytes(),
             trial_enabled,
+            uptime_enabled: true,
             bump,
         };
         let data = borsh::to_vec(&fc).expect("borsh fc");
@@ -582,15 +585,26 @@ mod integration {
     }
 
     /// Build a pre-populated `ClaimCommitment` account.
+    ///
+    /// `bandwidth_amount` is populated from `derive_reward_amount` rather than
+    /// a hardcoded literal, so it stays consistent with what the contract
+    /// itself would have derived from `total_bytes` and the pinned rate.
     fn commitment_account(claim_epoch: u64, relay: &Pubkey) -> Account {
+        let total_bytes    = 1_073_741_824u64; // 1 GB
+        let routing_per_mb = DEFAULT_ROUTING_PER_MB;
         let c = ClaimCommitment {
             relay_pubkey:    relay.to_bytes(),
             claim_epoch,
             merkle_root:     [0u8; 32],
             client_count:    1,
-            total_amount:    1_000_000,
-            total_bytes:     1_073_741_824,
+            bandwidth_amount: crate::handlers::derive_reward_amount(total_bytes, routing_per_mb),
+            uptime_amount:   0,
+            total_bytes,
             uptime_hours:    0,
+            routing_per_mb,
+            uptime_per_hour: DEFAULT_UPTIME_PER_HOUR,
+            committed_at:    0,
+            uptime_paid:     false,
             reserved_count:  1,
             released_count:  0,
             released_amount: 0,
@@ -737,6 +751,7 @@ mod integration {
         let fc = FoundationConfig {
             foundation_wallet: foundation.pubkey().to_bytes(),
             trial_enabled:     true,
+            uptime_enabled:    true,
             bump:              fc_bump,
         };
         let mut data = vec![0u8; FOUNDATION_CONFIG_SIZE];
