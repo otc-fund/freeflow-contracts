@@ -3263,3 +3263,253 @@ mod release_trial_claim_integration_tests {
         assert_eq!(tu.used_bytes, bytes, "trial usage records the served bytes");
     }
 }
+
+#[cfg(test)]
+mod reserve_batch_integration_tests {
+    //! End-to-end for ReserveBatch (disc 1). Proves rewards-v2 derives each
+    //! client's hold amount from `bytes × pinned routing_per_mb` (Task 8),
+    //! forwards *exactly that* to the escrow hold CPI, and records it in the
+    //! Reservation PDA — none of it relay-supplied.
+    //!
+    //! A mock program is registered at the escrow program id instead of the real
+    //! user-escrow Anchor program. rewards-v2's responsibility is to derive and
+    //! forward the correct amount (the Task 8 change); the mock captures the
+    //! amount that crosses the CPI boundary by writing it into the `fund_hold`
+    //! probe it owns. The real escrow's held-balance accounting is the escrow
+    //! program's own concern (unchanged here) and is proven separately by the
+    //! post-deploy devnet smoke test against a live escrow. reserve_batch does not
+    //! check the escrow program id against a constant, so a mock at any id works.
+    use super::*;
+    use solana_program::{account_info::AccountInfo, entrypoint::ProgramResult};
+    use solana_program_test::*;
+    use solana_sdk::{
+        account::Account,
+        instruction::{AccountMeta, Instruction},
+        signature::{Keypair, Signer},
+        transaction::Transaction,
+    };
+    use crate::{id, process_instruction, RewardsInstruction};
+
+    fn mock_escrow_id() -> Pubkey {
+        Pubkey::new_from_array([7u8; 32])
+    }
+
+    /// Records the amount from the hold_client_funds CPI into the fund_hold probe.
+    /// CPI data = [disc:8][amount:8 LE][claim_hash:32][session:16]; CPI accounts =
+    /// [mint_authority, payer, user, user_escrow, fund_hold, spender_registry,
+    /// system], so fund_hold is index 4.
+    fn mock_escrow_process(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+        let amount = u64::from_le_bytes(data[8..16].try_into().unwrap());
+        accounts[4].data.borrow_mut()[0..8].copy_from_slice(&amount.to_le_bytes());
+        Ok(())
+    }
+
+    fn program_test() -> ProgramTest {
+        let mut pt = ProgramTest::new("freeflow_rewards_v2", id(), processor!(process_instruction));
+        pt.add_program("mock_escrow", mock_escrow_id(), processor!(mock_escrow_process));
+        pt
+    }
+
+    fn commitment_account(
+        relay:            &Pubkey,
+        epoch:            u64,
+        bandwidth_amount: u64,
+        total_bytes:      u64,
+        bump:             u8,
+    ) -> Account {
+        let c = ClaimCommitment {
+            relay_pubkey:     relay.to_bytes(),
+            claim_epoch:      epoch,
+            merkle_root:      [0u8; 32],
+            client_count:     1,
+            bandwidth_amount,
+            uptime_amount:    0,
+            total_bytes,
+            uptime_hours:     0,
+            routing_per_mb:   DEFAULT_ROUTING_PER_MB,
+            uptime_per_hour:  DEFAULT_UPTIME_PER_HOUR,
+            committed_at:     0,
+            uptime_paid:      false,
+            reserved_count:   0,
+            released_count:   0,
+            released_amount:  0,
+            released_bytes:   0,
+            status:           ClaimCommitmentStatus::Active,
+            dispute_deadline: 0,
+            bump,
+        };
+        let data = borsh::to_vec(&c).expect("borsh commitment");
+        let mut padded = vec![0u8; CLAIM_COMMITMENT_SIZE];
+        padded[..data.len()].copy_from_slice(&data);
+        Account { lamports: 10_000_000, data: padded, owner: id(), executable: false, rent_epoch: 0 }
+    }
+
+    /// A minimal account for a CPI passthrough slot.
+    fn stub_account(owner: Pubkey, len: usize) -> Account {
+        Account { lamports: 1_000_000, data: vec![0u8; len], owner, executable: false, rent_epoch: 0 }
+    }
+
+    #[tokio::test]
+    async fn reserve_batch_derives_and_forwards_hold_amount() {
+        let relay  = Keypair::new();
+        let epoch  = 8_888u64;
+        let client = [11u8; 32];
+        let bytes  = 300_000_000u64; // 0.3 GB
+        let derived = derive_reward_amount(bytes, DEFAULT_ROUTING_PER_MB);
+        assert!(derived > 0, "test bytes must yield a nonzero hold");
+
+        let entry = ReserveBatchEntry {
+            client_pubkey:    client,
+            highest_seq:      1,
+            bytes,
+            merkle_leaf_hash: [0u8; 32],
+            session_id:       [5u8; 16],
+            record_count:     1,
+        };
+
+        let (c_pda, c_bump) = Pubkey::find_program_address(
+            &[b"claim_commitment", relay.pubkey().as_ref(), &epoch.to_le_bytes()], &id());
+        let (service_auth, _) = Pubkey::find_program_address(&[b"mint_authority"], &id());
+        let (claim_state_pda, _) = Pubkey::find_program_address(
+            &[b"claim_state", &client, relay.pubkey().as_ref()], &id());
+        let (reservation_pda, _) = Pubkey::find_program_address(&[b"reservation", &client], &id());
+
+        let fund_hold        = Keypair::new().pubkey();
+        let user_escrow      = Keypair::new().pubkey();
+        let user_escrow_tok  = Keypair::new().pubkey();
+        let spender_registry = Keypair::new().pubkey();
+        let user_pk          = Pubkey::new_from_array(client);
+
+        let mut pt = program_test();
+        pt.add_account(c_pda, commitment_account(&relay.pubkey(), epoch, derived, bytes, c_bump));
+        // fund_hold + user_escrow cross the CPI as WRITABLE; own them by the mock.
+        pt.add_account(fund_hold,   stub_account(mock_escrow_id(), 8));
+        pt.add_account(user_escrow, stub_account(mock_escrow_id(), 8));
+        pt.add_account(user_escrow_tok,  stub_account(solana_sdk::system_program::id(), 0));
+        pt.add_account(spender_registry, stub_account(solana_sdk::system_program::id(), 0));
+        pt.add_account(user_pk,          stub_account(solana_sdk::system_program::id(), 0));
+
+        let (mut banks, payer, bh) = pt.start().await;
+        // Relay pays PDA rent for claim_state + reservation, and the tx fee.
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(&payer.pubkey(), &relay.pubkey(), 2_000_000_000)],
+            Some(&payer.pubkey()), &[&payer], bh,
+        )).await.expect("fund relay");
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let ix = Instruction {
+            program_id: id(),
+            accounts: vec![
+                AccountMeta::new(relay.pubkey(), true),                             // 0  relay_wallet (payer/signer)
+                AccountMeta::new(c_pda, false),                                     // 1  commitment
+                AccountMeta::new_readonly(mock_escrow_id(), false),                 // 2  escrow_program
+                AccountMeta::new_readonly(service_auth, false),                     // 3  service_authority (mint_authority PDA)
+                AccountMeta::new_readonly(spender_registry, false),                 // 4  spender_registry
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false), // 5  system_program
+                // per-entry (6):
+                AccountMeta::new_readonly(user_pk, false),                          // user
+                AccountMeta::new(claim_state_pda, false),                           // claim_state (created)
+                AccountMeta::new(user_escrow, false),                               // user_escrow (CPI-writable)
+                AccountMeta::new(fund_hold, false),                                 // fund_hold (probe, CPI-writable)
+                AccountMeta::new_readonly(user_escrow_tok, false),                  // user_escrow_token (unused)
+                AccountMeta::new(reservation_pda, false),                           // reservation (created)
+            ],
+            data: borsh::to_vec(&RewardsInstruction::ReserveBatch {
+                claim_epoch: epoch,
+                entries:     vec![entry],
+            })
+            .expect("encode ReserveBatch"),
+        };
+        banks
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix], Some(&relay.pubkey()), &[&relay], bh,
+            ))
+            .await
+            .expect("ReserveBatch success path must place the hold");
+
+        // 1. The amount that crossed the escrow-hold CPI boundary == contract-derived.
+        let fh = banks.get_account(fund_hold).await.unwrap().unwrap();
+        let forwarded = u64::from_le_bytes(fh.data[0..8].try_into().unwrap());
+        assert_eq!(forwarded, derived, "reserve_batch must forward the DERIVED amount, not a relay figure");
+
+        // 2. rewards-v2 recorded the same amount in the Reservation PDA.
+        let res = banks.get_account(reservation_pda).await.unwrap().unwrap();
+        let r = Reservation::try_from_slice(&res.data[..RESERVATION_SIZE]).unwrap();
+        assert_eq!(r.reserved, derived, "Reservation.reserved == derived");
+        assert_eq!(r.user, client, "Reservation keyed to the client");
+
+        // 3. Commitment reserved_count advanced.
+        let cacct = banks.get_account(c_pda).await.unwrap().unwrap();
+        let c = ClaimCommitment::try_from_slice(&cacct.data[..CLAIM_COMMITMENT_SIZE]).unwrap();
+        assert_eq!(c.reserved_count, 1, "commitment records the reservation");
+    }
+
+    /// The aggregate cap still bites: derived hold > bandwidth_amount is rejected.
+    #[tokio::test]
+    async fn reserve_batch_rejects_when_derived_exceeds_bandwidth_budget() {
+        let relay  = Keypair::new();
+        let epoch  = 8_889u64;
+        let client = [12u8; 32];
+        let bytes  = 300_000_000u64;
+        let derived = derive_reward_amount(bytes, DEFAULT_ROUTING_PER_MB);
+
+        let entry = ReserveBatchEntry {
+            client_pubkey: client, highest_seq: 1, bytes,
+            merkle_leaf_hash: [0u8; 32], session_id: [5u8; 16], record_count: 1,
+        };
+
+        let (c_pda, c_bump) = Pubkey::find_program_address(
+            &[b"claim_commitment", relay.pubkey().as_ref(), &epoch.to_le_bytes()], &id());
+        let (service_auth, _) = Pubkey::find_program_address(&[b"mint_authority"], &id());
+        let (claim_state_pda, _) = Pubkey::find_program_address(
+            &[b"claim_state", &client, relay.pubkey().as_ref()], &id());
+        let (reservation_pda, _) = Pubkey::find_program_address(&[b"reservation", &client], &id());
+
+        let fund_hold        = Keypair::new().pubkey();
+        let user_escrow      = Keypair::new().pubkey();
+        let user_escrow_tok  = Keypair::new().pubkey();
+        let spender_registry = Keypair::new().pubkey();
+        let user_pk          = Pubkey::new_from_array(client);
+
+        let mut pt = program_test();
+        // bandwidth_amount one base unit short of the derived hold.
+        pt.add_account(c_pda, commitment_account(&relay.pubkey(), epoch, derived - 1, bytes, c_bump));
+        pt.add_account(fund_hold,   stub_account(mock_escrow_id(), 8));
+        pt.add_account(user_escrow, stub_account(mock_escrow_id(), 8));
+        pt.add_account(user_escrow_tok,  stub_account(solana_sdk::system_program::id(), 0));
+        pt.add_account(spender_registry, stub_account(solana_sdk::system_program::id(), 0));
+        pt.add_account(user_pk,          stub_account(solana_sdk::system_program::id(), 0));
+
+        let (mut banks, payer, bh) = pt.start().await;
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(&payer.pubkey(), &relay.pubkey(), 2_000_000_000)],
+            Some(&payer.pubkey()), &[&payer], bh,
+        )).await.expect("fund relay");
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let ix = Instruction {
+            program_id: id(),
+            accounts: vec![
+                AccountMeta::new(relay.pubkey(), true),
+                AccountMeta::new(c_pda, false),
+                AccountMeta::new_readonly(mock_escrow_id(), false),
+                AccountMeta::new_readonly(service_auth, false),
+                AccountMeta::new_readonly(spender_registry, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                AccountMeta::new_readonly(user_pk, false),
+                AccountMeta::new(claim_state_pda, false),
+                AccountMeta::new(user_escrow, false),
+                AccountMeta::new(fund_hold, false),
+                AccountMeta::new_readonly(user_escrow_tok, false),
+                AccountMeta::new(reservation_pda, false),
+            ],
+            data: borsh::to_vec(&RewardsInstruction::ReserveBatch {
+                claim_epoch: epoch, entries: vec![entry],
+            }).expect("encode"),
+        };
+        let res = banks.process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&relay.pubkey()), &[&relay], bh,
+        )).await;
+        assert!(res.is_err(), "a hold exceeding bandwidth_amount must be rejected");
+    }
+}
