@@ -2837,3 +2837,184 @@ mod clamp_tests {
         assert_eq!(clamp_uptime_hours(20, now, Some(now - 5 * H), true), 5);
     }
 }
+
+#[cfg(test)]
+mod foundation_config_realloc_dryrun {
+    //! Runtime dry-run of the 34->35 byte `foundation_config` realloc that
+    //! `process_set_uptime_enabled_ix` performs the first time it runs against a
+    //! legacy account. Unit tests (`foundation_config_migration_tests`) cover the
+    //! offset arithmetic; these drive the REAL allocate / rent-top-up / realloc /
+    //! save path through the BanksClient runtime against a planted replica of the
+    //! LIVE devnet account, so the migration is proven to execute before it ever
+    //! touches the irreplaceable on-chain PDA.
+    //!
+    //! Live snapshot reproduced here (predeploy_scan, 2026-07-21):
+    //!   PDA 4iwTtcoXrgWRiHsKPwLyKrxRU3jXspD62fWYit7kh3Th, 34 bytes,
+    //!   trial_enabled=1, bump=255. The wallet is substituted for a test signer
+    //!   (the authority check requires signing as it), which is immaterial to the
+    //!   realloc mechanics under test.
+    use super::*;
+    use solana_program_test::*;
+    use solana_sdk::{
+        account::Account,
+        instruction::{AccountMeta, Instruction},
+        signature::{Keypair, Signer},
+        system_program,
+        transaction::Transaction,
+    };
+    use crate::{id, process_instruction, RewardsInstruction};
+
+    const LIVE_TRIAL_ENABLED: u8 = 1;
+    const LIVE_BUMP: u8 = 255;
+
+    fn program_test() -> ProgramTest {
+        ProgramTest::new("freeflow_rewards_v2", id(), processor!(process_instruction))
+    }
+
+    fn fc_pda() -> Pubkey {
+        Pubkey::find_program_address(&[b"foundation_config"], &id()).0
+    }
+
+    fn funded_wallet() -> Account {
+        Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
+    /// A legacy 34-byte foundation_config exactly like the live one: program-owned,
+    /// rent-exempt for 34 bytes, layout wallet[0..32] | trial_enabled=1 | bump=255.
+    fn legacy_34b_account(wallet: &Pubkey) -> Account {
+        let mut data = Vec::with_capacity(34);
+        data.extend_from_slice(&wallet.to_bytes());
+        data.push(LIVE_TRIAL_ENABLED);
+        data.push(LIVE_BUMP);
+        assert_eq!(data.len(), 34, "legacy layout must be 34 bytes");
+        Account {
+            lamports: solana_sdk::rent::Rent::default().minimum_balance(34),
+            data,
+            owner: id(),
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
+    /// An already-migrated 35-byte account: uptime_enabled at [33], bump at [34].
+    fn migrated_35b_account(wallet: &Pubkey, uptime_enabled: u8) -> Account {
+        let mut data = Vec::with_capacity(35);
+        data.extend_from_slice(&wallet.to_bytes());
+        data.push(LIVE_TRIAL_ENABLED);
+        data.push(uptime_enabled);
+        data.push(LIVE_BUMP);
+        Account {
+            lamports: solana_sdk::rent::Rent::default().minimum_balance(35),
+            data,
+            owner: id(),
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
+    fn set_uptime_ix(foundation_wallet: &Pubkey, enabled: bool) -> Instruction {
+        Instruction {
+            program_id: id(),
+            accounts: vec![
+                AccountMeta::new(*foundation_wallet, true),
+                AccountMeta::new(fc_pda(), false),
+                AccountMeta::new_readonly(system_program::id(), false),
+            ],
+            data: borsh::to_vec(&RewardsInstruction::SetUptimeEnabled { enabled })
+                .expect("borsh encode"),
+        }
+    }
+
+    /// THE DRY-RUN: legacy 34-byte account -> SetUptimeEnabled(false) -> assert it
+    /// migrated to 35 bytes with the bump preserved and every other field intact.
+    /// This is the exact path that runs once against the live PDA at deploy time.
+    #[tokio::test]
+    async fn migrates_legacy_34b_to_35b_preserving_bump() {
+        let foundation = Keypair::new();
+        let mut pt = program_test();
+        pt.add_account(foundation.pubkey(), funded_wallet());
+        pt.add_account(fc_pda(), legacy_34b_account(&foundation.pubkey()));
+
+        let (mut banks, _payer, blockhash) = pt.start().await;
+
+        let pre = banks.get_account(fc_pda()).await.unwrap().unwrap();
+        assert_eq!(pre.data.len(), 34, "precondition: account starts at 34 bytes");
+
+        let mut tx = Transaction::new_with_payer(
+            &[set_uptime_ix(&foundation.pubkey(), false)],
+            Some(&foundation.pubkey()),
+        );
+        tx.sign(&[&foundation], blockhash);
+        banks.process_transaction(tx).await.expect("SetUptimeEnabled must succeed");
+
+        let post = banks.get_account(fc_pda()).await.unwrap().unwrap();
+        assert_eq!(post.data.len(), 35, "account must have realloc'd to 35 bytes");
+        assert_eq!(&post.data[0..32], &foundation.pubkey().to_bytes(), "wallet unchanged");
+        assert_eq!(post.data[32], LIVE_TRIAL_ENABLED, "trial_enabled must survive the migration");
+        assert_eq!(post.data[33], 0, "uptime_enabled must be the value written (false=0)");
+        assert_eq!(post.data[34], LIVE_BUMP, "BUMP MUST BE PRESERVED at byte 34");
+        assert_eq!(post.owner, id(), "account must stay program-owned");
+        assert!(
+            post.lamports >= solana_sdk::rent::Rent::default().minimum_balance(35),
+            "account must remain rent-exempt at 35 bytes",
+        );
+    }
+
+    /// Idempotency: a second call on the already-35-byte account must NOT realloc
+    /// again, and must toggle uptime_enabled while preserving the bump.
+    #[tokio::test]
+    async fn second_call_toggles_without_re_realloc() {
+        let foundation = Keypair::new();
+        let mut pt = program_test();
+        pt.add_account(foundation.pubkey(), funded_wallet());
+        pt.add_account(fc_pda(), migrated_35b_account(&foundation.pubkey(), 0));
+
+        let (mut banks, _payer, blockhash) = pt.start().await;
+
+        let mut tx = Transaction::new_with_payer(
+            &[set_uptime_ix(&foundation.pubkey(), true)],
+            Some(&foundation.pubkey()),
+        );
+        tx.sign(&[&foundation], blockhash);
+        banks.process_transaction(tx).await.expect("toggle must succeed");
+
+        let post = banks.get_account(fc_pda()).await.unwrap().unwrap();
+        assert_eq!(post.data.len(), 35, "must stay 35 bytes, no re-realloc");
+        assert_eq!(post.data[33], 1, "uptime_enabled must flip to true (1)");
+        assert_eq!(post.data[34], LIVE_BUMP, "bump still preserved");
+    }
+
+    /// Authority + ordering: a non-foundation signer must be rejected AND the
+    /// account left UNTOUCHED, proving the authority check runs BEFORE the rent
+    /// top-up / realloc (an attacker must not be able to fund or grow it).
+    #[tokio::test]
+    async fn non_foundation_signer_rejected_and_account_untouched() {
+        let real_foundation = Keypair::new();
+        let attacker        = Keypair::new();
+        let mut pt = program_test();
+        pt.add_account(attacker.pubkey(), funded_wallet());
+        pt.add_account(fc_pda(), legacy_34b_account(&real_foundation.pubkey()));
+
+        let (mut banks, _payer, blockhash) = pt.start().await;
+
+        let mut tx = Transaction::new_with_payer(
+            &[set_uptime_ix(&attacker.pubkey(), false)],
+            Some(&attacker.pubkey()),
+        );
+        tx.sign(&[&attacker], blockhash);
+        assert!(
+            banks.process_transaction(tx).await.is_err(),
+            "attacker toggle must be rejected",
+        );
+
+        let post = banks.get_account(fc_pda()).await.unwrap().unwrap();
+        assert_eq!(post.data.len(), 34, "rejected call must NOT have realloc'd the account");
+        assert_eq!(post.data[33], LIVE_BUMP, "bump untouched");
+    }
+}
