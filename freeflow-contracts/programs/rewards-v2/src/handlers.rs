@@ -3018,3 +3018,248 @@ mod foundation_config_realloc_dryrun {
         assert_eq!(post.data[33], LIVE_BUMP, "bump untouched");
     }
 }
+
+#[cfg(test)]
+mod release_trial_claim_integration_tests {
+    //! End-to-end SUCCESS path for ReleaseTrialClaim (disc 5) — the handler that
+    //! mints $FLOW to free-trial clients and runs LIVE every epoch. The existing
+    //! `test_trial::integration` tests only cover rejection paths (disabled /
+    //! below-gate / epoch-mismatch / no-signer); none proves a successful mint.
+    //! This drives the real 70/30 SPL-Token mint through the BanksClient runtime,
+    //! exercising Task 9's derive-from-pinned-rate change and the removal of the
+    //! `is_relay_self_uptime` branch.
+    //!
+    //! Kept under 1 GB of bytes so `repflow_amount = bytes / BYTES_PER_FLOW == 0`
+    //! and the repflow-token CPI is skipped — no second program needs loading. The
+    //! $FLOW mint CPI is real (SPL-Token is a built-in in solana-program-test).
+    //!
+    //! The small SPL/account helpers mirror `claim_relay_uptime_integration_tests`;
+    //! duplicated here to keep the module self-contained.
+    use super::*;
+    use solana_program::{program_option::COption, program_pack::Pack};
+    use solana_program_test::*;
+    use solana_sdk::{
+        account::Account,
+        instruction::{AccountMeta, Instruction},
+        signature::{Keypair, Signer},
+        transaction::Transaction,
+    };
+    use crate::{id, process_instruction, RewardsInstruction};
+
+    fn program_test() -> ProgramTest {
+        ProgramTest::new("freeflow_rewards_v2", id(), processor!(process_instruction))
+    }
+
+    fn flow_mint_account(mint_authority: &Pubkey) -> Account {
+        let mut data = vec![0u8; spl_token::state::Mint::LEN];
+        spl_token::state::Mint {
+            mint_authority: COption::Some(*mint_authority),
+            supply: 0,
+            decimals: FLOW_DECIMALS as u8,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        }
+        .pack_into_slice(&mut data);
+        Account { lamports: 10_000_000, data, owner: spl_token::id(), executable: false, rent_epoch: 0 }
+    }
+
+    fn spl_token_account(mint: &Pubkey, owner: &Pubkey) -> Account {
+        let mut data = vec![0u8; spl_token::state::Account::LEN];
+        spl_token::state::Account {
+            mint: *mint,
+            owner: *owner,
+            amount: 0,
+            delegate: COption::None,
+            state: spl_token::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        }
+        .pack_into_slice(&mut data);
+        Account { lamports: 10_000_000, data, owner: spl_token::id(), executable: false, rent_epoch: 0 }
+    }
+
+    /// repFlow mirror matching `read_repflow_balance`: 8-byte Anchor disc + 32-byte
+    /// wallet + 8-byte balance LE.
+    fn repflow_user_account(balance: u64) -> Account {
+        let mut data = vec![0u8; 48];
+        data[40..48].copy_from_slice(&balance.to_le_bytes());
+        Account { lamports: 1_000_000, data, owner: id(), executable: false, rent_epoch: 0 }
+    }
+
+    async fn token_balance(banks: &mut BanksClient, pk: Pubkey) -> u64 {
+        let acct = banks.get_account(pk).await.expect("rpc").expect("token account exists");
+        spl_token::state::Account::unpack(&acct.data).expect("unpack token account").amount
+    }
+
+    async fn fund(banks: &mut BanksClient, payer: &Keypair, to: &Pubkey, bh: solana_sdk::hash::Hash) {
+        banks
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[solana_sdk::system_instruction::transfer(&payer.pubkey(), to, 1_000_000_000)],
+                Some(&payer.pubkey()),
+                &[payer],
+                bh,
+            ))
+            .await
+            .expect("fund relay");
+    }
+
+    /// A post-CommitClaim commitment: single client, merkle_root == the client's
+    /// leaf (single-leaf tree), enough bandwidth_amount/total_bytes to cover it.
+    fn commitment_account(
+        relay:            &Pubkey,
+        epoch:            u64,
+        merkle_root:      [u8; 32],
+        bandwidth_amount: u64,
+        total_bytes:      u64,
+        bump:             u8,
+    ) -> Account {
+        let c = ClaimCommitment {
+            relay_pubkey:     relay.to_bytes(),
+            claim_epoch:      epoch,
+            merkle_root,
+            client_count:     1,
+            bandwidth_amount,
+            uptime_amount:    0,
+            total_bytes,
+            uptime_hours:     0,
+            routing_per_mb:   DEFAULT_ROUTING_PER_MB,
+            uptime_per_hour:  DEFAULT_UPTIME_PER_HOUR,
+            committed_at:     0,
+            uptime_paid:      false,
+            reserved_count:   0,
+            released_count:   0,
+            released_amount:  0,
+            released_bytes:   0,
+            status:           ClaimCommitmentStatus::Active,
+            dispute_deadline: 0,
+            bump,
+        };
+        let data = borsh::to_vec(&c).expect("borsh commitment");
+        let mut padded = vec![0u8; CLAIM_COMMITMENT_SIZE];
+        padded[..data.len()].copy_from_slice(&data);
+        Account { lamports: 10_000_000, data: padded, owner: id(), executable: false, rent_epoch: 0 }
+    }
+
+    fn foundation_config_account(wallet: &Pubkey, bump: u8) -> Account {
+        let fc = FoundationConfig {
+            foundation_wallet: wallet.to_bytes(),
+            trial_enabled:  true,
+            uptime_enabled: true,
+            bump,
+        };
+        let data = borsh::to_vec(&fc).expect("borsh fc");
+        let mut padded = vec![0u8; FOUNDATION_CONFIG_SIZE];
+        padded[..data.len()].copy_from_slice(&data);
+        Account { lamports: 1_000_000, data: padded, owner: id(), executable: false, rent_epoch: 0 }
+    }
+
+    #[tokio::test]
+    async fn release_trial_claim_success_mints_70_30_and_records_usage() {
+        let relay      = Keypair::new();
+        let foundation = Keypair::new().pubkey();
+        let epoch      = 7_777u64;
+        let client_pubkey = [9u8; 32];
+        // < 1 GB so the repflow-token CPI is skipped; still a nonzero $FLOW reward.
+        let bytes = 500_000_000u64;
+
+        // The single trial-client release. Fields mirror `make_release` in test_e2e.
+        let release = ClientReleaseOnChain {
+            client_pubkey,
+            session_id:       [3u8; 16],
+            batch_nonce:      1,
+            total_bytes:      bytes,
+            merkle_proof:     vec![], // single-leaf tree: no proof needed
+            client_signature: [1u8; 64], // non-null (the handler only rejects all-zero)
+            device_uuid:      [7u8; 16],
+            record_count:     1,
+        };
+        // Single-leaf tree: the root IS the leaf.
+        let merkle_root = compute_merkle_leaf_hash_from_release(&release);
+        let derived = derive_reward_amount(bytes, DEFAULT_ROUTING_PER_MB);
+        assert!(derived > 0, "test bytes must yield a nonzero reward");
+
+        let (c_pda, c_bump) = Pubkey::find_program_address(
+            &[b"claim_commitment", relay.pubkey().as_ref(), &epoch.to_le_bytes()], &id());
+        let (fc_pda, fc_bump) = Pubkey::find_program_address(&[b"foundation_config"], &id());
+        let (service_auth, _) = Pubkey::find_program_address(&[b"mint_authority"], &id());
+        let (tmc_pda, _) = Pubkey::find_program_address(
+            &[b"trial_mint_cap", relay.pubkey().as_ref(), &epoch.to_le_bytes()], &id());
+        let (claim_state_pda, _) = Pubkey::find_program_address(
+            &[b"claim_state", &client_pubkey, relay.pubkey().as_ref()], &id());
+        let (trial_usage_pda, _) = Pubkey::find_program_address(
+            &[b"trial_usage", &client_pubkey], &id());
+
+        let flow_mint      = Keypair::new().pubkey();
+        let relay_token    = Keypair::new().pubkey();
+        let treasury_token = Keypair::new().pubkey();
+        let repflow_pk     = Keypair::new().pubkey();
+        let stub           = Keypair::new().pubkey();
+
+        let mut pt = program_test();
+        pt.add_account(c_pda, commitment_account(&relay.pubkey(), epoch, merkle_root, derived, bytes, c_bump));
+        pt.add_account(fc_pda, foundation_config_account(&foundation, fc_bump));
+        pt.add_account(repflow_pk, repflow_user_account(MIN_RELAY_REPFLOW));
+        pt.add_account(flow_mint, flow_mint_account(&service_auth));
+        pt.add_account(relay_token, spl_token_account(&flow_mint, &relay.pubkey()));
+        pt.add_account(treasury_token, spl_token_account(&flow_mint, &foundation));
+
+        let (mut banks, payer, bh) = pt.start().await;
+        fund(&mut banks, &payer, &relay.pubkey(), bh).await;
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let ix = Instruction {
+            program_id: id(),
+            accounts: vec![
+                AccountMeta::new(relay.pubkey(), true),                              // 0  relay_wallet
+                AccountMeta::new(c_pda, false),                                      // 1  commitment
+                AccountMeta::new_readonly(fc_pda, false),                            // 2  foundation_config
+                AccountMeta::new_readonly(spl_token::id(), false),                   // 3  token_program
+                AccountMeta::new(flow_mint, false),                                  // 4  flow_mint
+                AccountMeta::new_readonly(service_auth, false),                      // 5  service_authority
+                AccountMeta::new_readonly(stub, false),                              // 6  repflow_program (not CPI'd: bytes < 1 GB)
+                AccountMeta::new_readonly(stub, false),                              // 7  repflow_config
+                AccountMeta::new_readonly(repflow_pk, false),                        // 8  relay_repflow_user
+                AccountMeta::new(relay_token, false),                                // 9  reward_relay
+                AccountMeta::new(treasury_token, false),                             // 10 reward_treasury
+                AccountMeta::new(tmc_pda, false),                                    // 11 trial_mint_cap
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),  // 12 system_program
+                AccountMeta::new(claim_state_pda, false),                           // + claim_state
+                AccountMeta::new(trial_usage_pda, false),                           // + trial_usage
+            ],
+            data: borsh::to_vec(&RewardsInstruction::ReleaseTrialClaim {
+                claim_epoch: epoch,
+                releases:    vec![release],
+            })
+            .expect("encode ReleaseTrialClaim"),
+        };
+        banks
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix], Some(&relay.pubkey()), &[&relay], bh,
+            ))
+            .await
+            .expect("ReleaseTrialClaim success path must mint");
+
+        // 70/30 split, remainder to treasury (matches the handler's M-1 arithmetic).
+        let want_relay    = derived * RELAY_SPLIT_PCT / 100;
+        let want_treasury = derived - want_relay;
+        assert_eq!(token_balance(&mut banks, relay_token).await, want_relay, "relay gets 70%");
+        assert_eq!(token_balance(&mut banks, treasury_token).await, want_treasury, "treasury gets 30%");
+
+        // Commitment accounting advanced.
+        let cacct = banks.get_account(c_pda).await.unwrap().unwrap();
+        let c = ClaimCommitment::try_from_slice(&cacct.data[..CLAIM_COMMITMENT_SIZE]).unwrap();
+        assert_eq!(c.released_count, 1, "commitment records the release");
+        assert_eq!(c.released_amount, derived, "released_amount == contract-derived value");
+
+        // Per-relay-per-epoch trial cap advanced by exactly the derived amount.
+        let tmc_acct = banks.get_account(tmc_pda).await.unwrap().unwrap();
+        let tmc = TrialMintCap::try_from_slice(&tmc_acct.data[..TRIAL_MINT_CAP_SIZE]).unwrap();
+        assert_eq!(tmc.minted_so_far, derived, "trial mint cap records the derived amount");
+
+        // Trial usage PDA created and byte usage recorded (anti-abuse accounting).
+        let tu_acct = banks.get_account(trial_usage_pda).await.unwrap().unwrap();
+        let tu = TrialUsage::try_from_slice(&tu_acct.data[..TRIAL_USAGE_SIZE]).unwrap();
+        assert_eq!(tu.used_bytes, bytes, "trial usage records the served bytes");
+    }
+}
