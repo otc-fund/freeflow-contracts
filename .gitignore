@@ -3,3 +3,6 @@
 /Wallet/
 BOOTSTRAP.md
 freeflow-contracts/deploy/
+
+# 460MB DHT snapshot — never belongs in git.
+dht_state_backup_*.json
