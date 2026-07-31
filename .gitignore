@@ -6,3 +6,6 @@ freeflow-contracts/deploy/
 
 # 460MB DHT snapshot — never belongs in git.
 dht_state_backup_*.json
+
+# Throwaway WSL build/diagnostic scratch.
+freeflow-contracts/_*.sh
