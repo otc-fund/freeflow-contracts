@@ -161,6 +161,53 @@ fn read_repflow_balance(repflow_user_ai: &AccountInfo) -> Result<u64, ProgramErr
     Ok(balance)
 }
 
+/// Validate that `repflow_user_ai` is a genuine repflow-token `RepFlowUser` PDA,
+/// then read its balance. This is the ONLY balance reader the handlers should use.
+///
+/// The bare `read_repflow_balance` trusts raw bytes at a fixed offset — it checks
+/// neither the account owner nor its address, so any 48-byte account (a fabricated
+/// one the caller owns, or an unrelated relay's *public* PDA) can satisfy the
+/// repFlow gate or absorb a slash. Binding the account to the authentic
+/// `REPFLOW_PROGRAM_ID` closes both:
+///   1. owner must be repflow-token — a system-owned or attacker-owned account fails;
+///   2. the address must be the canonical `[b"repflow_user", wallet]` PDA.
+///
+/// `expected_wallet`:
+///   - `Some(w)` — the address must be the PDA for `w`. Use at the repFlow gate
+///     (`w = relay_wallet`, so a relay presents *its own* balance, never a
+///     borrowed one) and in `ClientDispute` (`w = commitment.relay_pubkey`, so the
+///     slash burns the committing relay, never an unrelated account).
+///   - `None` — bind to the account's *own* stored wallet (bytes `[8..40]`). Use
+///     where a trusted signer names the target (`SlashTrialFraud`); this still
+///     rejects any account that is not a genuine repflow_user PDA.
+///
+/// `REPFLOW_PROGRAM_ID` is a compile-time constant, never a caller-supplied
+/// account, so the derivation cannot be pointed at an attacker program.
+fn read_checked_repflow_balance(
+    repflow_user_ai: &AccountInfo,
+    expected_wallet: Option<&[u8; 32]>,
+) -> Result<u64, ProgramError> {
+    if repflow_user_ai.owner != &REPFLOW_PROGRAM_ID {
+        return Err(RewardsError::RepFlowUserInvalid.into());
+    }
+    let stored_wallet: [u8; 32] = {
+        let data = repflow_user_ai.data.borrow();
+        if data.len() < 8 + 32 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        data[8..40].try_into().map_err(|_| ProgramError::InvalidAccountData)?
+    };
+    let wallet = expected_wallet.unwrap_or(&stored_wallet);
+    let (expected_pda, _) = Pubkey::find_program_address(
+        &[b"repflow_user", wallet.as_ref()],
+        &REPFLOW_PROGRAM_ID,
+    );
+    if repflow_user_ai.key != &expected_pda {
+        return Err(RewardsError::RepFlowUserInvalid.into());
+    }
+    read_repflow_balance(repflow_user_ai)
+}
+
 // ── 0: CommitClaim ───────────────────────────────────────────────────────────
 
 /// Clamp reported uptime to what is provably claimable.
@@ -820,7 +867,8 @@ pub fn process_release_claim_ix(
     }
 
     // repFlow gate check.
-    let repflow_balance = read_repflow_balance(relay_repflow_user)?;
+    let repflow_balance =
+        read_checked_repflow_balance(relay_repflow_user, Some(&relay_wallet.key.to_bytes()))?;
 
     if repflow_balance >= MIN_RELAY_REPFLOW {
         // Mint $FLOW 70/30.
@@ -1058,8 +1106,11 @@ pub fn process_client_dispute_ix(
 
     rep.slash_count += 1;
 
-    // Tiered slash amount.
-    let relay_repflow_balance = read_repflow_balance(relay_repflow_user)?;
+    // Tiered slash amount. F-1: bind the slash target to the committing relay's
+    // repFlow PDA (commitment.relay_pubkey) — a dispute must never burn an
+    // unrelated or fabricated account. A mismatch reverts before any slash.
+    let relay_repflow_balance =
+        read_checked_repflow_balance(relay_repflow_user, Some(&commitment.relay_pubkey))?;
     let slash_amount = match rep.slash_count {
         1 => SLASH_FIRST_OFFENSE,
         2 => SLASH_SECOND_OFFENSE,
@@ -1164,7 +1215,8 @@ pub fn process_claim_pending_ix(
     }
 
     // Check repFlow gate.
-    let repflow_balance = read_repflow_balance(relay_repflow_user)?;
+    let repflow_balance =
+        read_checked_repflow_balance(relay_repflow_user, Some(&relay_wallet.key.to_bytes()))?;
     if repflow_balance < MIN_RELAY_REPFLOW {
         return Err(RewardsError::RepFlowGateNotMet.into());
     }
@@ -1262,7 +1314,8 @@ pub fn process_release_trial_claim_ix(
     }
 
     // repFlow gate.
-    let repflow_balance = read_repflow_balance(relay_repflow_user)?;
+    let repflow_balance =
+        read_checked_repflow_balance(relay_repflow_user, Some(&relay_wallet.key.to_bytes()))?;
     if repflow_balance < MIN_RELAY_REPFLOW {
         return Err(RewardsError::RepFlowGateNotMet.into());
     }
@@ -1622,7 +1675,9 @@ pub fn process_slash_trial_fraud_ix(
     };
 
     rep.slash_count += 1;
-    let relay_repflow_balance = read_repflow_balance(relay_repflow_user)?;
+    // F-1: reject a fabricated target. The foundation names the relay, so bind to
+    // the account's own stored wallet — still requires a genuine repflow_user PDA.
+    let relay_repflow_balance = read_checked_repflow_balance(relay_repflow_user, None)?;
     let slash_amount = match rep.slash_count {
         1 => SLASH_FIRST_OFFENSE,
         2 => SLASH_SECOND_OFFENSE,
@@ -1889,7 +1944,8 @@ pub fn process_claim_relay_uptime_ix(
         return Ok(());
     }
 
-    let repflow_balance = read_repflow_balance(relay_repflow_user)?;
+    let repflow_balance =
+        read_checked_repflow_balance(relay_repflow_user, Some(&relay_wallet.key.to_bytes()))?;
     if repflow_balance < MIN_RELAY_REPFLOW {
         return Err(RewardsError::RepFlowGateNotMet.into());
     }
@@ -2085,7 +2141,9 @@ mod claim_relay_uptime_integration_tests {
     fn repflow_user_account(balance: u64) -> Account {
         let mut data = vec![0u8; 48];
         data[40..48].copy_from_slice(&balance.to_le_bytes());
-        Account { lamports: 1_000_000, data, owner: id(), executable: false, rent_epoch: 0 }
+        // F-1: owned by the real repflow-token program so read_checked_repflow_balance
+        // accepts it (paired with a genuine [b"repflow_user", relay] PDA at the call site).
+        Account { lamports: 1_000_000, data, owner: REPFLOW_PROGRAM_ID, executable: false, rent_epoch: 0 }
     }
 
     /// Build a `ClaimRelayUptime` instruction in the exact account order Task
@@ -2264,7 +2322,8 @@ mod claim_relay_uptime_integration_tests {
         let mut pt = program_test();
         pt.add_account(c_pda, commitment_account(&relay.pubkey(), claim_epoch, 10_000_000_000, false, c_bump));
         pt.add_account(fc_pda, foundation_config_account(&relay.pubkey(), true, fc_bump));
-        let repflow_pk = Keypair::new().pubkey();
+        let repflow_pk = Pubkey::find_program_address(
+            &[b"repflow_user", relay.pubkey().as_ref()], &REPFLOW_PROGRAM_ID).0; // F-1: genuine PDA
         pt.add_account(repflow_pk, repflow_user_account(MIN_RELAY_REPFLOW - 1));
 
         let (mut banks, payer, bh) = pt.start().await;
@@ -2362,7 +2421,7 @@ mod claim_relay_uptime_integration_tests {
         let flow_mint   = Keypair::new().pubkey();
         // Deliberately NOT an ATA: reward_relay is unconstrained by design.
         let relay_token = Keypair::new().pubkey();
-        let repflow_pk  = Keypair::new().pubkey();
+        let repflow_pk  = Pubkey::find_program_address(&[b"repflow_user", relay.pubkey().as_ref()], &REPFLOW_PROGRAM_ID).0;
 
         let mut pt = program_test();
         pt.add_account(c_pda, commitment_account(&relay.pubkey(), claim_epoch, amount, false, c_bump));
@@ -3084,7 +3143,9 @@ mod release_trial_claim_integration_tests {
     fn repflow_user_account(balance: u64) -> Account {
         let mut data = vec![0u8; 48];
         data[40..48].copy_from_slice(&balance.to_le_bytes());
-        Account { lamports: 1_000_000, data, owner: id(), executable: false, rent_epoch: 0 }
+        // F-1: owned by the real repflow-token program so read_checked_repflow_balance
+        // accepts it (paired with a genuine [b"repflow_user", relay] PDA at the call site).
+        Account { lamports: 1_000_000, data, owner: REPFLOW_PROGRAM_ID, executable: false, rent_epoch: 0 }
     }
 
     async fn token_balance(banks: &mut BanksClient, pk: Pubkey) -> u64 {
@@ -3193,7 +3254,7 @@ mod release_trial_claim_integration_tests {
         let flow_mint      = Keypair::new().pubkey();
         let relay_token    = Keypair::new().pubkey();
         let treasury_token = Keypair::new().pubkey();
-        let repflow_pk     = Keypair::new().pubkey();
+        let repflow_pk     = Pubkey::find_program_address(&[b"repflow_user", relay.pubkey().as_ref()], &REPFLOW_PROGRAM_ID).0;
         let stub           = Keypair::new().pubkey();
 
         let mut pt = program_test();
@@ -3563,7 +3624,8 @@ mod release_claim_integration_tests {
     fn repflow_user_account(balance: u64) -> Account {
         let mut d = vec![0u8; 48];
         d[40..48].copy_from_slice(&balance.to_le_bytes());
-        Account { lamports: 1_000_000, data: d, owner: id(), executable: false, rent_epoch: 0 }
+        // F-1: owned by the real repflow-token program (see uptime module note).
+        Account { lamports: 1_000_000, data: d, owner: REPFLOW_PROGRAM_ID, executable: false, rent_epoch: 0 }
     }
     fn stub(owner: Pubkey, len: usize) -> Account {
         Account { lamports: 1_000_000, data: vec![0u8; len], owner, executable: false, rent_epoch: 0 }
@@ -3614,7 +3676,7 @@ mod release_claim_integration_tests {
         let flow_mint = Keypair::new().pubkey();
         let relay_tok = Keypair::new().pubkey();
         let treas_tok = Keypair::new().pubkey();
-        let repflow = Keypair::new().pubkey();
+        let repflow = Pubkey::find_program_address(&[b"repflow_user", relay.pubkey().as_ref()], &REPFLOW_PROGRAM_ID).0;
         let s = Keypair::new().pubkey();
         let fund_hold = Keypair::new().pubkey();
         let user_escrow = Keypair::new().pubkey();
@@ -3706,7 +3768,8 @@ mod client_dispute_integration_tests {
     }
     fn repflow_user_account(balance: u64) -> Account {
         let mut d = vec![0u8; 48]; d[40..48].copy_from_slice(&balance.to_le_bytes());
-        Account { lamports: 1_000_000, data: d, owner: id(), executable: false, rent_epoch: 0 }
+        // F-1: owned by the real repflow-token program (see uptime module note).
+        Account { lamports: 1_000_000, data: d, owner: REPFLOW_PROGRAM_ID, executable: false, rent_epoch: 0 }
     }
     fn stub(owner: Pubkey, len: usize) -> Account {
         Account { lamports: 1_000_000, data: vec![0u8; len], owner, executable: false, rent_epoch: 0 }
@@ -3775,7 +3838,7 @@ mod client_dispute_integration_tests {
         // Honest: committed root IS the reconstructed leaf -> in_tree -> no slash.
         let (c_pda, c_bump) = Pubkey::find_program_address(&[b"claim_commitment", f.relay_pk.as_ref(), &epoch.to_le_bytes()], &id());
         let (rep_pda, _) = Pubkey::find_program_address(&[b"relay_reputation", &f.relay_pk.to_bytes()], &id());
-        let repflow = Keypair::new().pubkey();
+        let repflow = Pubkey::find_program_address(&[b"repflow_user", f.relay_pk.as_ref()], &REPFLOW_PROGRAM_ID).0;
         let fund_hold = Keypair::new().pubkey();
         let user_escrow = Keypair::new().pubkey();
 
@@ -3806,7 +3869,7 @@ mod client_dispute_integration_tests {
         // Forgery: committed root is NOT the reconstructed leaf -> slash.
         let (c_pda, c_bump) = Pubkey::find_program_address(&[b"claim_commitment", f.relay_pk.as_ref(), &epoch.to_le_bytes()], &id());
         let (rep_pda, _) = Pubkey::find_program_address(&[b"relay_reputation", &f.relay_pk.to_bytes()], &id());
-        let repflow = Keypair::new().pubkey();
+        let repflow = Pubkey::find_program_address(&[b"repflow_user", f.relay_pk.as_ref()], &REPFLOW_PROGRAM_ID).0;
         let fund_hold = Keypair::new().pubkey();
         let user_escrow = Keypair::new().pubkey();
 

@@ -76,6 +76,12 @@ pub enum RewardsError {
     /// account for the mint being paid. Appended — never renumber the
     /// variants above: deployed off-chain code maps these by number.
     InvalidTreasuryAccount         = 50,
+
+    /// `relay_repflow_user` is not the repflow-token `RepFlowUser` PDA bound to
+    /// the expected relay wallet — the repFlow gate and the dispute slash must
+    /// never accept a fabricated or unrelated account. Appended — never renumber
+    /// the variants above: deployed off-chain code maps these by number.
+    RepFlowUserInvalid             = 51,
 }
 
 impl From<RewardsError> for ProgramError {

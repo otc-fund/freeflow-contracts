@@ -637,7 +637,7 @@ mod integration {
         Account {
             lamports:   1_000_000,
             data,
-            owner:      id(), // owned by rewards-v2 for test isolation
+            owner:      REPFLOW_PROGRAM_ID, // F-1: real repflow-token owner for the gate binding
             executable: false,
             rent_epoch: 0,
         }
@@ -891,7 +891,8 @@ mod integration {
         let mut pt            = program_test();
         let commitment_pk     = Keypair::new().pubkey();
         let foundation_cfg_pk = Keypair::new().pubkey();
-        let repflow_user_pk   = Keypair::new().pubkey();
+        let repflow_user_pk   = Pubkey::find_program_address(
+            &[b"repflow_user", relay.pubkey().as_ref()], &REPFLOW_PROGRAM_ID).0; // F-1: genuine PDA
         let trial_cap_pk      = Keypair::new().pubkey();
 
         pt.add_account(commitment_pk,    commitment_account(claim_epoch, &relay.pubkey()));

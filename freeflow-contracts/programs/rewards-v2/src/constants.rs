@@ -35,6 +35,18 @@ pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
     11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
 ]);
 
+/// repFlow-token program (`8K4GhPEQ1yy9vdTaMPTL83G5qr5ZHZiBm2VBQ58jJs5w`).
+///
+/// The authentic deployed repflow-token program — matches `Anchor.toml` and the
+/// program's own `declare_id!`. Used to bind `relay_repflow_user` in the repFlow
+/// gate and the dispute slash: the account's owner must be this program and its
+/// address must be the canonical `[b"repflow_user", wallet]` PDA.
+///
+/// MUST be this hardcoded constant — never a caller-supplied program account —
+/// or the PDA derivation could be redirected to an attacker-controlled program.
+pub const REPFLOW_PROGRAM_ID: Pubkey =
+    solana_program::pubkey!("8K4GhPEQ1yy9vdTaMPTL83G5qr5ZHZiBm2VBQ58jJs5w");
+
 /// Seconds per epoch (12 hours).
 pub const EPOCH_SECS: u64 = 43_200;
 
