@@ -9,3 +9,10 @@ dht_state_backup_*.json
 
 # Throwaway WSL build/diagnostic scratch.
 freeflow-contracts/_*.sh
+
+# Security audits document exploitable gaps in a LIVE deployed contract.
+# This repo is PUBLIC — these must never be committed.
+freeflow-contracts/SECURITY-AUDIT.md
+freeflow-contracts/SECURITY-FIXES-PLAN.md
+freeflow-contracts/**/SECURITY-AUDIT*.md
+freeflow-contracts/**/SECURITY-FIXES*.md
