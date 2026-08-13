@@ -4612,6 +4612,333 @@ mod release_claim_integration_tests {
              and strands that client's FundHold permanently"
         );
     }
+
+    // ── multi-transaction latch guards ──────────────────────────────────
+    //
+    // `first_release_of_a_two_client_epoch_leaves_it_releasing` above proves
+    // transaction 1 does not latch. These two prove the consequence that
+    // actually matters: transaction 2 LANDS, and the second client's FundHold
+    // is really burned. They also cover the probationary branch (handlers.rs
+    // :1217), which is the branch RackNerd takes and which nothing else
+    // exercises.
+    //
+    // Unlike the other tests in this module these register a mock escrow that
+    // WRITES — it stamps HoldStatus::Burned — so "the client was charged" is
+    // asserted against account bytes rather than assumed from an Ok return.
+    //
+    // Mutation check (run before trusting these): revert either latch site to
+    // an unconditional `commitment.status = Complete`. Transaction 1's
+    // `assert_eq!(c.status, Releasing)` fails, and transaction 2 fails outright
+    // with EpochComplete.
+
+
+    use crate::merkle::hash_pair;
+
+    /// FundHold (user-escrow) byte layout: 8 disc | 32 user | 8 amount |
+    /// 32 claim_hash | 16 session_id | 8 created_at | 1 status = 105.
+    const FH_LEN: usize = 105;
+    const FH_CLAIM_HASH: usize = 48;
+    const FH_STATUS: usize = 104;
+    const HOLD_BURNED: u8 = 2;
+
+    /// Emulates user_escrow::burn_held_funds: stamps the FundHold Burned and
+    /// records the claim_hash that crossed the CPI boundary.
+    /// CPI data = [disc:8][claim_hash:32]; accounts =
+    /// [mint_authority, user, user_escrow, user_escrow_token, fund_hold,
+    ///  spender_registry, token_mint, token_program] → fund_hold is index 4.
+    fn mock_escrow_burn(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+        assert_eq!(data.len(), 40, "burn_held_funds CPI data must be disc+claim_hash");
+        let mut fh = accounts[4].data.borrow_mut();
+        fh[FH_CLAIM_HASH..FH_CLAIM_HASH + 32].copy_from_slice(&data[8..40]);
+        fh[FH_STATUS] = HOLD_BURNED;
+        Ok(())
+    }
+
+    fn program_test_burn() -> ProgramTest {
+        let mut pt = ProgramTest::new("freeflow_rewards_v2", id(), processor!(process_instruction));
+        pt.add_program("mock_escrow", mock_escrow_id(), processor!(mock_escrow_burn));
+        pt
+    }
+
+    fn fund_hold_account() -> Account {
+        Account { lamports: 1_000_000, data: vec![0u8; FH_LEN], owner: mock_escrow_id(),
+                  executable: false, rent_epoch: 0 }
+    }
+
+    #[tokio::test]
+    async fn two_paid_clients_both_burn_across_two_transactions() {
+        let relay = Keypair::new();
+        let epoch = 6_162u64;
+        let c1 = [21u8; 32];
+        let c2 = [31u8; 32];
+        let bytes = 500_000_000u64; // < BYTES_PER_FLOW ⇒ repFlow CPI skipped
+        let derived = derive_reward_amount(bytes, DEFAULT_ROUTING_PER_MB);
+
+        let mut r1 = ClientReleaseOnChain {
+            client_pubkey: c1, session_id: [2u8; 16], batch_nonce: 1, total_bytes: bytes,
+            merkle_proof: vec![], client_signature: [1u8; 64], device_uuid: [0u8; 16], record_count: 1,
+        };
+        let mut r2 = ClientReleaseOnChain {
+            client_pubkey: c2, session_id: [3u8; 16], batch_nonce: 2, total_bytes: bytes,
+            merkle_proof: vec![], client_signature: [1u8; 64], device_uuid: [0u8; 16], record_count: 1,
+        };
+        let l1 = compute_merkle_leaf_hash_from_release(&r1);
+        let l2 = compute_merkle_leaf_hash_from_release(&r2);
+        let root = hash_pair(&l1, &l2);
+        r1.merkle_proof = vec![l2];
+        r2.merkle_proof = vec![l1];
+        assert!(verify_merkle_proof(l1, &r1.merkle_proof, root));
+        assert!(verify_merkle_proof(l2, &r2.merkle_proof, root));
+
+        let (c_pda, c_bump) = Pubkey::find_program_address(
+            &[b"claim_commitment", relay.pubkey().as_ref(), &epoch.to_le_bytes()], &id());
+        let (service_auth, _) = Pubkey::find_program_address(&[b"mint_authority"], &id());
+        let (cs1, cs1_b) = Pubkey::find_program_address(
+            &[b"claim_state", &c1, relay.pubkey().as_ref()], &id());
+        let (cs2, cs2_b) = Pubkey::find_program_address(
+            &[b"claim_state", &c2, relay.pubkey().as_ref()], &id());
+        let flow_mint = Keypair::new().pubkey();
+        let relay_tok = Keypair::new().pubkey();
+        let treas_tok = Pubkey::find_program_address(
+            &[FOUNDATION_PUBKEY.as_ref(), spl_token::id().as_ref(), flow_mint.as_ref()],
+            &Pubkey::new_from_array([
+                140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131,
+                11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
+            ]),
+        ).0;
+        let repflow = Pubkey::find_program_address(
+            &[b"repflow_user", relay.pubkey().as_ref()], &REPFLOW_PROGRAM_ID).0;
+        let (cb_pda, _) = Pubkey::find_program_address(
+            &[b"claimable_balance", relay.pubkey().as_ref(), &epoch.to_le_bytes()], &id());
+        let s = Keypair::new().pubkey();
+        let fh1 = Keypair::new().pubkey();
+        let fh2 = Keypair::new().pubkey();
+        let ue1 = Keypair::new().pubkey();
+        let ue2 = Keypair::new().pubkey();
+        let uet1 = Keypair::new().pubkey();
+        let uet2 = Keypair::new().pubkey();
+
+        let mut pt = program_test_burn();
+        pt.add_account(c_pda, commitment_account_n(
+            &relay.pubkey(), epoch, root, derived * 2, bytes * 2, c_bump, 2));
+        pt.add_account(cs1, claim_state_account(c1, &relay.pubkey(), cs1_b));
+        pt.add_account(cs2, claim_state_account(c2, &relay.pubkey(), cs2_b));
+        pt.add_account(repflow, repflow_user_account(MIN_RELAY_REPFLOW));
+        pt.add_account(flow_mint, flow_mint_account(&service_auth));
+        pt.add_account(relay_tok, spl_token_account(&flow_mint, &relay.pubkey()));
+        pt.add_account(treas_tok, spl_token_account(&flow_mint, &FOUNDATION_PUBKEY));
+        pt.add_account(fh1, fund_hold_account());
+        pt.add_account(fh2, fund_hold_account());
+        pt.add_account(ue1, stub(mock_escrow_id(), 8));
+        pt.add_account(ue2, stub(mock_escrow_id(), 8));
+        pt.add_account(uet1, stub(mock_escrow_id(), 8));
+        pt.add_account(uet2, stub(mock_escrow_id(), 8));
+
+        let (mut banks, payer, bh) = pt.start().await;
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(&payer.pubkey(), &relay.pubkey(), 2_000_000_000)],
+            Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let build = |rel: ClientReleaseOnChain, user: [u8; 32], cs: Pubkey,
+                     ue: Pubkey, fh: Pubkey, uet: Pubkey| Instruction {
+            program_id: id(),
+            accounts: vec![
+                AccountMeta::new(relay.pubkey(), true),
+                AccountMeta::new(c_pda, false),
+                AccountMeta::new_readonly(mock_escrow_id(), false),
+                AccountMeta::new_readonly(service_auth, false),
+                AccountMeta::new_readonly(s, false),
+                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new(flow_mint, false),
+                AccountMeta::new_readonly(s, false),
+                AccountMeta::new_readonly(s, false),
+                AccountMeta::new_readonly(repflow, false),
+                AccountMeta::new_readonly(s, false),
+                AccountMeta::new(relay_tok, false),
+                AccountMeta::new(treas_tok, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                AccountMeta::new_readonly(Pubkey::new_from_array(user), false),
+                AccountMeta::new(cs, false),
+                AccountMeta::new(ue, false),
+                AccountMeta::new(fh, false),
+                AccountMeta::new(uet, false),
+                // 19: claimable_balance — the relay sends this unconditionally
+                // (sidecar solana.rs:2999) and the handler reads it only on the
+                // probationary branch (handlers.rs:1176). Inert above the gate.
+                AccountMeta::new(cb_pda, false),
+            ],
+            data: borsh::to_vec(&RewardsInstruction::ReleaseClaim {
+                claim_epoch: epoch, releases: vec![rel] }).unwrap(),
+        };
+
+        // ── transaction 1 — client 1 ──
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[build(r1.clone(), c1, cs1, ue1, fh1, uet1)],
+            Some(&relay.pubkey()), &[&relay], bh)).await
+            .expect("first paid release must land");
+
+        let c = ClaimCommitment::try_from_slice(
+            &banks.get_account(c_pda).await.unwrap().unwrap().data[..CLAIM_COMMITMENT_SIZE]).unwrap();
+        assert_eq!(c.released_count, 1);
+        assert_eq!(c.status, ClaimCommitmentStatus::Releasing,
+            "1 of 2 reserved — must stay Releasing or tx2 hits EpochComplete");
+
+        // ── transaction 2 — client 2, same commitment ──
+        let bh2 = banks.get_new_latest_blockhash(&bh).await.unwrap();
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[build(r2.clone(), c2, cs2, ue2, fh2, uet2)],
+            Some(&relay.pubkey()), &[&relay], bh2)).await
+            .expect("SECOND paid release must land — free network use if it reverts");
+
+        let c = ClaimCommitment::try_from_slice(
+            &banks.get_account(c_pda).await.unwrap().unwrap().data[..CLAIM_COMMITMENT_SIZE]).unwrap();
+        assert_eq!(c.released_count, 2, "both paid clients released");
+        assert_eq!(c.status, ClaimCommitmentStatus::Complete, "last release closes the epoch");
+        assert_eq!(c.released_amount, derived * 2);
+        assert_eq!(c.released_bytes, bytes * 2);
+
+        // Both FundHolds actually burned, each with its own claim_hash.
+        for (fh, rel) in [(fh1, &r1), (fh2, &r2)] {
+            let a = banks.get_account(fh).await.unwrap().unwrap();
+            assert_eq!(a.data[FH_STATUS], HOLD_BURNED,
+                "every reserved client's FundHold must be burned");
+            let want = compute_claim_hash(
+                &rel.client_pubkey, &rel.session_id, rel.batch_nonce,
+                &compute_merkle_leaf_hash_from_release(rel));
+            assert_eq!(&a.data[FH_CLAIM_HASH..FH_CLAIM_HASH + 32], &want[..],
+                "burn CPI must carry this client's claim_hash");
+        }
+
+        assert_eq!(token_balance(&mut banks, relay_tok).await, derived * 2 * RELAY_SPLIT_PCT / 100);
+        assert_eq!(token_balance(&mut banks, treas_tok).await,
+            derived * 2 - derived * 2 * RELAY_SPLIT_PCT / 100);
+    }
+
+    #[tokio::test]
+    async fn probationary_two_clients_both_defer_across_two_transactions() {
+        let relay = Keypair::new();
+        let epoch = 6_163u64;
+        let c1 = [41u8; 32];
+        let c2 = [51u8; 32];
+        let bytes = 500_000_000u64;
+        let derived = derive_reward_amount(bytes, DEFAULT_ROUTING_PER_MB);
+
+        let mut r1 = ClientReleaseOnChain {
+            client_pubkey: c1, session_id: [2u8; 16], batch_nonce: 1, total_bytes: bytes,
+            merkle_proof: vec![], client_signature: [1u8; 64], device_uuid: [0u8; 16], record_count: 1,
+        };
+        let mut r2 = ClientReleaseOnChain {
+            client_pubkey: c2, session_id: [3u8; 16], batch_nonce: 2, total_bytes: bytes,
+            merkle_proof: vec![], client_signature: [1u8; 64], device_uuid: [0u8; 16], record_count: 1,
+        };
+        let l1 = compute_merkle_leaf_hash_from_release(&r1);
+        let l2 = compute_merkle_leaf_hash_from_release(&r2);
+        let root = hash_pair(&l1, &l2);
+        r1.merkle_proof = vec![l2];
+        r2.merkle_proof = vec![l1];
+
+        let (c_pda, c_bump) = Pubkey::find_program_address(
+            &[b"claim_commitment", relay.pubkey().as_ref(), &epoch.to_le_bytes()], &id());
+        let (service_auth, _) = Pubkey::find_program_address(&[b"mint_authority"], &id());
+        let (cs1, cs1_b) = Pubkey::find_program_address(
+            &[b"claim_state", &c1, relay.pubkey().as_ref()], &id());
+        let (cs2, cs2_b) = Pubkey::find_program_address(
+            &[b"claim_state", &c2, relay.pubkey().as_ref()], &id());
+        let (cb_pda, _) = Pubkey::find_program_address(
+            &[b"claimable_balance", relay.pubkey().as_ref(), &epoch.to_le_bytes()], &id());
+        let flow_mint = Keypair::new().pubkey();
+        let relay_tok = Keypair::new().pubkey();
+        let treas_tok = Keypair::new().pubkey();
+        let repflow = Pubkey::find_program_address(
+            &[b"repflow_user", relay.pubkey().as_ref()], &REPFLOW_PROGRAM_ID).0;
+        let s = Keypair::new().pubkey();
+        let (fh1, fh2) = (Keypair::new().pubkey(), Keypair::new().pubkey());
+        let (ue1, ue2) = (Keypair::new().pubkey(), Keypair::new().pubkey());
+        let (uet1, uet2) = (Keypair::new().pubkey(), Keypair::new().pubkey());
+
+        let mut pt = program_test_burn();
+        pt.add_account(c_pda, commitment_account_n(
+            &relay.pubkey(), epoch, root, derived * 2, bytes * 2, c_bump, 2));
+        pt.add_account(cs1, claim_state_account(c1, &relay.pubkey(), cs1_b));
+        pt.add_account(cs2, claim_state_account(c2, &relay.pubkey(), cs2_b));
+        // BELOW the gate — the probationary branch.
+        pt.add_account(repflow, repflow_user_account(MIN_RELAY_REPFLOW - 1));
+        pt.add_account(flow_mint, flow_mint_account(&service_auth));
+        pt.add_account(relay_tok, spl_token_account(&flow_mint, &relay.pubkey()));
+        pt.add_account(treas_tok, spl_token_account(&flow_mint, &FOUNDATION_PUBKEY));
+        pt.add_account(fh1, fund_hold_account());
+        pt.add_account(fh2, fund_hold_account());
+        pt.add_account(ue1, stub(mock_escrow_id(), 8));
+        pt.add_account(ue2, stub(mock_escrow_id(), 8));
+        pt.add_account(uet1, stub(mock_escrow_id(), 8));
+        pt.add_account(uet2, stub(mock_escrow_id(), 8));
+        // cb_pda deliberately NOT added: lamports == 0 ⇒ create_pda_account path.
+
+        let (mut banks, payer, bh) = pt.start().await;
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(&payer.pubkey(), &relay.pubkey(), 2_000_000_000)],
+            Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let build = |rel: ClientReleaseOnChain, user: [u8; 32], cs: Pubkey,
+                     ue: Pubkey, fh: Pubkey, uet: Pubkey| Instruction {
+            program_id: id(),
+            accounts: vec![
+                AccountMeta::new(relay.pubkey(), true),
+                AccountMeta::new(c_pda, false),
+                AccountMeta::new_readonly(mock_escrow_id(), false),
+                AccountMeta::new_readonly(service_auth, false),
+                AccountMeta::new_readonly(s, false),
+                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new(flow_mint, false),
+                AccountMeta::new_readonly(s, false),
+                AccountMeta::new_readonly(s, false),
+                AccountMeta::new_readonly(repflow, false),
+                AccountMeta::new_readonly(s, false),
+                AccountMeta::new(relay_tok, false),
+                AccountMeta::new(treas_tok, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                AccountMeta::new_readonly(Pubkey::new_from_array(user), false),
+                AccountMeta::new(cs, false),
+                AccountMeta::new(ue, false),
+                AccountMeta::new(fh, false),
+                AccountMeta::new(uet, false),
+                AccountMeta::new(cb_pda, false),
+            ],
+            data: borsh::to_vec(&RewardsInstruction::ReleaseClaim {
+                claim_epoch: epoch, releases: vec![rel] }).unwrap(),
+        };
+
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[build(r1.clone(), c1, cs1, ue1, fh1, uet1)],
+            Some(&relay.pubkey()), &[&relay], bh)).await
+            .expect("first probationary release must land");
+        let c = ClaimCommitment::try_from_slice(
+            &banks.get_account(c_pda).await.unwrap().unwrap().data[..CLAIM_COMMITMENT_SIZE]).unwrap();
+        assert_eq!(c.status, ClaimCommitmentStatus::Releasing,
+            "probationary branch latches Complete too — handlers.rs:1217");
+
+        let bh2 = banks.get_new_latest_blockhash(&bh).await.unwrap();
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[build(r2.clone(), c2, cs2, ue2, fh2, uet2)],
+            Some(&relay.pubkey()), &[&relay], bh2)).await
+            .expect("SECOND probationary release must land");
+
+        let c = ClaimCommitment::try_from_slice(
+            &banks.get_account(c_pda).await.unwrap().unwrap().data[..CLAIM_COMMITMENT_SIZE]).unwrap();
+        assert_eq!(c.released_count, 2);
+        assert_eq!(c.status, ClaimCommitmentStatus::Complete);
+
+        let cb = ClaimableBalance::try_from_slice(
+            &banks.get_account(cb_pda).await.unwrap().unwrap().data[..CLAIMABLE_BALANCE_SIZE]).unwrap();
+        assert_eq!(cb.pending_relay_flow, derived * 2 * RELAY_SPLIT_PCT / 100,
+            "BOTH clients' deferred 70% accumulated");
+        for fh in [fh1, fh2] {
+            assert_eq!(banks.get_account(fh).await.unwrap().unwrap().data[FH_STATUS], HOLD_BURNED);
+        }
+        assert_eq!(token_balance(&mut banks, relay_tok).await, 0, "nothing minted below the gate");
+    }
 }
 
 #[cfg(test)]
