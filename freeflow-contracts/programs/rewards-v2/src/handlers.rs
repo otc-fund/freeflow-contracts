@@ -610,6 +610,71 @@ pub fn process_reserve_batch_ix(
 }
 
 #[cfg(test)]
+mod complete_latch_tests {
+    use super::*;
+
+    fn commitment(client_count: u32, reserved: u32, released: u32) -> ClaimCommitment {
+        ClaimCommitment {
+            relay_pubkey: [0u8; 32], claim_epoch: 1, merkle_root: [0u8; 32],
+            client_count, bandwidth_amount: 0, uptime_amount: 0, total_bytes: 0,
+            uptime_hours: 0, routing_per_mb: 0, uptime_per_hour: 0, committed_at: 0,
+            uptime_paid: false, reserved_count: reserved, released_count: released,
+            released_amount: 0, released_bytes: 0,
+            status: ClaimCommitmentStatus::Releasing, dispute_deadline: 0, bump: 0,
+        }
+    }
+
+    /// THE regression. The relay fits exactly one paid release per transaction,
+    /// so an epoch with two reserved clients closes over two txs. Latching
+    /// Complete after the first sent the second to `_ => EpochComplete` and
+    /// stranded its FundHold permanently — nothing in the program can
+    /// un-Complete a commitment.
+    #[test]
+    fn first_of_two_releases_must_not_complete_the_epoch() {
+        assert!(
+            !epoch_is_fully_released(&commitment(2, 2, 1)),
+            "1 of 2 reserved clients released — the epoch must stay Releasing, \
+             or the second tx reverts EpochComplete and its FundHold is lost"
+        );
+        assert!(
+            epoch_is_fully_released(&commitment(2, 2, 2)),
+            "the LAST release closes the epoch"
+        );
+    }
+
+    /// The denominator must be reserved_count, not client_count. client_count
+    /// is the relay's batches.len() — paid AND trial — while ReleaseClaim
+    /// releases only the paid subset, so comparing against it would hang every
+    /// mixed epoch in Releasing forever: the same bug wearing the other mask.
+    #[test]
+    fn mixed_paid_and_trial_epoch_completes_on_the_paid_subset() {
+        // 3 clients committed, only 1 of them paid and therefore reserved.
+        let c = commitment(3, 1, 1);
+        assert!(
+            epoch_is_fully_released(&c),
+            "the single reserved (paid) client has been released — the epoch is \
+             done, even though client_count is 3 and the other two were trial"
+        );
+    }
+
+    /// A partially-succeeded ReserveBatch leaves reserved_count short. Still
+    /// correct: a client with no FundHold cannot be released at all, so the
+    /// epoch closes over exactly what was reservable.
+    #[test]
+    fn partial_reserve_still_closes_on_what_was_reserved() {
+        assert!(epoch_is_fully_released(&commitment(5, 2, 2)));
+        assert!(!epoch_is_fully_released(&commitment(5, 2, 1)));
+    }
+
+    /// Degenerate: nothing reserved (an all-trial epoch reaching ReleaseClaim).
+    /// `>=` rather than `==` keeps this closing instead of hanging.
+    #[test]
+    fn nothing_reserved_is_vacuously_complete() {
+        assert!(epoch_is_fully_released(&commitment(2, 0, 0)));
+    }
+}
+
+#[cfg(test)]
 mod derive_amount_tests {
     use super::*;
 
@@ -691,6 +756,73 @@ mod pda_init_predicate_tests {
         let program_id = Pubkey::new_unique();
         assert!(!is_pda_initialized(&program_id, 0, &program_id));
     }
+}
+
+// ── Helper: has every reserved client been released? ──────────────────────────
+
+/// True once every client this epoch actually reserved has been released.
+///
+/// Guards the `Complete` latch in both branches of `process_release_claim_ix`.
+/// Before this existed the status was set unconditionally at the end of the
+/// FIRST transaction, and the relay fits exactly one paid release per
+/// transaction — so any epoch with 2+ paid clients stranded every client after
+/// the first: the next tx falls to the `_ => EpochComplete` arm, and nothing in
+/// the program can un-Complete a commitment (`ClientDispute` requires `Active`).
+///
+/// **The denominator is `reserved_count`, not `client_count`.** `client_count`
+/// is the relay's `batches.len()` — paid AND trial — while `ReleaseClaim`
+/// releases only the paid subset, so comparing against it would leave every
+/// mixed paid+trial epoch stuck in `Releasing` forever: the same bug wearing
+/// the opposite mask. `reserved_count` increments once per `ReserveBatch` entry
+/// (`process_reserve_batch_ix`) and only paid clients are ever reserved, which
+/// makes it exactly the set `ReleaseClaim` can close.
+///
+/// It stays exact in two edge cases worth naming:
+/// * A paid batch capped to 0 bytes is dropped from the reserve AND from the
+///   release by identical relay-side filters, so it is in neither count.
+/// * If `ReserveBatch` partially failed, `reserved_count` is short — still
+///   correct, because a client with no `FundHold` cannot be released at all.
+fn epoch_is_fully_released(commitment: &ClaimCommitment) -> bool {
+    commitment.released_count >= commitment.reserved_count
+}
+
+// ── Helper: pin the treasury sink ─────────────────────────────────────────────
+
+/// The 30% treasury share may ONLY be minted to the foundation's canonical
+/// $FLOW ATA.
+///
+/// Without this a relay passes a second account it controls as
+/// `reward_treasury` and keeps 100% of the reward instead of 70% —
+/// `cpi_mint_flow` validates nothing about its destination and signs with the
+/// program's own `mint_authority` PDA, so the mint simply succeeds.
+///
+/// `reward_relay` is deliberately NOT constrained: the relay legitimately owns
+/// its 70%, and forcing an ATA there would break relays paid into non-ATA
+/// accounts. Same reasoning as `process_claim_relay_uptime_ix`.
+///
+/// $FLOW is a classic SPL mint, so the ATA is derived with
+/// `SPL_TOKEN_PROGRAM_ID`; using the Token-2022 id would produce an address
+/// that does not exist.
+fn require_foundation_treasury(
+    reward_treasury: &AccountInfo,
+    flow_mint:       &AccountInfo,
+) -> ProgramResult {
+    let (expected, _) = Pubkey::find_program_address(
+        &[
+            FOUNDATION_PUBKEY.as_ref(),
+            SPL_TOKEN_PROGRAM_ID.as_ref(),
+            flow_mint.key.as_ref(),
+        ],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    );
+    if reward_treasury.key != &expected {
+        msg!(
+            "reward_treasury {} is not the foundation ATA {}",
+            reward_treasury.key, expected,
+        );
+        return Err(RewardsError::InvalidTreasuryAccount.into());
+    }
+    Ok(())
 }
 
 // ── Helper: compute claim_hash ────────────────────────────────────────────────
@@ -872,6 +1004,10 @@ pub fn process_release_claim_ix(
 
     if repflow_balance >= MIN_RELAY_REPFLOW {
         // Mint $FLOW 70/30.
+        // H-1: the 30% may only go to the foundation ATA. Unpinned, a relay
+        // passes its own account here and keeps 100%.
+        require_foundation_treasury(reward_treasury, flow_mint)?;
+
         // M-1: derive treasury as remainder to avoid truncation loss.
         let relay_amount    = total_released_amount * RELAY_SPLIT_PCT / 100;
         let treasury_amount = total_released_amount - relay_amount;
@@ -887,7 +1023,11 @@ pub fn process_release_claim_ix(
             )?;
         }
 
-        commitment.status = ClaimCommitmentStatus::Complete;
+        // Only the LAST release of the epoch may close it. See
+        // `epoch_is_fully_released` for why the denominator is reserved_count.
+        if epoch_is_fully_released(&commitment) {
+            commitment.status = ClaimCommitmentStatus::Complete;
+        }
         msg!(
             "ReleaseClaim: minted {} $FLOW (70/30) + {} repFlow",
             total_released_amount, repflow_amount,
@@ -939,7 +1079,11 @@ pub fn process_release_claim_ix(
 
         // H-2: persist commitment to Complete BEFORE crediting ClaimableBalance.
         // If the second save fails the commitment guard blocks a double-credit.
-        commitment.status = ClaimCommitmentStatus::Complete;
+        // Same release-count guard as the mint branch — a probationary relay
+        // splits its releases across transactions exactly like a funded one.
+        if epoch_is_fully_released(&commitment) {
+            commitment.status = ClaimCommitmentStatus::Complete;
+        }
         save_account(commitment_ai, &commitment)?;
         save_account(cb_ai, &cb)?;
         msg!(
@@ -1223,6 +1367,11 @@ pub fn process_claim_pending_ix(
 
     let (_, authority_bump) = Pubkey::find_program_address(&[b"mint_authority"], program_id);
 
+    // H-1: same pin as the inline release. This is where the deferred branch's
+    // treasury share is finally paid, so it is the sink that must carry the
+    // check for every probationary release.
+    require_foundation_treasury(reward_treasury, flow_mint)?;
+
     // Mint $FLOW.
     cpi_mint_flow(token_program, flow_mint, reward_relay, service_authority, cb.pending_relay_flow, authority_bump)?;
     cpi_mint_flow(token_program, flow_mint, reward_treasury, service_authority, cb.pending_treasury, authority_bump)?;
@@ -1307,18 +1456,64 @@ pub fn process_release_trial_claim_ix(
         return Err(RewardsError::EpochComplete.into());
     }
 
+    // M-3: this handler read `foundation_config` without ever checking it is
+    // the canonical PDA — unlike ClaimRelayUptime and SetTrialEnabled. A relay
+    // could hand over a forged account and flip the kill switch back on for
+    // itself. Check it before trusting a single field.
+    let (fc_pda, _) = Pubkey::find_program_address(&[b"foundation_config"], program_id);
+    if foundation_config_ai.key != &fc_pda {
+        msg!(
+            "ReleaseTrialClaim: foundation_config {} is not the canonical PDA {}",
+            foundation_config_ai.key, fc_pda,
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
     // Check foundation kill switch. Legacy-tolerant — see read_foundation_config_compat.
     let foundation_config = read_foundation_config_compat(&foundation_config_ai.data.borrow())?;
     if !foundation_config.trial_enabled {
         return Err(RewardsError::TrialDisabled.into());
     }
 
-    // repFlow gate.
+    // Divergence tripwire for the two sources of truth about the foundation
+    // wallet. `require_foundation_treasury` pins the treasury against the
+    // hardcoded FOUNDATION_PUBKEY (no wire change at the sinks that lack this
+    // account), while `process_claim_relay_uptime_ix` derives it from
+    // `foundation_config.wallet` so a rotation needs no upgrade. This handler
+    // is the ONLY one holding both, so it is the only place the two can be
+    // compared.
+    //
+    // Rotate the foundation wallet without updating the constant and, without
+    // this, uptime would quietly pay the new treasury while every release paid
+    // the old one. Here it fails loudly on the next trial release instead.
+    // Now verified above to be the real config PDA, so this cannot be spoofed.
+    if foundation_config.wallet != FOUNDATION_PUBKEY.to_bytes() {
+        msg!(
+            "ReleaseTrialClaim: foundation_config.wallet has diverged from \
+             FOUNDATION_PUBKEY — the foundation wallet was rotated without \
+             updating constants.rs. Refusing to pay a treasury that half the \
+             program disagrees about."
+        );
+        return Err(RewardsError::InvalidTreasuryAccount.into());
+    }
+
+    // repFlow gate — DEFER below it, do not reject.
+    //
+    // This used to `return Err(RepFlowGateNotMet)` before any mutation, so a
+    // relay under MIN_RELAY_REPFLOW could not release trial claims at all: not
+    // deferred, refused, with the whole transaction reverted. The paid path has
+    // had an escape hatch since the beginning (`process_release_claim_ix`
+    // credits a `ClaimableBalance` instead of minting), and the trial path had
+    // none.
+    //
+    // It was self-locking, which is what made it worth fixing rather than
+    // documenting: the trial path's own bandwidth-repFlow mint below is the
+    // relay's way of EARNING repFlow, and it sat downstream of the gate it
+    // could not pass. A relay that started under 2001 could never climb out
+    // through trial traffic.
     let repflow_balance =
         read_checked_repflow_balance(relay_repflow_user, Some(&relay_wallet.key.to_bytes()))?;
-    if repflow_balance < MIN_RELAY_REPFLOW {
-        return Err(RewardsError::RepFlowGateNotMet.into());
-    }
+    let probationary = repflow_balance < MIN_RELAY_REPFLOW;
 
     let clock = Clock::get()?;
     let now = clock.unix_timestamp as u64;
@@ -1507,13 +1702,77 @@ pub fn process_release_trial_claim_ix(
     // M-1: derive treasury as remainder to avoid truncation loss.
     let relay_amount    = total_released_amount * RELAY_SPLIT_PCT / 100;
     let treasury_amount = total_released_amount - relay_amount;
+    // Use this transaction's bytes only, not the commitment cumulative — that
+    // would double-count on every subsequent ReleaseTrialClaim in the epoch.
+    let repflow_amount  = total_released_bytes / BYTES_PER_FLOW;
+
+    // Note the TrialMintCap above was advanced BEFORE this branch, so a
+    // deferred release still consumes the epoch's trial quota. That is
+    // deliberate: the quota is per relay per epoch and the reward is owed
+    // either way, so charging it at defer time keeps ClaimPendingRewards — which
+    // has no trial-cap check — from paying out beyond the cap later.
+    if probationary {
+        // Below the gate: credit a ClaimableBalance instead of minting, exactly
+        // as process_release_claim_ix does. Same PDA, so a relay that earns
+        // both paid and trial rewards in one epoch accumulates them in one
+        // account and drains them with a single ClaimPendingRewards.
+        //
+        // Consumed AFTER the per-release loop, so it is the last account in the
+        // instruction — matching ReleaseClaim's layout and keeping the
+        // per-release stride untouched.
+        let cb_ai = next_account_info(iter)?;
+        let (cb_pda, cb_bump) = Pubkey::find_program_address(
+            &[b"claimable_balance", relay_wallet.key.as_ref(), &claim_epoch.to_le_bytes()],
+            program_id,
+        );
+        if cb_ai.key != &cb_pda {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let mut cb: ClaimableBalance = if cb_ai.lamports() == 0 {
+            create_pda_account(
+                relay_wallet, cb_ai, system_prog, program_id,
+                &[b"claimable_balance", relay_wallet.key.as_ref(), &claim_epoch.to_le_bytes(), &[cb_bump]],
+                CLAIMABLE_BALANCE_SIZE,
+            )?;
+            ClaimableBalance {
+                relay:              relay_wallet.key.to_bytes(),
+                claim_epoch,
+                pending_relay_flow: 0,
+                pending_treasury:   0,
+                pending_repflow:    0,
+                status:             ClaimableBalanceStatus::Pending,
+                bump:               cb_bump,
+            }
+        } else {
+            ClaimableBalance::try_from_slice(&cb_ai.data.borrow())
+                .map_err(|_| ProgramError::InvalidAccountData)?
+        };
+
+        cb.pending_relay_flow = cb.pending_relay_flow
+            .checked_add(relay_amount).ok_or(RewardsError::ArithmeticOverflow)?;
+        cb.pending_treasury   = cb.pending_treasury
+            .checked_add(treasury_amount).ok_or(RewardsError::ArithmeticOverflow)?;
+        cb.pending_repflow    = cb.pending_repflow
+            .checked_add(repflow_amount).ok_or(RewardsError::ArithmeticOverflow)?;
+
+        save_account(commitment_ai, &commitment)?;
+        save_account(cb_ai, &cb)?;
+        msg!(
+            "ReleaseTrialClaim: relay probationary (<{} repFlow). {} $FLOW deferred",
+            MIN_RELAY_REPFLOW, total_released_amount,
+        );
+        return Ok(());
+    }
+
+    // H-1: pin the treasury sink. Only on the minting branch — the deferred
+    // branch pays nothing here, and ClaimPendingRewards carries the same check
+    // for when it finally does.
+    require_foundation_treasury(reward_treasury, flow_mint)?;
+
     cpi_mint_flow(token_program, flow_mint, reward_relay, service_authority, relay_amount, authority_bump)?;
     cpi_mint_flow(token_program, flow_mint, reward_treasury, service_authority, treasury_amount, authority_bump)?;
 
-    // Mint bandwidth repFlow — use this transaction's bytes only, not commitment
-    // cumulative. Using commitment.released_bytes here would double-mint repFlow
-    // on every subsequent ReleaseTrialClaim call in the same epoch.
-    let repflow_amount = total_released_bytes / BYTES_PER_FLOW;
     if repflow_amount > 0 {
         cpi_mint_repflow_bandwidth(
             repflow_program, repflow_config, relay_repflow_user,
@@ -3215,10 +3474,135 @@ mod release_trial_claim_integration_tests {
         Account { lamports: 1_000_000, data: padded, owner: id(), executable: false, rent_epoch: 0 }
     }
 
+    /// A relay BELOW the 2001 repFlow gate must defer its trial rewards into a
+    /// ClaimableBalance, not have the whole transaction reverted.
+    ///
+    /// Before this, `ReleaseTrialClaim` returned `RepFlowGateNotMet` before any
+    /// mutation, so a probationary relay could not release trial claims at all.
+    /// It was self-locking: the trial path's own bandwidth-repFlow mint is the
+    /// relay's way of EARNING repFlow, and it sat downstream of the gate it
+    /// could not pass. Measured 2026-08-13, RackNerd sits at ~1,450.
+    ///
+    /// Uses ≥ 1 GB so `repflow_amount > 0` and the deferred repFlow is
+    /// non-trivial — the point is that it accrues instead of being lost.
+    #[tokio::test]
+    async fn release_trial_claim_below_gate_defers_instead_of_reverting() {
+        let relay      = Keypair::new();
+        let foundation = FOUNDATION_PUBKEY;
+        let epoch      = 7_778u64;
+        let client_pubkey = [11u8; 32];
+        let bytes = 2_000_000_000u64; // ≥ 1 GB → repflow_amount > 0
+
+        let release = ClientReleaseOnChain {
+            client_pubkey,
+            session_id:       [4u8; 16],
+            batch_nonce:      1,
+            total_bytes:      bytes,
+            merkle_proof:     vec![],
+            client_signature: [1u8; 64],
+            device_uuid:      [8u8; 16],
+            record_count:     1,
+        };
+        let merkle_root = compute_merkle_leaf_hash_from_release(&release);
+        let derived = derive_reward_amount(bytes, DEFAULT_ROUTING_PER_MB);
+        assert!(derived > 0);
+
+        let (c_pda, c_bump) = Pubkey::find_program_address(
+            &[b"claim_commitment", relay.pubkey().as_ref(), &epoch.to_le_bytes()], &id());
+        let (fc_pda, fc_bump) = Pubkey::find_program_address(&[b"foundation_config"], &id());
+        let (service_auth, _) = Pubkey::find_program_address(&[b"mint_authority"], &id());
+        let (tmc_pda, _) = Pubkey::find_program_address(
+            &[b"trial_mint_cap", relay.pubkey().as_ref(), &epoch.to_le_bytes()], &id());
+        let (claim_state_pda, _) = Pubkey::find_program_address(
+            &[b"claim_state", &client_pubkey, relay.pubkey().as_ref()], &id());
+        let (trial_usage_pda, _) = Pubkey::find_program_address(
+            &[b"trial_usage", &client_pubkey], &id());
+        let (cb_pda, _) = Pubkey::find_program_address(
+            &[b"claimable_balance", relay.pubkey().as_ref(), &epoch.to_le_bytes()], &id());
+
+        let flow_mint      = Keypair::new().pubkey();
+        let relay_token    = Keypair::new().pubkey();
+        let treasury_token = Keypair::new().pubkey(); // never touched on this path
+        let repflow_pk     = Pubkey::find_program_address(
+            &[b"repflow_user", relay.pubkey().as_ref()], &REPFLOW_PROGRAM_ID).0;
+        let stub           = Keypair::new().pubkey();
+
+        let mut pt = program_test();
+        pt.add_account(c_pda, commitment_account(&relay.pubkey(), epoch, merkle_root, derived, bytes, c_bump));
+        pt.add_account(fc_pda, foundation_config_account(&foundation, fc_bump));
+        // THE precondition: one short of the gate.
+        pt.add_account(repflow_pk, repflow_user_account(MIN_RELAY_REPFLOW - 1));
+        pt.add_account(flow_mint, flow_mint_account(&service_auth));
+        pt.add_account(relay_token, spl_token_account(&flow_mint, &relay.pubkey()));
+        pt.add_account(treasury_token, spl_token_account(&flow_mint, &foundation));
+
+        let (mut banks, payer, bh) = pt.start().await;
+        fund(&mut banks, &payer, &relay.pubkey(), bh).await;
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let ix = Instruction {
+            program_id: id(),
+            accounts: vec![
+                AccountMeta::new(relay.pubkey(), true),
+                AccountMeta::new(c_pda, false),
+                AccountMeta::new_readonly(fc_pda, false),
+                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new(flow_mint, false),
+                AccountMeta::new_readonly(service_auth, false),
+                AccountMeta::new_readonly(stub, false),
+                AccountMeta::new_readonly(stub, false),
+                AccountMeta::new_readonly(repflow_pk, false),
+                AccountMeta::new(relay_token, false),
+                AccountMeta::new(treasury_token, false),
+                AccountMeta::new(tmc_pda, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                AccountMeta::new(claim_state_pda, false),
+                AccountMeta::new(trial_usage_pda, false),
+                // LAST, after the per-release accounts — same position as
+                // ReleaseClaim's probationary ClaimableBalance.
+                AccountMeta::new(cb_pda, false),
+            ],
+            data: borsh::to_vec(&RewardsInstruction::ReleaseTrialClaim {
+                claim_epoch: epoch,
+                releases:    vec![release],
+            }).expect("encode"),
+        };
+
+        banks
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix], Some(&relay.pubkey()), &[&relay], bh,
+            ))
+            .await
+            .expect("below the gate must DEFER, not revert with RepFlowGateNotMet");
+
+        // Nothing minted.
+        assert_eq!(token_balance(&mut banks, relay_token).await, 0, "no $FLOW minted below the gate");
+        assert_eq!(token_balance(&mut banks, treasury_token).await, 0, "treasury untouched below the gate");
+
+        // Everything accrued instead.
+        let cb_acct = banks.get_account(cb_pda).await.unwrap()
+            .expect("ClaimableBalance must be created below the gate");
+        let cb = ClaimableBalance::try_from_slice(&cb_acct.data[..CLAIMABLE_BALANCE_SIZE]).unwrap();
+        let want_relay    = derived * RELAY_SPLIT_PCT / 100;
+        assert_eq!(cb.pending_relay_flow, want_relay, "relay's 70% deferred");
+        assert_eq!(cb.pending_treasury, derived - want_relay, "treasury's 30% deferred");
+        assert_eq!(cb.pending_repflow, bytes / BYTES_PER_FLOW, "bandwidth repFlow deferred");
+        assert_eq!(cb.status, ClaimableBalanceStatus::Pending);
+        assert_eq!(cb.claim_epoch, epoch);
+
+        // The epoch's trial quota is still consumed — the reward is owed either
+        // way, and ClaimPendingRewards has no trial-cap check of its own.
+        let tmc_acct = banks.get_account(tmc_pda).await.unwrap().unwrap();
+        let tmc = TrialMintCap::try_from_slice(&tmc_acct.data[..TRIAL_MINT_CAP_SIZE]).unwrap();
+        assert_eq!(tmc.minted_so_far, derived, "deferring still consumes the trial cap");
+    }
+
     #[tokio::test]
     async fn release_trial_claim_success_mints_70_30_and_records_usage() {
         let relay      = Keypair::new();
-        let foundation = Keypair::new().pubkey();
+        // Must be the constant: ReleaseTrialClaim is the one handler holding
+        // both sources of truth and now refuses to pay when they disagree.
+        let foundation = FOUNDATION_PUBKEY;
         let epoch      = 7_777u64;
         let client_pubkey = [9u8; 32];
         // < 1 GB so the repflow-token CPI is skipped; still a nonzero $FLOW reward.
@@ -3253,7 +3637,22 @@ mod release_trial_claim_integration_tests {
 
         let flow_mint      = Keypair::new().pubkey();
         let relay_token    = Keypair::new().pubkey();
-        let treasury_token = Keypair::new().pubkey();
+        // H-1 + the divergence tripwire: `foundation` above is FOUNDATION_PUBKEY
+        // (the handler now rejects a config whose wallet disagrees with the
+        // constant), and reward_treasury must be that wallet's canonical ATA.
+        // ATA program id from literal bytes, not constants.rs — same reasoning
+        // as `foundation_ata` in the uptime tests.
+        let treasury_token = Pubkey::find_program_address(
+            &[
+                FOUNDATION_PUBKEY.as_ref(),
+                spl_token::id().as_ref(),
+                flow_mint.as_ref(),
+            ],
+            &Pubkey::new_from_array([
+                140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131,
+                11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
+            ]),
+        ).0;
         let repflow_pk     = Pubkey::find_program_address(&[b"repflow_user", relay.pubkey().as_ref()], &REPFLOW_PROGRAM_ID).0;
         let stub           = Keypair::new().pubkey();
 
@@ -3636,11 +4035,20 @@ mod release_claim_integration_tests {
     }
 
     fn commitment_account(relay: &Pubkey, epoch: u64, root: [u8;32], bandwidth: u64, total_bytes: u64, bump: u8) -> Account {
+        commitment_account_n(relay, epoch, root, bandwidth, total_bytes, bump, 1)
+    }
+    /// Same, with an explicit `reserved_count` so a multi-client epoch can be
+    /// exercised — that is the only shape in which the Complete latch bites.
+    fn commitment_account_n(
+        relay: &Pubkey, epoch: u64, root: [u8;32], bandwidth: u64, total_bytes: u64,
+        bump: u8, reserved: u32,
+    ) -> Account {
         let c = ClaimCommitment {
-            relay_pubkey: relay.to_bytes(), claim_epoch: epoch, merkle_root: root, client_count: 1,
+            relay_pubkey: relay.to_bytes(), claim_epoch: epoch, merkle_root: root,
+            client_count: reserved,
             bandwidth_amount: bandwidth, uptime_amount: 0, total_bytes, uptime_hours: 0,
             routing_per_mb: DEFAULT_ROUTING_PER_MB, uptime_per_hour: DEFAULT_UPTIME_PER_HOUR,
-            committed_at: 0, uptime_paid: false, reserved_count: 1, released_count: 0,
+            committed_at: 0, uptime_paid: false, reserved_count: reserved, released_count: 0,
             released_amount: 0, released_bytes: 0, status: ClaimCommitmentStatus::Active,
             dispute_deadline: 0, bump, // deadline 0 => matured (now >= 0), releases allowed
         };
@@ -3675,7 +4083,21 @@ mod release_claim_integration_tests {
         let (cs_pda, cs_bump) = Pubkey::find_program_address(&[b"claim_state", &client, relay.pubkey().as_ref()], &id());
         let flow_mint = Keypair::new().pubkey();
         let relay_tok = Keypair::new().pubkey();
-        let treas_tok = Keypair::new().pubkey();
+        // H-1: reward_treasury must BE the foundation's canonical $FLOW ATA —
+        // a random keypair now fails Custom(50). Derived from literal bytes,
+        // not from constants.rs, so a wrong program id baked into the constants
+        // is caught here rather than silently agreed with.
+        let treas_tok = Pubkey::find_program_address(
+            &[
+                FOUNDATION_PUBKEY.as_ref(),
+                spl_token::id().as_ref(),
+                flow_mint.as_ref(),
+            ],
+            &Pubkey::new_from_array([
+                140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131,
+                11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
+            ]),
+        ).0;
         let repflow = Pubkey::find_program_address(&[b"repflow_user", relay.pubkey().as_ref()], &REPFLOW_PROGRAM_ID).0;
         let s = Keypair::new().pubkey();
         let fund_hold = Keypair::new().pubkey();
@@ -3688,7 +4110,7 @@ mod release_claim_integration_tests {
         pt.add_account(repflow, repflow_user_account(MIN_RELAY_REPFLOW));
         pt.add_account(flow_mint, flow_mint_account(&service_auth));
         pt.add_account(relay_tok, spl_token_account(&flow_mint, &relay.pubkey()));
-        pt.add_account(treas_tok, spl_token_account(&flow_mint, &Keypair::new().pubkey()));
+        pt.add_account(treas_tok, spl_token_account(&flow_mint, &FOUNDATION_PUBKEY));
         pt.add_account(fund_hold, stub(mock_escrow_id(), 8));       // burn CPI writable
         pt.add_account(user_escrow, stub(mock_escrow_id(), 8));      // burn CPI writable
         pt.add_account(user_escrow_tok, stub(mock_escrow_id(), 8));  // burn CPI writable
@@ -3729,6 +4151,201 @@ mod release_claim_integration_tests {
         let c = ClaimCommitment::try_from_slice(&banks.get_account(c_pda).await.unwrap().unwrap().data[..CLAIM_COMMITMENT_SIZE]).unwrap();
         assert_eq!(c.released_count, 1, "released_count advanced");
         assert_eq!(c.status, ClaimCommitmentStatus::Complete, "single client fully released -> Complete");
+    }
+
+    /// H-1: `ReleaseClaim` must refuse a `reward_treasury` that is not the
+    /// foundation's canonical ATA.
+    ///
+    /// The success test above does NOT cover this — verified by deleting the
+    /// pin and watching it stay green, because it passes the correct ATA. Only
+    /// a negative test guards the check, and this is the sink that arms the
+    /// moment the paid path first succeeds.
+    ///
+    /// Unpinned, a relay passes a token account it owns and keeps the
+    /// foundation's 30% on top of its own 70% — `cpi_mint_flow` validates
+    /// nothing about the destination and signs with the program's own
+    /// `mint_authority` PDA, so the mint simply succeeds.
+    #[tokio::test]
+    async fn release_claim_rejects_a_treasury_the_relay_controls() {
+        let relay = Keypair::new();
+        let epoch = 910u64;
+        let client = [22u8; 32];
+        let bytes = 500_000_000u64;
+
+        let release = ClientReleaseOnChain {
+            client_pubkey: client, session_id: [2u8; 16], batch_nonce: 1,
+            total_bytes: bytes, merkle_proof: vec![], client_signature: [1u8; 64],
+            device_uuid: [0u8; 16], record_count: 1,
+        };
+        let root = compute_merkle_leaf_hash_from_release(&release);
+        let derived = derive_reward_amount(bytes, DEFAULT_ROUTING_PER_MB);
+
+        let (c_pda, c_bump) = Pubkey::find_program_address(
+            &[b"claim_commitment", relay.pubkey().as_ref(), &epoch.to_le_bytes()], &id());
+        let (service_auth, _) = Pubkey::find_program_address(&[b"mint_authority"], &id());
+        let (cs_pda, cs_bump) = Pubkey::find_program_address(
+            &[b"claim_state", &client, relay.pubkey().as_ref()], &id());
+        let flow_mint = Keypair::new().pubkey();
+        let relay_tok = Keypair::new().pubkey();
+        // The attack: a token account the RELAY owns, passed as the treasury.
+        let rogue_treasury = Keypair::new().pubkey();
+        let repflow = Pubkey::find_program_address(
+            &[b"repflow_user", relay.pubkey().as_ref()], &REPFLOW_PROGRAM_ID).0;
+        let s = Keypair::new().pubkey();
+        let fund_hold = Keypair::new().pubkey();
+        let user_escrow = Keypair::new().pubkey();
+        let user_escrow_tok = Keypair::new().pubkey();
+
+        let mut pt = program_test();
+        pt.add_account(c_pda, commitment_account(&relay.pubkey(), epoch, root, derived, bytes, c_bump));
+        pt.add_account(cs_pda, claim_state_account(client, &relay.pubkey(), cs_bump));
+        pt.add_account(repflow, repflow_user_account(MIN_RELAY_REPFLOW));
+        pt.add_account(flow_mint, flow_mint_account(&service_auth));
+        pt.add_account(relay_tok, spl_token_account(&flow_mint, &relay.pubkey()));
+        pt.add_account(rogue_treasury, spl_token_account(&flow_mint, &relay.pubkey()));
+        pt.add_account(fund_hold, stub(mock_escrow_id(), 8));
+        pt.add_account(user_escrow, stub(mock_escrow_id(), 8));
+        pt.add_account(user_escrow_tok, stub(mock_escrow_id(), 8));
+
+        let (mut banks, payer, bh) = pt.start().await;
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(&payer.pubkey(), &relay.pubkey(), 2_000_000_000)],
+            Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let ix = Instruction { program_id: id(), accounts: vec![
+            AccountMeta::new(relay.pubkey(), true),
+            AccountMeta::new(c_pda, false),
+            AccountMeta::new_readonly(mock_escrow_id(), false),
+            AccountMeta::new_readonly(service_auth, false),
+            AccountMeta::new_readonly(s, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new(flow_mint, false),
+            AccountMeta::new_readonly(s, false),
+            AccountMeta::new_readonly(s, false),
+            AccountMeta::new_readonly(repflow, false),
+            AccountMeta::new_readonly(s, false),
+            AccountMeta::new(relay_tok, false),
+            AccountMeta::new(rogue_treasury, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(client), false),
+            AccountMeta::new(cs_pda, false),
+            AccountMeta::new(user_escrow, false),
+            AccountMeta::new(fund_hold, false),
+            AccountMeta::new(user_escrow_tok, false),
+        ], data: borsh::to_vec(&RewardsInstruction::ReleaseClaim {
+            claim_epoch: epoch, releases: vec![release] }).unwrap() };
+
+        let err = banks.process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&relay.pubkey()), &[&relay], bh)).await
+            .expect_err("a relay-controlled treasury must be rejected");
+        let want = format!("Custom({})", RewardsError::InvalidTreasuryAccount as u32);
+        assert!(
+            format!("{err:?}").contains(&want),
+            "expected {want} (InvalidTreasuryAccount), got {err:?}"
+        );
+        assert_eq!(token_balance(&mut banks, rogue_treasury).await, 0, "nothing minted to it");
+    }
+
+    /// The Complete latch, at the CALL SITE.
+    ///
+    /// `complete_latch_tests` covers the predicate; this covers the wiring, and
+    /// the two are not interchangeable — reverting the guard at the call site
+    /// leaves the predicate tests green. Verified by doing exactly that.
+    ///
+    /// Two clients reserved, one released. The relay fits one paid release per
+    /// transaction, so this is the real shape of a 2-client epoch. Before the
+    /// guard, the commitment latched Complete here and the second transaction
+    /// hit `_ => EpochComplete`, stranding the other client's FundHold with no
+    /// instruction able to recover it.
+    #[tokio::test]
+    async fn first_release_of_a_two_client_epoch_leaves_it_releasing() {
+        let relay = Keypair::new();
+        let epoch = 909u64;
+        let client = [21u8; 32];
+        let bytes = 500_000_000u64;
+
+        let release = ClientReleaseOnChain {
+            client_pubkey: client, session_id: [2u8; 16], batch_nonce: 1,
+            total_bytes: bytes, merkle_proof: vec![], client_signature: [1u8; 64],
+            device_uuid: [0u8; 16], record_count: 1,
+        };
+        let root = compute_merkle_leaf_hash_from_release(&release);
+        let derived = derive_reward_amount(bytes, DEFAULT_ROUTING_PER_MB);
+
+        let (c_pda, c_bump) = Pubkey::find_program_address(
+            &[b"claim_commitment", relay.pubkey().as_ref(), &epoch.to_le_bytes()], &id());
+        let (service_auth, _) = Pubkey::find_program_address(&[b"mint_authority"], &id());
+        let (cs_pda, cs_bump) = Pubkey::find_program_address(
+            &[b"claim_state", &client, relay.pubkey().as_ref()], &id());
+        let flow_mint = Keypair::new().pubkey();
+        let relay_tok = Keypair::new().pubkey();
+        let treas_tok = Pubkey::find_program_address(
+            &[FOUNDATION_PUBKEY.as_ref(), spl_token::id().as_ref(), flow_mint.as_ref()],
+            &Pubkey::new_from_array([
+                140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131,
+                11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
+            ]),
+        ).0;
+        let repflow = Pubkey::find_program_address(
+            &[b"repflow_user", relay.pubkey().as_ref()], &REPFLOW_PROGRAM_ID).0;
+        let s = Keypair::new().pubkey();
+        let fund_hold = Keypair::new().pubkey();
+        let user_escrow = Keypair::new().pubkey();
+        let user_escrow_tok = Keypair::new().pubkey();
+
+        let mut pt = program_test();
+        // TWO clients reserved — the shape that made this bite.
+        pt.add_account(c_pda, commitment_account_n(&relay.pubkey(), epoch, root, derived * 2, bytes * 2, c_bump, 2));
+        pt.add_account(cs_pda, claim_state_account(client, &relay.pubkey(), cs_bump));
+        pt.add_account(repflow, repflow_user_account(MIN_RELAY_REPFLOW));
+        pt.add_account(flow_mint, flow_mint_account(&service_auth));
+        pt.add_account(relay_tok, spl_token_account(&flow_mint, &relay.pubkey()));
+        pt.add_account(treas_tok, spl_token_account(&flow_mint, &FOUNDATION_PUBKEY));
+        pt.add_account(fund_hold, stub(mock_escrow_id(), 8));
+        pt.add_account(user_escrow, stub(mock_escrow_id(), 8));
+        pt.add_account(user_escrow_tok, stub(mock_escrow_id(), 8));
+
+        let (mut banks, payer, bh) = pt.start().await;
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(&payer.pubkey(), &relay.pubkey(), 2_000_000_000)],
+            Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let ix = Instruction { program_id: id(), accounts: vec![
+            AccountMeta::new(relay.pubkey(), true),
+            AccountMeta::new(c_pda, false),
+            AccountMeta::new_readonly(mock_escrow_id(), false),
+            AccountMeta::new_readonly(service_auth, false),
+            AccountMeta::new_readonly(s, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new(flow_mint, false),
+            AccountMeta::new_readonly(s, false),
+            AccountMeta::new_readonly(s, false),
+            AccountMeta::new_readonly(repflow, false),
+            AccountMeta::new_readonly(s, false),
+            AccountMeta::new(relay_tok, false),
+            AccountMeta::new(treas_tok, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(client), false),
+            AccountMeta::new(cs_pda, false),
+            AccountMeta::new(user_escrow, false),
+            AccountMeta::new(fund_hold, false),
+            AccountMeta::new(user_escrow_tok, false),
+        ], data: borsh::to_vec(&RewardsInstruction::ReleaseClaim {
+            claim_epoch: epoch, releases: vec![release] }).unwrap() };
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&relay.pubkey()), &[&relay], bh)).await.expect("first release must land");
+
+        let c = ClaimCommitment::try_from_slice(
+            &banks.get_account(c_pda).await.unwrap().unwrap().data[..CLAIM_COMMITMENT_SIZE]).unwrap();
+        assert_eq!(c.released_count, 1, "one of two released");
+        assert_eq!(
+            c.status, ClaimCommitmentStatus::Releasing,
+            "1 of 2 reserved clients released — the commitment MUST stay Releasing. \
+             Latching Complete here sends the second transaction to EpochComplete \
+             and strands that client's FundHold permanently"
+        );
     }
 }
 

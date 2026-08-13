@@ -882,9 +882,26 @@ mod integration {
         assert!(result.is_err(), "TrialDisabled must cause transaction failure");
     }
 
-    /// `ReleaseTrialClaim` fails when relay repFlow is below the 2001 gate.
+    /// `ReleaseTrialClaim` rejects a forged `foundation_config` (M-3).
+    ///
+    /// **This test used to be `release_trial_claim_fails_when_repflow_below_gate`
+    /// and it is no longer true of the contract:** below the gate the handler
+    /// now DEFERS into a `ClaimableBalance` instead of reverting, because the
+    /// old behaviour was self-locking — the trial path's own bandwidth-repFlow
+    /// mint is how a relay earns repFlow, and it sat downstream of the gate it
+    /// could not pass. The deferral is covered by
+    /// `handlers::release_trial_claim_integration_tests::release_trial_claim_below_gate_defers_instead_of_reverting`,
+    /// which uses real PDAs.
+    ///
+    /// It was left asserting `is_err()` and kept PASSING after that change —
+    /// for the wrong reason. This harness passes a random keypair as
+    /// `foundation_config`, so the transaction now fails at the M-3 PDA check
+    /// long before the gate. Rather than delete a test that still exercises
+    /// something real, it is repurposed to assert exactly that: M-3 previously
+    /// had no coverage at all, and a forged config is how a relay would flip
+    /// the trial kill switch back on for itself.
     #[tokio::test]
-    async fn release_trial_claim_fails_when_repflow_below_gate() {
+    async fn release_trial_claim_rejects_forged_foundation_config() {
         let relay = Keypair::new();
         let claim_epoch = 101u64;
 
@@ -923,7 +940,12 @@ mod integration {
             &[&relay],
             recent_blockhash,
         )).await;
-        assert!(result.is_err(), "RepFlowGateNotMet must cause transaction failure");
+        assert!(
+            result.is_err(),
+            "a foundation_config that is not the canonical PDA must be rejected \
+             (M-3) — without the check a relay forges a config whose wallet is \
+             one it controls and re-enables the trial path for itself"
+        );
     }
 
     /// `ReleaseTrialClaim` fails when `claim_epoch` in instruction doesn't match

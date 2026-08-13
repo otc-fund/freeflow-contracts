@@ -35,6 +35,33 @@ pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
     11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
 ]);
 
+/// Foundation wallet whose ATA receives the 30% treasury split
+/// (`8SL4dhnXU9tjvsbwfkVzQbfV99wGnVZBECoiuwrdbaJk`).
+///
+/// Used by `require_foundation_treasury` to pin `reward_treasury` at the three
+/// mint sinks that do NOT carry `foundation_config` in their account lists:
+/// `ReleaseClaim`, `ClaimPendingRewards`, and `ReleaseTrialClaim`. Hardcoding
+/// keeps those pins free of a wire change (SECURITY-FIXES-PLAN.md §H-1, D3).
+///
+/// **This is a SECOND source of truth.** `process_claim_relay_uptime_ix`
+/// derives the same wallet from `foundation_config.wallet` instead, precisely
+/// so a rotation needs no program upgrade. If the foundation wallet is ever
+/// rotated and this constant is not updated in the same release, uptime pays
+/// the new treasury and every release pays the old one — silently.
+///
+/// That divergence is not left to vigilance: `ReleaseTrialClaim` is the one
+/// handler holding both, and it asserts they are equal
+/// (`RewardsError::InvalidTreasuryAccount`). A rotation therefore fails loudly
+/// on the next trial release instead of quietly misrouting the 30%.
+///
+/// The permanent fix is one source of truth — either add `foundation_config`
+/// to the two paid sinks (a wire change at both) or land the treasury set
+/// (`docs/superpowers/plans/2026-07-31-treasury-set.md`).
+pub const FOUNDATION_PUBKEY: Pubkey = Pubkey::new_from_array([
+    110, 126, 226, 5, 207, 4, 113, 108, 159, 133, 215, 194, 173, 220, 77, 27,
+    22, 144, 172, 176, 41, 96, 65, 31, 110, 88, 150, 233, 171, 99, 37, 89,
+]);
+
 /// repFlow-token program (`8K4GhPEQ1yy9vdTaMPTL83G5qr5ZHZiBm2VBQ58jJs5w`).
 ///
 /// The authentic deployed repflow-token program — matches `Anchor.toml` and the
