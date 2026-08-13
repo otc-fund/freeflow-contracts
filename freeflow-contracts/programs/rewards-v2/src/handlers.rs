@@ -460,6 +460,11 @@ pub fn process_reserve_batch_ix(
         ClaimCommitment::try_from_slice(&commitment_ai.data.borrow())
             .map_err(|_| RewardsError::ClaimCommitmentNotFound)?;
 
+    // Bind the commitment to the SIGNER before touching it. Without this any
+    // keypair could pass another relay's commitment and release its epoch —
+    // see `require_own_commitment`.
+    require_own_commitment(commitment_ai, relay_wallet, claim_epoch, program_id)?;
+
     if commitment.claim_epoch != claim_epoch {
         return Err(ProgramError::InvalidArgument);
     }
@@ -657,6 +662,52 @@ mod complete_latch_tests {
         );
     }
 
+    /// The gap the first version of this guard had, and the reason the audit
+    /// called the fix incomplete.
+    ///
+    /// `released_count` was incremented by BOTH release paths while
+    /// `reserved_count` counts paid clients only. An epoch with 2 paid and 1
+    /// trial client therefore reached `released_count == 2 == reserved_count`
+    /// after the trial release plus the FIRST paid release — latching
+    /// `Complete` one release early and stranding the second paid client's
+    /// FundHold permanently, which is precisely the bug the guard exists to
+    /// prevent.
+    ///
+    /// Fixed by making the trial path leave `released_count` alone. This test
+    /// models the state the program can now actually produce: after a trial
+    /// release, `released_count` is still 0.
+    ///
+    /// **This test is documentation, NOT the guard.** Mutation-checked: restore
+    /// the increment in `process_release_trial_claim_ix` and this still passes,
+    /// because it hand-builds the commitment rather than driving the handler —
+    /// the same weakness the audit flagged in the rest of this module. The
+    /// regression is actually caught by
+    /// `release_trial_claim_integration_tests::release_trial_claim_success_mints_70_30_and_records_usage`,
+    /// which asserts `released_count == 0` against a real transaction. Keep
+    /// that assertion; it is load-bearing.
+    #[test]
+    fn a_trial_release_does_not_advance_the_paid_latch() {
+        // 2 paid (reserved) + 1 trial. The trial release has already happened
+        // and contributed NOTHING to released_count.
+        let after_trial_release = commitment(3, 2, 0);
+        assert!(
+            !epoch_is_fully_released(&after_trial_release),
+            "a trial release must not move the paid latch at all"
+        );
+
+        // First paid release.
+        let after_first_paid = commitment(3, 2, 1);
+        assert!(
+            !epoch_is_fully_released(&after_first_paid),
+            "1 of 2 paid clients released — the epoch must stay Releasing. If \
+             the trial release had counted, released_count would read 2 here and \
+             the second paid client would be stranded"
+        );
+
+        // Second paid release closes it.
+        assert!(epoch_is_fully_released(&commitment(3, 2, 2)));
+    }
+
     /// A partially-succeeded ReserveBatch leaves reserved_count short. Still
     /// correct: a client with no FundHold cannot be released at all, so the
     /// epoch closes over exactly what was reservable.
@@ -758,6 +809,56 @@ mod pda_init_predicate_tests {
     }
 }
 
+// ── Helper: is this commitment the signer's own? ──────────────────────────────
+
+/// Reject a `claim_commitment` that does not belong to the signing relay.
+///
+/// Every instruction that mutates a commitment must call this. Without it, the
+/// commitment is just an account the caller hands over, and nothing ties it to
+/// the signer:
+///
+/// * `ReleaseClaim` verified only `claim_epoch` and `status`, and did not pin
+///   `claim_state` either (unlike `process_reserve_batch_ix`, which re-derives
+///   it). So `AlreadyReleased` was no defence — an attacker supplies any
+///   `claim_state` whose `last_release_epoch` differs.
+/// * Every input needed to pass the Merkle check is public: the victim's own
+///   `ReserveBatch` instruction data carries `client_pubkey`, `session_id`,
+///   `highest_seq`, `bytes` and `record_count`, which is the whole leaf. For a
+///   single-client epoch the proof is empty and `root == leaf`.
+/// * `client_signature` is only checked non-zero, so any 64 bytes pass.
+///
+/// The result was direct theft: relay B calls `ReleaseClaim` on relay A's
+/// matured commitment with B's own `reward_relay`, the client's escrow burns,
+/// and B mints A's 70%. Below the repFlow gate B accrues A's reward into B's
+/// own `ClaimableBalance` instead — the same theft, deferred. Even without
+/// monetising, calling it advances the victim's `released_count` and flips the
+/// commitment out of `Active`, stranding its remaining clients.
+///
+/// Re-deriving the PDA from the SIGNER is strictly stronger than comparing
+/// `commitment.relay_pubkey`: it also proves the account is a real commitment
+/// for this program and epoch, not an attacker-owned look-alike. The same idiom
+/// already guards `ClaimRelayUptime` and, for the sibling PDA,
+/// `process_claim_pending_ix`.
+fn require_own_commitment(
+    commitment_ai: &AccountInfo,
+    relay_wallet:  &AccountInfo,
+    claim_epoch:   u64,
+    program_id:    &Pubkey,
+) -> ProgramResult {
+    let (expected, _) = Pubkey::find_program_address(
+        &[b"claim_commitment", relay_wallet.key.as_ref(), &claim_epoch.to_le_bytes()],
+        program_id,
+    );
+    if commitment_ai.key != &expected {
+        msg!(
+            "claim_commitment {} does not belong to signer {} for epoch {}",
+            commitment_ai.key, relay_wallet.key, claim_epoch,
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+    Ok(())
+}
+
 // ── Helper: has every reserved client been released? ──────────────────────────
 
 /// True once every client this epoch actually reserved has been released.
@@ -777,11 +878,17 @@ mod pda_init_predicate_tests {
 /// (`process_reserve_batch_ix`) and only paid clients are ever reserved, which
 /// makes it exactly the set `ReleaseClaim` can close.
 ///
-/// It stays exact in two edge cases worth naming:
+/// It stays exact in three edge cases worth naming:
 /// * A paid batch capped to 0 bytes is dropped from the reserve AND from the
 ///   release by identical relay-side filters, so it is in neither count.
 /// * If `ReserveBatch` partially failed, `reserved_count` is short — still
 ///   correct, because a client with no `FundHold` cannot be released at all.
+/// * **Trial releases do not increment `released_count`.** They used to, which
+///   made the comparison asymmetric — `reserved_count` counts paid clients
+///   only, so an epoch with 2 paid and 1 trial client latched `Complete` after
+///   the trial release plus the FIRST paid release, stranding the second paid
+///   client exactly as the unguarded version did. Both counters are now
+///   paid-only. See the note at the trial handler's `released_amount` update.
 fn epoch_is_fully_released(commitment: &ClaimCommitment) -> bool {
     commitment.released_count >= commitment.reserved_count
 }
@@ -894,6 +1001,11 @@ pub fn process_release_claim_ix(
         ClaimCommitment::try_from_slice(&commitment_ai.data.borrow())
             .map_err(|_| RewardsError::ClaimCommitmentNotFound)?;
 
+    // Bind the commitment to the SIGNER before touching it. Without this any
+    // keypair could pass another relay's commitment and release its epoch —
+    // see `require_own_commitment`.
+    require_own_commitment(commitment_ai, relay_wallet, claim_epoch, program_id)?;
+
     if commitment.claim_epoch != claim_epoch {
         return Err(ProgramError::InvalidArgument);
     }
@@ -935,7 +1047,28 @@ pub fn process_release_claim_ix(
             return Err(RewardsError::ClientSignatureInvalid.into());
         }
 
-        // 3. Check AlreadyReleased.
+        // 3. Pin claim_state to (this client, THIS relay), then check
+        //    AlreadyReleased.
+        //
+        //    `process_reserve_batch_ix` already re-derives this PDA; the
+        //    release path did not, so the account was whatever the caller
+        //    passed. That made the `AlreadyReleased` guard below worthless as a
+        //    replay defence — supply any `UserRelayClaimState` whose
+        //    `last_release_epoch` differs and it passes. Both halves matter:
+        //    the seed binds the CLIENT (so one client's state cannot stand in
+        //    for another's) and the RELAY (so a foreign relay cannot release
+        //    against its own untouched state).
+        let (expected_claim_state, _) = Pubkey::find_program_address(
+            &[b"claim_state", &release.client_pubkey, relay_wallet.key.as_ref()],
+            program_id,
+        );
+        if claim_state_ai.key != &expected_claim_state {
+            msg!(
+                "claim_state {} is not the PDA for this client and relay",
+                claim_state_ai.key,
+            );
+            return Err(ProgramError::InvalidArgument);
+        }
         let mut claim_state: UserRelayClaimState =
             UserRelayClaimState::try_from_slice(&claim_state_ai.data.borrow())
                 .map_err(|_| ProgramError::InvalidAccountData)?;
@@ -1446,6 +1579,11 @@ pub fn process_release_trial_claim_ix(
     let mut commitment: ClaimCommitment =
         ClaimCommitment::try_from_slice(&commitment_ai.data.borrow())
             .map_err(|_| RewardsError::ClaimCommitmentNotFound)?;
+
+    // Bind the commitment to the SIGNER before touching it. Without this any
+    // keypair could pass another relay's commitment and release its epoch —
+    // see `require_own_commitment`.
+    require_own_commitment(commitment_ai, relay_wallet, claim_epoch, program_id)?;
     if commitment.claim_epoch != claim_epoch {
         return Err(ProgramError::InvalidArgument);
     }
@@ -1644,7 +1782,19 @@ pub fn process_release_trial_claim_ix(
             .checked_add(derived_amount)
             .ok_or(RewardsError::ArithmeticOverflow)?;
 
-        commitment.released_count  += 1;
+        // NOT `released_count`. That counter is the denominator half of
+        // `epoch_is_fully_released`, which compares it against `reserved_count`
+        // — and `reserved_count` is incremented only by `process_reserve_batch_ix`,
+        // i.e. it counts PAID clients only. Counting trial releases here made
+        // the two asymmetric: an epoch with 2 paid clients and 1 trial client
+        // reached `released_count == reserved_count == 2` after the trial
+        // release plus the FIRST paid release, latching `Complete` one release
+        // early and stranding the second paid client's FundHold permanently.
+        //
+        // `released_amount` and `released_bytes` below stay shared on purpose:
+        // both kinds of release genuinely draw on `bandwidth_amount`, and the
+        // ReleaseExceedsCommitment cap must see the total.
+        //
         commitment.released_amount  = new_amount;
         commitment.released_bytes   = new_bytes;
 
@@ -3709,7 +3859,17 @@ mod release_trial_claim_integration_tests {
         // Commitment accounting advanced.
         let cacct = banks.get_account(c_pda).await.unwrap().unwrap();
         let c = ClaimCommitment::try_from_slice(&cacct.data[..CLAIM_COMMITMENT_SIZE]).unwrap();
-        assert_eq!(c.released_count, 1, "commitment records the release");
+        // A trial release must NOT advance released_count. That counter is
+        // compared against reserved_count by `epoch_is_fully_released`, and
+        // reserved_count is paid-only — counting trial releases here latched
+        // `Complete` one release early on any epoch mixing trial and 2+ paid
+        // clients, stranding the last paid client's FundHold permanently.
+        assert_eq!(
+            c.released_count, 0,
+            "a trial release must leave the PAID release counter untouched"
+        );
+        // released_amount IS shared: both kinds draw on bandwidth_amount and the
+        // ReleaseExceedsCommitment cap has to see the total.
         assert_eq!(c.released_amount, derived, "released_amount == contract-derived value");
 
         // Per-relay-per-epoch trial cap advanced by exactly the derived amount.
@@ -4151,6 +4311,111 @@ mod release_claim_integration_tests {
         let c = ClaimCommitment::try_from_slice(&banks.get_account(c_pda).await.unwrap().unwrap().data[..CLAIM_COMMITMENT_SIZE]).unwrap();
         assert_eq!(c.released_count, 1, "released_count advanced");
         assert_eq!(c.status, ClaimCommitmentStatus::Complete, "single client fully released -> Complete");
+    }
+
+    /// A relay must not be able to release ANOTHER relay's commitment.
+    ///
+    /// Nothing bound `claim_commitment` to the signer: the handler checked only
+    /// `claim_epoch` and `status`, and did not pin `claim_state` either. Every
+    /// other input is public — the victim's own ReserveBatch instruction data
+    /// carries the whole leaf, a single-client epoch has an EMPTY proof with
+    /// `root == leaf`, and `client_signature` is only checked non-zero. So an
+    /// attacker could release a matured epoch it did not create, burning the
+    /// client's escrow and minting the 70% into its own `reward_relay`.
+    ///
+    /// Here the attacker signs with its own keypair while passing the VICTIM's
+    /// commitment PDA. Everything else is well-formed, so only the binding can
+    /// reject it.
+    #[tokio::test]
+    async fn release_claim_rejects_another_relays_commitment() {
+        let victim   = Keypair::new();
+        let attacker = Keypair::new();
+        let epoch = 911u64;
+        let client = [23u8; 32];
+        let bytes = 500_000_000u64;
+
+        let release = ClientReleaseOnChain {
+            client_pubkey: client, session_id: [2u8; 16], batch_nonce: 1,
+            total_bytes: bytes, merkle_proof: vec![], client_signature: [1u8; 64],
+            device_uuid: [0u8; 16], record_count: 1,
+        };
+        let root = compute_merkle_leaf_hash_from_release(&release);
+        let derived = derive_reward_amount(bytes, DEFAULT_ROUTING_PER_MB);
+
+        // The VICTIM's commitment PDA — public, derivable by anyone.
+        let (victim_c_pda, c_bump) = Pubkey::find_program_address(
+            &[b"claim_commitment", victim.pubkey().as_ref(), &epoch.to_le_bytes()], &id());
+        let (service_auth, _) = Pubkey::find_program_address(&[b"mint_authority"], &id());
+        // claim_state keyed to the ATTACKER, which is what made AlreadyReleased
+        // useless as a defence.
+        let (cs_pda, cs_bump) = Pubkey::find_program_address(
+            &[b"claim_state", &client, attacker.pubkey().as_ref()], &id());
+        let flow_mint = Keypair::new().pubkey();
+        let attacker_tok = Keypair::new().pubkey();
+        let treas_tok = Pubkey::find_program_address(
+            &[FOUNDATION_PUBKEY.as_ref(), spl_token::id().as_ref(), flow_mint.as_ref()],
+            &Pubkey::new_from_array([
+                140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131,
+                11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
+            ]),
+        ).0;
+        let repflow = Pubkey::find_program_address(
+            &[b"repflow_user", attacker.pubkey().as_ref()], &REPFLOW_PROGRAM_ID).0;
+        let s = Keypair::new().pubkey();
+        let fund_hold = Keypair::new().pubkey();
+        let user_escrow = Keypair::new().pubkey();
+        let user_escrow_tok = Keypair::new().pubkey();
+
+        let mut pt = program_test();
+        pt.add_account(victim_c_pda, commitment_account(&victim.pubkey(), epoch, root, derived, bytes, c_bump));
+        pt.add_account(cs_pda, claim_state_account(client, &attacker.pubkey(), cs_bump));
+        pt.add_account(repflow, repflow_user_account(MIN_RELAY_REPFLOW));
+        pt.add_account(flow_mint, flow_mint_account(&service_auth));
+        pt.add_account(attacker_tok, spl_token_account(&flow_mint, &attacker.pubkey()));
+        pt.add_account(treas_tok, spl_token_account(&flow_mint, &FOUNDATION_PUBKEY));
+        pt.add_account(fund_hold, stub(mock_escrow_id(), 8));
+        pt.add_account(user_escrow, stub(mock_escrow_id(), 8));
+        pt.add_account(user_escrow_tok, stub(mock_escrow_id(), 8));
+
+        let (mut banks, payer, bh) = pt.start().await;
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(&payer.pubkey(), &attacker.pubkey(), 2_000_000_000)],
+            Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let ix = Instruction { program_id: id(), accounts: vec![
+            AccountMeta::new(attacker.pubkey(), true),      // signer = ATTACKER
+            AccountMeta::new(victim_c_pda, false),          // commitment = VICTIM's
+            AccountMeta::new_readonly(mock_escrow_id(), false),
+            AccountMeta::new_readonly(service_auth, false),
+            AccountMeta::new_readonly(s, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new(flow_mint, false),
+            AccountMeta::new_readonly(s, false),
+            AccountMeta::new_readonly(s, false),
+            AccountMeta::new_readonly(repflow, false),
+            AccountMeta::new_readonly(s, false),
+            AccountMeta::new(attacker_tok, false),          // reward_relay = ATTACKER's
+            AccountMeta::new(treas_tok, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(client), false),
+            AccountMeta::new(cs_pda, false),
+            AccountMeta::new(user_escrow, false),
+            AccountMeta::new(fund_hold, false),
+            AccountMeta::new(user_escrow_tok, false),
+        ], data: borsh::to_vec(&RewardsInstruction::ReleaseClaim {
+            claim_epoch: epoch, releases: vec![release] }).unwrap() };
+
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&attacker.pubkey()), &[&attacker], bh)).await
+            .expect_err(
+                "a relay must NOT be able to release another relay's commitment — \
+                 this is direct theft of the victim's 70% plus the client's escrow");
+
+        assert_eq!(
+            token_balance(&mut banks, attacker_tok).await, 0,
+            "nothing may be minted to the attacker"
+        );
     }
 
     /// H-1: `ReleaseClaim` must refuse a `reward_treasury` that is not the
