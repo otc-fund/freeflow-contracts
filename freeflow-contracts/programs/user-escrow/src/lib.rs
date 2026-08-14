@@ -1021,18 +1021,28 @@ pub struct ReleaseFunds<'info> {
     #[account(seeds = [b"spender_registry"], bump)]
     pub spender_registry: Account<'info, AuthorizedSpenderRegistry>,
 
-    /// CHECK: rent refund target, validated by the CALLER — rewards-v2 pins it
-    /// to `FOUNDATION_PUBKEY` before invoking this CPI
-    /// (`process_client_dispute_ix`).
+    /// CHECK: rent refund target, pinned to `FOUNDATION_PUBKEY` HERE, and
+    /// independently by the caller — rewards-v2 checks the same value before
+    /// invoking this CPI (`process_client_dispute_ix`). Two pins, either of
+    /// which alone closes the hole; neither is redundant, because they answer
+    /// different questions (see below).
     ///
     /// The burn path's argument does NOT apply here. There, `rent_recipient` is
     /// safe unvalidated because the relay is the signer, so it can only refund
     /// itself. On this path the signer is the disputing CLIENT — the relay is
     /// not in the account list at all — so an unvalidated recipient would let a
-    /// client name their own wallet and take the relay's rent. The pin lives in
-    /// rewards-v2 because it is the program that knows a dispute is in flight
-    /// and that neither party should profit from one.
-    #[account(mut)]
+    /// client name their own wallet and take the relay's rent. rewards-v2 pins
+    /// it because it is the program that knows a dispute is in flight and that
+    /// neither party should profit from one.
+    ///
+    /// user-escrow pins it too because `release_funds` is callable by ANY
+    /// authority in `spender_registry.active_spenders`, not solely rewards-v2.
+    /// Trusting the caller makes every present and future authorised spender
+    /// a place the rent can be redirected from; pinning here makes the sink a
+    /// property of the escrow itself. Same wallet on both sides
+    /// (`8SL4dhnXU9tjvsbwfkVzQbfV99wGnVZBECoiuwrdbaJk`), so the CPI is
+    /// unaffected.
+    #[account(mut, address = FOUNDATION_PUBKEY @ EscrowError::NotFoundation)]
     pub rent_recipient: UncheckedAccount<'info>,
 }
 

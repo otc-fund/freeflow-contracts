@@ -22,6 +22,7 @@ import {
   PublicKey,
   SystemProgram,
   LAMPORTS_PER_SOL,
+  sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import {
   createMint,
@@ -53,6 +54,36 @@ const UNUSED_POOL_VAULT = Keypair.generate().publicKey;
 async function airdrop(provider: anchor.AnchorProvider, key: PublicKey, sol = 10) {
   const sig = await provider.connection.requestAirdrop(key, sol * LAMPORTS_PER_SOL);
   await provider.connection.confirmTransaction(sig, "confirmed");
+}
+
+/**
+ * Lamport balance as an exact bigint, read straight off the JSON-RPC wire.
+ *
+ * `Connection.getBalance()` (and `meta.pre/postBalances`, and
+ * `getAccountInfo().lamports`) all hand back a JavaScript `number`, i.e. a
+ * float64. That is fine for ordinary accounts and WRONG for the provider
+ * wallet: `solana-test-validator` makes the configured CLI keypair the genesis
+ * mint, funded with 500,000,000 SOL = 5e17 lamports. Past 2^53 the float grid
+ * spacing at that magnitude is 64 lamports, so a 1,621,680-lamport rent refund
+ * reads back as 1,621,632 or 1,621,696 — never the true value. An exact-equality
+ * delta assertion on that account is unwinnable through the typed client.
+ *
+ * `JSON.parse` would round it identically, so the number is lifted out of the
+ * raw response text before any float can touch it.
+ */
+async function getBalanceExact(connection: anchor.web3.Connection, key: PublicKey): Promise<bigint> {
+  const res = await fetch(connection.rpcEndpoint, {
+    method:  "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0", id: 1, method: "getBalance",
+      params: [key.toBase58(), { commitment: "confirmed" }],
+    }),
+  });
+  const text  = await res.text();
+  const match = text.match(/"value"\s*:\s*(\d+)/);
+  assert.isNotNull(match, `getBalance returned no numeric value: ${text}`);
+  return BigInt(match![1]);
 }
 
 // ─── Suite ────────────────────────────────────────────────────────────────────
@@ -1149,16 +1180,32 @@ describe("user-escrow", () => {
         program.programId
       );
 
-      // In production this is FOUNDATION_PUBKEY: the client signs a dispute, so
-      // rewards-v2 pins the recipient rather than trusting the caller (unlike the
-      // burn path, where the relay signs and can only refund itself). user-escrow
-      // itself takes whatever the caller names, so any key exercises the same code.
-      // It is deliberately its own independent keypair — distinct from
-      // rewardsContractPda (both `serviceAuthority` and `payer` on the hold below)
-      // and from `user` — so the lamport-delta assertion can only pass under
-      // `close = rent_recipient` specifically, and not under `close = payer` or
-      // `close = user`, which would be indistinguishable if the keys coincided.
-      const rentRecipient = Keypair.generate();
+      // The recipient is no longer free: `ReleaseFunds.rent_recipient` is pinned
+      // to FOUNDATION_PUBKEY in the program, so it MUST be the foundation here.
+      // That collides with two things the test needs, and both are worked around
+      // rather than dropped:
+      //
+      //   (1) THE DISCRIMINATION PROPERTY. The delta assertion below has to be
+      //       able to fail under `close = payer` or `close = user`. The pin
+      //       fixes the recipient, so the separation is moved to the OTHER
+      //       accounts instead: the hold's `payer` is rewardsContractPda and the
+      //       `user` is `user` — neither of which is the foundation. So under
+      //       `close = payer` or `close = user` the foundation's balance would
+      //       not move at all and the exact-equality assertion fails. Only
+      //       `close = rent_recipient` can satisfy it.
+      //
+      //   (2) THE FEE-PAYER COLLISION. `foundation` is the provider wallet,
+      //       which .rpc() would make the fee payer — the fee would net against
+      //       the refund and the delta would no longer be exactly the rent.
+      //       Approach (a): build with .transaction() and send with
+      //       rewardsContractPda as the fee payer (it is already a required
+      //       signer). The foundation is then a writable NON-signer, charged
+      //       nothing, so its delta is the rent and nothing else — exact
+      //       equality, no fee arithmetic and no hardcoded 5000.
+      //
+      // Whether the pin itself has teeth is a separate question, proved by the
+      // negative test below; this test proves `close` targets the right account.
+      const rentRecipient = foundation;
 
       // Create the hold first.
       await program.methods
@@ -1196,14 +1243,14 @@ describe("user-escrow", () => {
         `FundHold should hold exactly the rent-exempt minimum for ${holdInfoBefore!.data.length} bytes`
       );
 
-      // Fee-payer netting: .rpc() makes the provider wallet the fee payer and
-      // rewardsContractPda only an extra signer, so neither the recipient nor any
-      // signer is charged against this delta. rentRecipient is not a signer at all.
-      // The delta is therefore the rent refund alone — exact equality, no slack.
-      const rentRecipientBefore = await provider.connection.getBalance(rentRecipient.publicKey);
+      // bigint, not getBalance() — the foundation is the validator's 500M-SOL
+      // genesis mint and a float64 cannot resolve a 1.6M-lamport delta there.
+      // See getBalanceExact.
+      const rentRecipientBefore = await getBalanceExact(provider.connection, rentRecipient.publicKey);
 
-      // Release.
-      await program.methods
+      // Release — see (2) above. .transaction() + an explicit non-foundation fee
+      // payer, NOT .rpc(), so no fee is charged to the account being measured.
+      const releaseTx = await program.methods
         .releaseFunds([...claimHash])
         .accounts({
           serviceAuthority: rewardsContractPda.publicKey,
@@ -1213,8 +1260,29 @@ describe("user-escrow", () => {
           spenderRegistry:  spenderRegistryPda,
           rentRecipient:    rentRecipient.publicKey,
         })
-        .signers([rewardsContractPda])
-        .rpc();
+        .transaction();
+      releaseTx.feePayer = rewardsContractPda.publicKey;
+      assert.ok(
+        !releaseTx.feePayer.equals(rentRecipient.publicKey),
+        "fee payer must not be the measured rent recipient, or the delta is fee-netted"
+      );
+      const relSig = await sendAndConfirmTransaction(
+        provider.connection,
+        releaseTx,
+        [rewardsContractPda],
+        { commitment: "confirmed" }
+      );
+      // The fee really did land on someone else — asserted, not assumed, since
+      // the exactness of the delta below rests on it. Account 0 of a legacy
+      // message is the fee payer.
+      const relTx = await provider.connection.getTransaction(relSig, {
+        commitment: "confirmed", maxSupportedTransactionVersion: 0,
+      });
+      assert.ok(
+        relTx!.transaction.message.getAccountKeys().staticAccountKeys[0]
+          .equals(rewardsContractPda.publicKey),
+        "the fee-paying account must be rewardsContractPda, not the measured foundation"
+      );
 
       const escrowAfter = await program.account.userEscrow.fetch(userEscrowPda);
       assert.ok(
@@ -1235,12 +1303,110 @@ describe("user-escrow", () => {
         "FundHold account must be closed by `close = rent_recipient`, not merely marked Released"
       );
 
-      // (2) Its lamports landed on the rent recipient.
-      const rentRecipientAfter = await provider.connection.getBalance(rentRecipient.publicKey);
+      // (2) Its lamports landed on the rent recipient — exactly, no slack. Under
+      // `close = payer` this delta would be 0 (the payer is rewardsContractPda),
+      // and under `close = user` it would be 0 as well. Only
+      // `close = rent_recipient` can satisfy it. That is the discrimination the
+      // pin would otherwise have cost, relocated onto the other accounts.
+      const rentRecipientAfter = await getBalanceExact(provider.connection, rentRecipient.publicKey);
       assert.equal(
-        rentRecipientAfter - rentRecipientBefore,
-        holdRent,
+        (rentRecipientAfter - rentRecipientBefore).toString(),
+        BigInt(holdRent).toString(),
         `rent recipient must receive exactly the FundHold's ${holdRent} lamports`
+      );
+    });
+
+    it("rejects a rent recipient that is not the foundation", async () => {
+      // This is the test that gives the `address = FOUNDATION_PUBKEY` pin on
+      // `ReleaseFunds.rent_recipient` its teeth. The test above cannot: with the
+      // pin deleted, naming the foundation is still permitted, so it would stay
+      // green. Only an attempt to name someone ELSE distinguishes the two.
+      //
+      // Why the pin belongs in user-escrow and not only in rewards-v2:
+      // release_funds is callable by ANY authority in
+      // spender_registry.active_spenders. rewardsContractPda below is exactly
+      // that — a registered spender that is not rewards-v2 — so this test is a
+      // faithful model of the residual risk, not a synthetic one.
+      const claimHash  = Buffer.alloc(32, 0x55);
+      const sessionId  = Buffer.alloc(16, 0x66);
+      const holdAmount = new BN(1_000_000_000); // 1 FLOW
+
+      const [fundHoldPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("fund_hold"), user.publicKey.toBuffer(), claimHash],
+        program.programId
+      );
+
+      await program.methods
+        .holdClientFunds(holdAmount, [...claimHash], [...sessionId])
+        .accounts({
+          serviceAuthority: rewardsContractPda.publicKey,
+          payer:            rewardsContractPda.publicKey,
+          user:             user.publicKey,
+          userEscrow:       userEscrowPda,
+          fundHold:         fundHoldPda,
+          spenderRegistry:  spenderRegistryPda,
+          systemProgram:    SystemProgram.programId,
+        })
+        .signers([rewardsContractPda])
+        .rpc();
+
+      const thief = Keypair.generate();
+
+      // A flag rather than assert.fail(): chai's AssertionError would be swallowed
+      // by the catch, and its message would itself contain "NotFoundation" — the
+      // assertion would then confirm its own failure message. The flag cannot.
+      let released = false;
+      try {
+        await program.methods
+          .releaseFunds([...claimHash])
+          .accounts({
+            serviceAuthority: rewardsContractPda.publicKey,
+            user:             user.publicKey,
+            userEscrow:       userEscrowPda,
+            fundHold:         fundHoldPda,
+            spenderRegistry:  spenderRegistryPda,
+            rentRecipient:    thief.publicKey,
+          })
+          .signers([rewardsContractPda])
+          .rpc();
+        released = true;
+      } catch (err: any) {
+        assert.include(err.message, "NotFoundation",
+          `Expected NotFoundation, got: ${err.message}`);
+      }
+      assert.isFalse(released,
+        "a registered spender must not be able to redirect the closed hold's rent");
+
+      // Reverted wholesale: the hold is untouched and the named wallet is empty.
+      assert.isNotNull(
+        await provider.connection.getAccountInfo(fundHoldPda),
+        "a rejected release must leave the FundHold open"
+      );
+      assert.equal(
+        await provider.connection.getBalance(thief.publicKey), 0,
+        "a rejected release must move no lamports to the named recipient"
+      );
+
+      // The SAME instruction with only the recipient changed must succeed. That
+      // is what makes this an A/B on the pin rather than on some other constraint
+      // (registry membership, hold status, seeds) that would reject either way.
+      // It also leaves no Active hold behind for later tests.
+      await program.methods
+        .releaseFunds([...claimHash])
+        .accounts({
+          serviceAuthority: rewardsContractPda.publicKey,
+          user:             user.publicKey,
+          userEscrow:       userEscrowPda,
+          fundHold:         fundHoldPda,
+          spenderRegistry:  spenderRegistryPda,
+          rentRecipient:    foundation.publicKey,
+        })
+        .signers([rewardsContractPda])
+        .rpc();
+
+      assert.isNull(
+        await provider.connection.getAccountInfo(fundHoldPda),
+        "the same release with the foundation as recipient must succeed and close the hold"
       );
     });
 
@@ -1258,6 +1424,18 @@ describe("user-escrow", () => {
       // AccountNotInitialized (3012). Same refusal, different code — and no live
       // FundHold can ever be non-Active any more, since both termination paths
       // close it. The status constraint stays as defence in depth.
+      //
+      // AccountNotInitialized is a GENERIC error: a mistyped seed would raise it
+      // just as readily, and the test would "pass" while proving nothing. Pin the
+      // subject first — this exact PDA exists in the ledger's history and is
+      // genuinely closed now, so the rejection below is about closure and not
+      // about addressing a PDA that never existed. (Same hazard as using a
+      // throwing .fetch() to prove absence.)
+      assert.isNull(
+        await provider.connection.getAccountInfo(fundHoldPda),
+        "precondition: the FundHold released above must be closed, not merely a PDA that was never created"
+      );
+
       try {
         await program.methods
           .releaseFunds([...claimHash])
@@ -1267,7 +1445,9 @@ describe("user-escrow", () => {
             userEscrow:       userEscrowPda,
             fundHold:         fundHoldPda,
             spenderRegistry:  spenderRegistryPda,
-            rentRecipient:    rewardsContractPda.publicKey,
+            // The foundation, so this test trips only the replay guard and never
+            // the rent_recipient address pin (covered by the test above).
+            rentRecipient:    foundation.publicKey,
           })
           .signers([rewardsContractPda])
           .rpc();
@@ -1403,6 +1583,15 @@ describe("user-escrow", () => {
       const [fundHoldPda] = PublicKey.findProgramAddressSync(
         [Buffer.from("fund_hold"), user.publicKey.toBuffer(), claimHash],
         program.programId
+      );
+
+      // AccountNotInitialized is a GENERIC error — a mistyped seed raises it too.
+      // Prove the subject is the right, genuinely-closed PDA before asserting on
+      // the refusal, so this cannot pass vacuously against an address that never
+      // held an account.
+      assert.isNull(
+        await provider.connection.getAccountInfo(fundHoldPda),
+        "precondition: the FundHold released earlier must be closed, not merely a PDA that was never created"
       );
 
       try {

@@ -1294,6 +1294,28 @@ pub fn process_client_dispute_ix(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    // Releasing closes the FundHold, and its ~1.6M lamports of rent have to land
+    // somewhere. Pin that somewhere to the foundation: the client signs this
+    // instruction, so an unvalidated recipient would let them name their own
+    // wallet and pocket the relay's rent as a bonus for disputing. Paying the
+    // relay instead would reward it for the batch a dispute just proved forged.
+    // Neither party profits — the foundation absorbs it.
+    //
+    // FOUNDATION_PUBKEY is the system-owned wallet, NOT the foundation's $FLOW
+    // ATA. This is SOL: lamports parked on an SPL token account cannot be
+    // withdrawn below its own rent-exemption and there is no sweep instruction,
+    // so routing rent to the ATA would strand it exactly as before.
+    //
+    // Checked here, with the other account-identity checks, rather than at the
+    // CPI: it compares against a compile-time constant and depends on nothing,
+    // so a malformed dispute is rejected before merkle verification and the
+    // reputation write burn compute. (user-escrow pins the same account itself;
+    // this one stays because it is what makes the intent legible at the site
+    // that knows a dispute is in flight.)
+    if rent_recipient_ai.key != &FOUNDATION_PUBKEY {
+        return Err(RewardsError::InvalidTreasuryAccount.into());
+    }
+
     let commitment: ClaimCommitment =
         ClaimCommitment::try_from_slice(&commitment_ai.data.borrow())
             .map_err(|_| RewardsError::ClaimCommitmentNotFound)?;
@@ -1426,21 +1448,9 @@ pub fn process_client_dispute_ix(
     // Release client's funds.
     let (_, authority_bump) = Pubkey::find_program_address(&[b"mint_authority"], program_id);
 
-    // Releasing closes the FundHold, and its ~1.6M lamports of rent have to land
-    // somewhere. Pin that somewhere to the foundation: the client signs this
-    // instruction, so an unvalidated recipient would let them name their own
-    // wallet and pocket the relay's rent as a bonus for disputing. Paying the
-    // relay instead would reward it for the batch a dispute just proved forged.
-    // Neither party profits — the foundation absorbs it.
-    //
-    // FOUNDATION_PUBKEY is the system-owned wallet, NOT the foundation's $FLOW
-    // ATA. This is SOL: lamports parked on an SPL token account cannot be
-    // withdrawn below its own rent-exemption and there is no sweep instruction,
-    // so routing rent to the ATA would strand it exactly as before.
-    if rent_recipient_ai.key != &FOUNDATION_PUBKEY {
-        return Err(RewardsError::InvalidTreasuryAccount.into());
-    }
-
+    // `rent_recipient_ai` is pinned to FOUNDATION_PUBKEY at the top of this
+    // handler, before any compute is spent; user-escrow pins the same account
+    // itself on the `ReleaseFunds` struct.
     cpi_release_funds(
         escrow_program,
         rent_recipient_ai,
