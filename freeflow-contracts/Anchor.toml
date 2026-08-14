@@ -48,4 +48,17 @@ wallet   = "~/.config/solana/id.json"
 # types. Runtime behaviour is unaffected — .accounts() and .accountsPartial()
 # are identical at runtime — so transpile-only is what makes the suite execute.
 # Migrating the call sites to .accountsPartial() would make type-checking viable.
+#
+# PREREQUISITE on a fresh checkout: target/idl/ and target/types/ are gitignored
+# (not committed), but tests/user-escrow.ts imports anchor.workspace.UserEscrow
+# and ../target/types/user_escrow, so run this once first or the suite throws
+# immediately:
+#   CARGO_ENCODED_RUSTFLAGS="" anchor idl build -p user_escrow \
+#     -o target/idl/user_escrow.json -t target/types/user_escrow.ts
+# CARGO_ENCODED_RUSTFLAGS="" is required on this toolchain: anchor-syn 0.30.1
+# calls proc_macro2::Span::source_file(), which proc-macro2 removed in 1.0.94
+# (the lockfile resolves 1.0.106) — plain `anchor idl build` fails with
+# error[E0599] at anchor-syn-0.30.1/src/idl/defined.rs:499:66. Setting
+# CARGO_ENCODED_RUSTFLAGS empty overrides anchor-cli's own RUSTFLAGS and drops
+# the cfg (procmacro2_semver_exempt) that gates that dead code path.
 test = "TS_NODE_TRANSPILE_ONLY=true yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/user-escrow.ts"

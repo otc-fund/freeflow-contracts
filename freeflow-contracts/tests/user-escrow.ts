@@ -1236,11 +1236,16 @@ describe("user-escrow", () => {
         program.programId
       );
 
-      // The rent recipient is rewardsContractPda: it is the `payer` on the hold
-      // below, mirroring production, where the relay wallet funds the FundHold in
-      // hold_client_funds and rewards-v2 forwards that same wallet as account 8 of
-      // the burn CPI. A relay can therefore only ever refund itself.
-      const rentRecipient = rewardsContractPda.publicKey;
+      // In production, `payer` and `rentRecipient` are the same wallet: the relay
+      // funds the FundHold in hold_client_funds, and rewards-v2 forwards that same
+      // relay wallet as CPI account 8 on the burn, so a relay can only ever refund
+      // itself. Here rentRecipient is deliberately its own independent keypair,
+      // distinct from rewardsContractPda (which is both `serviceAuthority` and
+      // `payer` on the hold below) — so the lamport-delta assertion below can only
+      // pass if the runtime actually honors `close = rent_recipient`, and not
+      // `close = service_authority` or `close = payer`, which happen to be the
+      // same key in this fixture.
+      const rentRecipient = Keypair.generate();
 
       // Create the hold. rewardsContractPda pays the FundHold's rent.
       await program.methods
@@ -1278,7 +1283,7 @@ describe("user-escrow", () => {
       // rewardsContractPda is only an extra signer, so it is never charged a fee.
       // The delta below is therefore the rent refund alone and can be asserted as
       // exact equality — no `>` slack, no fee subtraction.
-      const rentRecipientBefore = await provider.connection.getBalance(rentRecipient);
+      const rentRecipientBefore = await provider.connection.getBalance(rentRecipient.publicKey);
 
       // Burn.
       await program.methods
@@ -1292,7 +1297,7 @@ describe("user-escrow", () => {
           spenderRegistry:  spenderRegistryPda,
           tokenMint:        tokenMint,
           tokenProgram:     TOKEN_PROGRAM_ID,
-          rentRecipient:    rentRecipient,
+          rentRecipient:    rentRecipient.publicKey,
         })
         .signers([rewardsContractPda])
         .rpc();
@@ -1323,7 +1328,7 @@ describe("user-escrow", () => {
       );
 
       // (2) Its lamports landed on the rent recipient.
-      const rentRecipientAfter = await provider.connection.getBalance(rentRecipient);
+      const rentRecipientAfter = await provider.connection.getBalance(rentRecipient.publicKey);
       assert.equal(
         rentRecipientAfter - rentRecipientBefore,
         holdRent,
