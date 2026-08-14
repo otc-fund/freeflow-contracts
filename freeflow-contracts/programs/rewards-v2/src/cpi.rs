@@ -111,11 +111,20 @@ pub fn cpi_hold_client_funds<'a>(
 
 /// CPI to user_escrow::release_funds.
 ///
-/// Decrements UserEscrow.held and marks FundHold as Released.
-/// Called when client wins dispute — tokens stay in escrow (balance unchanged).
+/// Decrements UserEscrow.held, marks FundHold as Released, and CLOSES the
+/// FundHold PDA. Called when client wins dispute — tokens stay in escrow
+/// (balance unchanged).
+///
+/// `rent_recipient_ai` receives the closed FundHold's rent. Unlike the burn
+/// path, the caller here is the disputing CLIENT, not the relay, so "the signer
+/// can only refund itself" is not available as a safety argument: the caller
+/// MUST pin this to `FOUNDATION_PUBKEY` before invoking, or the client can take
+/// the relay's rent. `process_client_dispute_ix` does exactly that.
+#[allow(clippy::too_many_arguments)]
 #[inline(never)]
 pub fn cpi_release_funds<'a>(
     user_escrow_program_ai: &AccountInfo<'a>,
+    rent_recipient_ai:      &AccountInfo<'a>,
     mint_authority_ai:      &AccountInfo<'a>,
     user_ai:                &AccountInfo<'a>,
     user_escrow_state_ai:   &AccountInfo<'a>,
@@ -137,6 +146,8 @@ pub fn cpi_release_funds<'a>(
             AccountMeta { pubkey: *user_escrow_state_ai.key, is_signer: false, is_writable: true  },
             AccountMeta { pubkey: *fund_hold_ai.key,         is_signer: false, is_writable: true  },
             AccountMeta { pubkey: *spender_registry_ai.key,  is_signer: false, is_writable: false },
+            // 5: rent_recipient — last, matching ReleaseFunds' field order.
+            AccountMeta { pubkey: *rent_recipient_ai.key,    is_signer: false, is_writable: true  },
         ],
         data,
     };
@@ -149,6 +160,7 @@ pub fn cpi_release_funds<'a>(
             user_escrow_state_ai.clone(),
             fund_hold_ai.clone(),
             spender_registry_ai.clone(),
+            rent_recipient_ai.clone(),
         ],
         &[&[b"mint_authority", &[mint_authority_bump]]],
     )

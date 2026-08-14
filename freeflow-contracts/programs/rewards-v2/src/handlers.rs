@@ -1258,6 +1258,8 @@ pub fn process_release_claim_ix(
 ///   10: system_program
 ///   11: fund_hold            (writable, FundHold PDA in user_escrow keyed by claim_hash)
 ///   12: user_escrow          (writable, UserEscrow PDA for the client)
+///   13: rent_recipient       (writable, MUST be FOUNDATION_PUBKEY — receives the
+///                             closed FundHold's rent; see the pin before the CPI)
 #[allow(clippy::too_many_arguments)]
 pub fn process_client_dispute_ix(
     program_id:          &Pubkey,
@@ -1286,6 +1288,7 @@ pub fn process_client_dispute_ix(
     let system_prog      = next_account_info(iter)?;
     let fund_hold_ai     = next_account_info(iter)?;
     let user_escrow_ai   = next_account_info(iter)?;
+    let rent_recipient_ai = next_account_info(iter)?;
 
     if !client.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -1423,8 +1426,24 @@ pub fn process_client_dispute_ix(
     // Release client's funds.
     let (_, authority_bump) = Pubkey::find_program_address(&[b"mint_authority"], program_id);
 
+    // Releasing closes the FundHold, and its ~1.6M lamports of rent have to land
+    // somewhere. Pin that somewhere to the foundation: the client signs this
+    // instruction, so an unvalidated recipient would let them name their own
+    // wallet and pocket the relay's rent as a bonus for disputing. Paying the
+    // relay instead would reward it for the batch a dispute just proved forged.
+    // Neither party profits — the foundation absorbs it.
+    //
+    // FOUNDATION_PUBKEY is the system-owned wallet, NOT the foundation's $FLOW
+    // ATA. This is SOL: lamports parked on an SPL token account cannot be
+    // withdrawn below its own rent-exemption and there is no sweep instruction,
+    // so routing rent to the ATA would strand it exactly as before.
+    if rent_recipient_ai.key != &FOUNDATION_PUBKEY {
+        return Err(RewardsError::InvalidTreasuryAccount.into());
+    }
+
     cpi_release_funds(
         escrow_program,
+        rent_recipient_ai,
         service_authority,
         client,  // user_ai
         user_escrow_ai,
@@ -1435,9 +1454,13 @@ pub fn process_client_dispute_ix(
     ).map_err(|_| RewardsError::CpiFailed)?;
 
     // L-4: do NOT set commitment to Disputed — that would freeze all other
-    // clients' funds in this epoch.  H-1 already prevents repeat disputes on
-    // the same batch (fund_hold lamports == 0 after release).  The commitment
-    // stays Active so honest clients can still proceed to ReleaseClaim.
+    // clients' funds in this epoch.  Repeat disputes on the same batch are
+    // caught by H-1: release closes the FundHold, so on a second attempt
+    // fund_hold_ai.lamports() == 0 and the dispute is rejected as fabricated.
+    // (Before the close landed, the actual guard was user-escrow's
+    // `status == Active` constraint, which surfaced as a CpiFailed instead.)
+    // The commitment stays Active so honest clients can still proceed to
+    // ReleaseClaim.
     msg!(
         "ClientDispute: epoch={} client={:?} FORGED/OMITTED -- relay slashed (offense #{})",
         claim_epoch, &client_pubkey[..4], rep.slash_count,
@@ -4659,11 +4682,9 @@ mod release_claim_integration_tests {
     /// registers a hand-written processor at the escrow id. What it DOES pin is
     /// the rewards-v2 half of the contract: the CPI carries exactly 9 accounts,
     /// and account 8 is a writable rent recipient the lamports can land on.
-    /// The `close` itself is NOT covered by any currently-passing test —
-    /// `tests/user-escrow.ts` still fetches the FundHold after burning and
-    /// asserts `status == Burned`, which is the pre-close behavior. That file
-    /// needs updating (to expect the account gone) before the close is proven
-    /// on a real validator.
+    /// The `close` itself is proven separately, on a real validator, by
+    /// `tests/user-escrow.ts` — it cannot be executed here because the real .so
+    /// will not load into ProgramTest (SBPF v3 vs the pinned rbpf).
     ///
     /// CPI data = [disc:8][claim_hash:32]; accounts =
     /// [mint_authority, user, user_escrow, user_escrow_token, fund_hold,
@@ -5119,9 +5140,13 @@ mod client_dispute_integration_tests {
     //! honest case would mis-reconstruct, miss the root, and wrongly slash — so the
     //! no-slash assertion is the real guard on leaf agreement.
     //!
-    //! Mock program at both the escrow and repflow ids absorbs cpi_slash_repflow
-    //! and cpi_release_funds (rewards-v2's job is to detect the forgery and request
-    //! the slash; the repflow/escrow effects are those programs' own concern).
+    //! Mock program at the repflow id absorbs cpi_slash_repflow (rewards-v2's job
+    //! is to detect the forgery and request the slash; the repflow effects are that
+    //! program's own concern). The escrow mock is not a pure sink: it stands in for
+    //! Anchor's `close = rent_recipient` so the release CPI's account list — and in
+    //! particular that the foundation is the account the rent lands on — is pinned
+    //! here. The `close` itself is proven on a validator in tests/user-escrow.ts;
+    //! the real .so cannot be loaded into ProgramTest (SBPF v3 vs the pinned rbpf).
     use super::*;
     use solana_program::{account_info::AccountInfo, entrypoint::ProgramResult, hash::hashv};
     use solana_program_test::*;
@@ -5137,9 +5162,37 @@ mod client_dispute_integration_tests {
     fn mock_repflow_id() -> Pubkey { Pubkey::new_from_array([8u8; 32]) }
     fn mock_ok(_pid: &Pubkey, _a: &[AccountInfo], _d: &[u8]) -> ProgramResult { Ok(()) }
 
+    /// Stands in for user-escrow's `release_funds`, whose FundHold is
+    /// `close = rent_recipient`. Pins the rewards-v2 half of the contract: the
+    /// CPI carries exactly 6 accounts and account 5 is a writable rent recipient
+    /// the lamports can land on.
+    ///
+    /// CPI data = [disc:8][claim_hash:32]; accounts =
+    /// [mint_authority, user, user_escrow, fund_hold, spender_registry, rent_recipient]
+    /// → fund_hold is index 3, rent_recipient index 5.
+    fn mock_escrow_release(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+        assert_eq!(data.len(), 40, "release_funds CPI data must be disc+claim_hash");
+        assert_eq!(
+            accounts.len(), 6,
+            "release_funds must receive 6 accounts — the 6th is the rent recipient \
+             the closed FundHold refunds to. Without it the 105-byte PDA is stranded."
+        );
+
+        // Stand in for `close = rent_recipient`. No realloc(0): program-test runs
+        // native processors over copied buffers, where AccountInfo::realloc's
+        // length write past the data pointer is not valid.
+        let hold = &accounts[3];
+        let rent_recipient = &accounts[5];
+        let refund = hold.lamports();
+        **rent_recipient.try_borrow_mut_lamports()? += refund;
+        **hold.try_borrow_mut_lamports()? -= refund;
+        hold.data.borrow_mut().fill(0);
+        Ok(())
+    }
+
     fn program_test() -> ProgramTest {
         let mut pt = ProgramTest::new("freeflow_rewards_v2", id(), processor!(process_instruction));
-        pt.add_program("mock_escrow", mock_escrow_id(), processor!(mock_ok));
+        pt.add_program("mock_escrow", mock_escrow_id(), processor!(mock_escrow_release));
         pt.add_program("mock_repflow", mock_repflow_id(), processor!(mock_ok));
         pt
     }
@@ -5148,8 +5201,17 @@ mod client_dispute_integration_tests {
         // F-1: owned by the real repflow-token program (see uptime module note).
         Account { lamports: 1_000_000, data: d, owner: REPFLOW_PROGRAM_ID, executable: false, rent_epoch: 0 }
     }
+    /// Every `stub` is funded with this, so it doubles as the rent a released
+    /// FundHold refunds.
+    const FH_LAMPORTS: u64 = 1_000_000;
     fn stub(owner: Pubkey, len: usize) -> Account {
-        Account { lamports: 1_000_000, data: vec![0u8; len], owner, executable: false, rent_epoch: 0 }
+        Account { lamports: FH_LAMPORTS, data: vec![0u8; len], owner, executable: false, rent_epoch: 0 }
+    }
+    /// A plain system-owned wallet — what the rent recipient must be. Pre-funded
+    /// so the assertion is a delta on a live account rather than a create.
+    fn system_wallet() -> Account {
+        Account { lamports: 5_000_000, data: vec![], owner: solana_sdk::system_program::id(),
+                  executable: false, rent_epoch: 0 }
     }
     fn commitment_account(relay: &Pubkey, epoch: u64, root: [u8;32], bump: u8) -> Account {
         let c = ClaimCommitment {
@@ -5180,7 +5242,7 @@ mod client_dispute_integration_tests {
     }
 
     fn dispute_ix(f: &Fixture, c_pda: Pubkey, rep_pda: Pubkey, repflow: Pubkey, epoch: u64,
-        fund_hold: Pubkey, user_escrow: Pubkey) -> Instruction {
+        fund_hold: Pubkey, user_escrow: Pubkey, rent_recipient: Pubkey) -> Instruction {
         let s = Pubkey::new_from_array([99u8;32]);
         // service_authority / slash_authority are PDAs rewards-v2 signs for via
         // invoke_signed in cpi_release_funds / cpi_slash_repflow — they MUST be the
@@ -5201,6 +5263,7 @@ mod client_dispute_integration_tests {
             AccountMeta::new_readonly(solana_sdk::system_program::id(), false), // 10 system
             AccountMeta::new(fund_hold, false),                                 // 11 fund_hold (release w)
             AccountMeta::new(user_escrow, false),                               // 12 user_escrow (release w)
+            AccountMeta::new(rent_recipient, false),                            // 13 rent_recipient (close refund, w)
         ], data: borsh::to_vec(&RewardsInstruction::ClientDispute {
             claim_epoch: epoch, client_pubkey: f.cpk, session_id: f.session, batch_nonce: f.nonce,
             original_batch_hash: f.batch_hash, total_bytes: 500_000_000, record_count: 1,
@@ -5224,6 +5287,7 @@ mod client_dispute_integration_tests {
         pt.add_account(repflow, repflow_user_account(10_000));
         pt.add_account(fund_hold, stub(mock_escrow_id(), 8));   // H-1: lamports != 0
         pt.add_account(user_escrow, stub(mock_escrow_id(), 8));
+        pt.add_account(FOUNDATION_PUBKEY, system_wallet());
 
         let (mut banks, payer, bh) = pt.start().await;
         banks.process_transaction(Transaction::new_signed_with_payer(
@@ -5232,11 +5296,15 @@ mod client_dispute_integration_tests {
         let bh = banks.get_latest_blockhash().await.unwrap();
 
         banks.process_transaction(Transaction::new_signed_with_payer(
-            &[dispute_ix(&f, c_pda, rep_pda, repflow, epoch, fund_hold, user_escrow)],
+            &[dispute_ix(&f, c_pda, rep_pda, repflow, epoch, fund_hold, user_escrow, FOUNDATION_PUBKEY)],
             Some(&f.client.pubkey()), &[&f.client], bh)).await.expect("honest-relay dispute must succeed as a no-op");
 
         assert!(banks.get_account(rep_pda).await.unwrap().is_none(),
             "no RelayReputation must be created when the batch verifies in the tree");
+        assert_eq!(
+            banks.get_account(fund_hold).await.unwrap().unwrap().lamports, FH_LAMPORTS,
+            "an honest-relay dispute releases nothing, so the FundHold keeps its rent"
+        );
     }
 
     #[tokio::test]
@@ -5255,6 +5323,7 @@ mod client_dispute_integration_tests {
         pt.add_account(repflow, repflow_user_account(10_000)); // >= SLASH_FIRST_OFFENSE
         pt.add_account(fund_hold, stub(mock_escrow_id(), 8));
         pt.add_account(user_escrow, stub(mock_escrow_id(), 8));
+        pt.add_account(FOUNDATION_PUBKEY, system_wallet());
 
         let (mut banks, payer, bh) = pt.start().await;
         banks.process_transaction(Transaction::new_signed_with_payer(
@@ -5262,13 +5331,66 @@ mod client_dispute_integration_tests {
             Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
         let bh = banks.get_latest_blockhash().await.unwrap();
 
+        let foundation_before = banks.get_account(FOUNDATION_PUBKEY).await.unwrap().unwrap().lamports;
+
         banks.process_transaction(Transaction::new_signed_with_payer(
-            &[dispute_ix(&f, c_pda, rep_pda, repflow, epoch, fund_hold, user_escrow)],
+            &[dispute_ix(&f, c_pda, rep_pda, repflow, epoch, fund_hold, user_escrow, FOUNDATION_PUBKEY)],
             Some(&f.client.pubkey()), &[&f.client], bh)).await.expect("forgery dispute must succeed and slash");
 
         let acct = banks.get_account(rep_pda).await.unwrap().expect("RelayReputation must be created on a forgery");
         let rep = RelayReputation::try_from_slice(&acct.data[..RELAY_REPUTATION_SIZE]).unwrap();
         assert_eq!(rep.slash_count, 1, "first offense");
         assert_eq!(rep.lifetime_slashed, SLASH_FIRST_OFFENSE, "first-offense slash amount recorded");
+
+        // The FundHold's rent went to the foundation, not to the disputing client
+        // and not to the relay. The client is the fee payer here, so asserting on
+        // the foundation's balance (never a fee payer) keeps this an exact delta.
+        let foundation_after = banks.get_account(FOUNDATION_PUBKEY).await.unwrap().unwrap().lamports;
+        assert_eq!(
+            foundation_after - foundation_before, FH_LAMPORTS,
+            "the closed FundHold's rent must land on the foundation wallet"
+        );
+    }
+
+    /// The theft vector the pin exists to close. The disputing client signs this
+    /// instruction, so without the `FOUNDATION_PUBKEY` check they could name any
+    /// wallet — their own — as the account the closed FundHold refunds to, and walk
+    /// away with the relay's rent on top of winning the dispute.
+    #[tokio::test]
+    async fn dispute_cannot_redirect_the_closed_holds_rent() {
+        let f = build();
+        let epoch = 5_053u64;
+        let (c_pda, c_bump) = Pubkey::find_program_address(&[b"claim_commitment", f.relay_pk.as_ref(), &epoch.to_le_bytes()], &id());
+        let (rep_pda, _) = Pubkey::find_program_address(&[b"relay_reputation", &f.relay_pk.to_bytes()], &id());
+        let repflow = Pubkey::find_program_address(&[b"repflow_user", f.relay_pk.as_ref()], &REPFLOW_PROGRAM_ID).0;
+        let fund_hold = Keypair::new().pubkey();
+        let user_escrow = Keypair::new().pubkey();
+
+        let mut pt = program_test();
+        pt.add_account(c_pda, commitment_account(&f.relay_pk, epoch, [0xAB;32], c_bump)); // forgery
+        pt.add_account(repflow, repflow_user_account(10_000));
+        pt.add_account(fund_hold, stub(mock_escrow_id(), 8));
+        pt.add_account(user_escrow, stub(mock_escrow_id(), 8));
+        pt.add_account(FOUNDATION_PUBKEY, system_wallet());
+
+        let (mut banks, payer, bh) = pt.start().await;
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(&payer.pubkey(), &f.client.pubkey(), 2_000_000_000)],
+            Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        // Everything else is a legitimate, winnable dispute; only account 13 is swapped.
+        let err = banks.process_transaction(Transaction::new_signed_with_payer(
+            &[dispute_ix(&f, c_pda, rep_pda, repflow, epoch, fund_hold, user_escrow, f.client.pubkey())],
+            Some(&f.client.pubkey()), &[&f.client], bh)).await
+            .expect_err("naming a rent recipient other than the foundation must revert");
+
+        let want = format!("Custom({})", RewardsError::InvalidTreasuryAccount as u32);
+        let got  = format!("{err:?}");
+        assert!(got.contains(&want), "expected {want}, got {got}");
+        assert_eq!(
+            banks.get_account(fund_hold).await.unwrap().unwrap().lamports, FH_LAMPORTS,
+            "the revert must leave the FundHold's rent where it was"
+        );
     }
 }

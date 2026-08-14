@@ -1139,7 +1139,7 @@ describe("user-escrow", () => {
 
   describe("ReleaseFunds", () => {
 
-    it("decrements held and marks FundHold as Released", async () => {
+    it("decrements held, closes FundHold and refunds its rent", async () => {
       const claimHash  = Buffer.alloc(32, 0x11);
       const sessionId  = Buffer.alloc(16, 0x22);
       const holdAmount = new BN(100_000_000_000); // 100 FLOW
@@ -1148,6 +1148,17 @@ describe("user-escrow", () => {
         [Buffer.from("fund_hold"), user.publicKey.toBuffer(), claimHash],
         program.programId
       );
+
+      // In production this is FOUNDATION_PUBKEY: the client signs a dispute, so
+      // rewards-v2 pins the recipient rather than trusting the caller (unlike the
+      // burn path, where the relay signs and can only refund itself). user-escrow
+      // itself takes whatever the caller names, so any key exercises the same code.
+      // It is deliberately its own independent keypair — distinct from
+      // rewardsContractPda (both `serviceAuthority` and `payer` on the hold below)
+      // and from `user` — so the lamport-delta assertion can only pass under
+      // `close = rent_recipient` specifically, and not under `close = payer` or
+      // `close = user`, which would be indistinguishable if the keys coincided.
+      const rentRecipient = Keypair.generate();
 
       // Create the hold first.
       await program.methods
@@ -1167,6 +1178,30 @@ describe("user-escrow", () => {
       const escrowBefore = await program.account.userEscrow.fetch(userEscrowPda);
       const heldBefore   = escrowBefore.held as BN;
 
+      // Before/after control: the account must demonstrably exist first, or the
+      // "it is gone afterwards" assertion below could pass vacuously (e.g. on a
+      // PDA that was never created).
+      const holdInfoBefore = await provider.connection.getAccountInfo(fundHoldPda);
+      assert.isNotNull(holdInfoBefore, "FundHold must exist before the release");
+
+      // Snapshot the rent about to be reclaimed straight off the live account
+      // rather than hardcoding 1,621,680, and cross-check it against the runtime's
+      // own rent-exemption schedule for that data length.
+      const holdRent = holdInfoBefore!.lamports;
+      const rentExemptMin = await provider.connection.getMinimumBalanceForRentExemption(
+        holdInfoBefore!.data.length
+      );
+      assert.equal(
+        holdRent, rentExemptMin,
+        `FundHold should hold exactly the rent-exempt minimum for ${holdInfoBefore!.data.length} bytes`
+      );
+
+      // Fee-payer netting: .rpc() makes the provider wallet the fee payer and
+      // rewardsContractPda only an extra signer, so neither the recipient nor any
+      // signer is charged against this delta. rentRecipient is not a signer at all.
+      // The delta is therefore the rent refund alone — exact equality, no slack.
+      const rentRecipientBefore = await provider.connection.getBalance(rentRecipient.publicKey);
+
       // Release.
       await program.methods
         .releaseFunds([...claimHash])
@@ -1176,6 +1211,7 @@ describe("user-escrow", () => {
           userEscrow:       userEscrowPda,
           fundHold:         fundHoldPda,
           spenderRegistry:  spenderRegistryPda,
+          rentRecipient:    rentRecipient.publicKey,
         })
         .signers([rewardsContractPda])
         .rpc();
@@ -1191,18 +1227,37 @@ describe("user-escrow", () => {
         "balance must be unchanged on release"
       );
 
-      const hold = await program.account.fundHold.fetch(fundHoldPda);
-      assert.deepEqual(hold.status, { released: {} }, "FundHold status must be Released");
+      // (1) The FundHold is gone. getAccountInfo returning null is checked rather
+      // than a throwing .fetch(), which would also "pass" on a mistyped PDA.
+      const holdInfoAfter = await provider.connection.getAccountInfo(fundHoldPda);
+      assert.isNull(
+        holdInfoAfter,
+        "FundHold account must be closed by `close = rent_recipient`, not merely marked Released"
+      );
+
+      // (2) Its lamports landed on the rent recipient.
+      const rentRecipientAfter = await provider.connection.getBalance(rentRecipient.publicKey);
+      assert.equal(
+        rentRecipientAfter - rentRecipientBefore,
+        holdRent,
+        `rent recipient must receive exactly the FundHold's ${holdRent} lamports`
+      );
     });
 
-    it("rejects release of an already-released hold", async () => {
-      const claimHash = Buffer.alloc(32, 0x11); // same hash as above (already Released)
+    it("rejects a second release of the same hold", async () => {
+      const claimHash = Buffer.alloc(32, 0x11); // same hash as above (released + closed)
 
       const [fundHoldPda] = PublicKey.findProgramAddressSync(
         [Buffer.from("fund_hold"), user.publicKey.toBuffer(), claimHash],
         program.programId
       );
 
+      // The replay guard used to be `constraint = status == Active`, surfacing as
+      // HoldNotActive. Now that release closes the account there is no account left
+      // to deserialize, so Anchor rejects it one step earlier with
+      // AccountNotInitialized (3012). Same refusal, different code — and no live
+      // FundHold can ever be non-Active any more, since both termination paths
+      // close it. The status constraint stays as defence in depth.
       try {
         await program.methods
           .releaseFunds([...claimHash])
@@ -1212,13 +1267,14 @@ describe("user-escrow", () => {
             userEscrow:       userEscrowPda,
             fundHold:         fundHoldPda,
             spenderRegistry:  spenderRegistryPda,
+            rentRecipient:    rewardsContractPda.publicKey,
           })
           .signers([rewardsContractPda])
           .rpc();
-        assert.fail("Expected HoldNotActive error");
+        assert.fail("Expected AccountNotInitialized error");
       } catch (err: any) {
-        assert.include(err.message, "HoldNotActive",
-          `Expected HoldNotActive, got: ${err.message}`);
+        assert.include(err.message, "AccountNotInitialized",
+          `Expected AccountNotInitialized, got: ${err.message}`);
       }
     });
 
@@ -1336,8 +1392,13 @@ describe("user-escrow", () => {
       );
     });
 
-    it("rejects burn of a non-Active hold (already Released)", async () => {
-      const claimHash = Buffer.alloc(32, 0x11); // Released in ReleaseFunds test above
+    it("rejects burn of a hold already closed by release", async () => {
+      // Released — and therefore closed — in the ReleaseFunds test above. Before
+      // release closed it this reached the `status == Active` constraint and
+      // surfaced HoldNotActive; now the account is gone, so Anchor fails earlier
+      // with AccountNotInitialized. This is the double-spend guard that matters:
+      // a client who won a dispute must not also have their funds burned.
+      const claimHash = Buffer.alloc(32, 0x11);
 
       const [fundHoldPda] = PublicKey.findProgramAddressSync(
         [Buffer.from("fund_hold"), user.publicKey.toBuffer(), claimHash],
@@ -1360,10 +1421,10 @@ describe("user-escrow", () => {
           })
           .signers([rewardsContractPda])
           .rpc();
-        assert.fail("Expected HoldNotActive error");
+        assert.fail("Expected AccountNotInitialized error");
       } catch (err: any) {
-        assert.include(err.message, "HoldNotActive",
-          `Expected HoldNotActive, got: ${err.message}`);
+        assert.include(err.message, "AccountNotInitialized",
+          `Expected AccountNotInitialized, got: ${err.message}`);
       }
     });
 

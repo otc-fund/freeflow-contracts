@@ -1003,8 +1003,13 @@ pub struct ReleaseFunds<'info> {
     pub user_escrow: Account<'info, UserEscrow>,
 
     /// FundHold PDA to release. Must be in Active state.
+    ///
+    /// `close` returns the 105-byte account's rent instead of stranding it —
+    /// the same leak the burn path had, on the other termination path. Since
+    /// the seed includes claim_hash, a released hold is never revisited.
     #[account(
         mut,
+        close = rent_recipient,
         seeds = [b"fund_hold", user.key().as_ref(), claim_hash.as_ref()],
         bump,
         constraint = fund_hold.status == HoldStatus::Active @ EscrowError::HoldNotActive,
@@ -1015,6 +1020,20 @@ pub struct ReleaseFunds<'info> {
     /// Registry of Foundation-approved spenders.
     #[account(seeds = [b"spender_registry"], bump)]
     pub spender_registry: Account<'info, AuthorizedSpenderRegistry>,
+
+    /// CHECK: rent refund target, validated by the CALLER — rewards-v2 pins it
+    /// to `FOUNDATION_PUBKEY` before invoking this CPI
+    /// (`process_client_dispute_ix`).
+    ///
+    /// The burn path's argument does NOT apply here. There, `rent_recipient` is
+    /// safe unvalidated because the relay is the signer, so it can only refund
+    /// itself. On this path the signer is the disputing CLIENT — the relay is
+    /// not in the account list at all — so an unvalidated recipient would let a
+    /// client name their own wallet and take the relay's rent. The pin lives in
+    /// rewards-v2 because it is the program that knows a dispute is in flight
+    /// and that neither party should profit from one.
+    #[account(mut)]
+    pub rent_recipient: UncheckedAccount<'info>,
 }
 
 /// Context for burning held tokens after the 7-day dispute window.
