@@ -1045,8 +1045,13 @@ pub struct BurnHeldFunds<'info> {
     pub user_escrow_token: Account<'info, TokenAccount>,
 
     /// FundHold PDA to burn. Must be in Active state.
+    ///
+    /// `close` returns the 105-byte account's rent to the relay that paid it at
+    /// reserve time. Without it the PDA stays rent-exempt forever, and since
+    /// its seed includes claim_hash a fresh one is created every epoch.
     #[account(
         mut,
+        close = rent_recipient,
         seeds = [b"fund_hold", user.key().as_ref(), claim_hash.as_ref()],
         bump,
         constraint = fund_hold.status == HoldStatus::Active @ EscrowError::HoldNotActive,
@@ -1062,6 +1067,14 @@ pub struct BurnHeldFunds<'info> {
     pub token_mint: Account<'info, Mint>,
 
     pub token_program: Program<'info, Token>,
+
+    /// CHECK: rent refund target. This is the relay wallet that funded the
+    /// FundHold in `hold_client_funds`, forwarded by rewards-v2. Unvalidated
+    /// here because user-escrow has no way to know which relay served the
+    /// epoch; rewards-v2 passes its own signer, so a relay can only ever
+    /// refund itself.
+    #[account(mut)]
+    pub rent_recipient: UncheckedAccount<'info>,
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────

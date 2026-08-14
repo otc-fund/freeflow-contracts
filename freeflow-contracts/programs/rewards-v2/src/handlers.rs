@@ -1104,6 +1104,10 @@ pub fn process_release_claim_ix(
         // For CPI the escrow program validates via PDA seeds.
         cpi_burn_held_funds(
             escrow_program,
+            // The relay funded this FundHold in hold_client_funds; closing it
+            // refunds the rent to the same account. It is already account 0 of
+            // this instruction, so nothing new enters the transaction.
+            relay_wallet,
             service_authority,
             user_wallet_ai,
             user_escrow_ai,
@@ -4637,20 +4641,55 @@ mod release_claim_integration_tests {
     /// FundHold (user-escrow) byte layout: 8 disc | 32 user | 8 amount |
     /// 32 claim_hash | 16 session_id | 8 created_at | 1 status = 105.
     const FH_LEN: usize = 105;
-    const FH_CLAIM_HASH: usize = 48;
-    const FH_STATUS: usize = 104;
-    const HOLD_BURNED: u8 = 2;
+    /// The mock parks the claim_hash that crossed the CPI boundary on the
+    /// user_escrow stub. It cannot leave it on the FundHold any more — that
+    /// account is closed by the time the test looks.
+    const UE_RECEIPT_LEN: usize = 32;
 
-    /// Emulates user_escrow::burn_held_funds: stamps the FundHold Burned and
-    /// records the claim_hash that crossed the CPI boundary.
+    /// Emulates user_escrow::burn_held_funds AFTER the close change: refunds the
+    /// FundHold's rent to the recipient rewards-v2 forwarded, wipes its data, and
+    /// records the claim_hash that crossed the CPI boundary on the user_escrow
+    /// stub. Zero lamports ⇒ the runtime reaps the account, so
+    /// `get_account(fund_hold)` is None afterwards.
+    ///
+    /// HONEST SCOPE: this is a STAND-IN and does NOT prove Anchor's
+    /// `close = rent_recipient` works. The real user-escrow code never executes
+    /// in this suite — there is no .so to load (the pinned solana_rbpf 0.8.3
+    /// understands only SBPF v1/v2, and the built program is v3), so this
+    /// registers a hand-written processor at the escrow id. What it DOES pin is
+    /// the rewards-v2 half of the contract: the CPI carries exactly 9 accounts,
+    /// and account 8 is a writable rent recipient the lamports can land on.
+    /// A separate Anchor TypeScript test proves the `close` itself, on a real
+    /// validator where the real program runs.
+    ///
     /// CPI data = [disc:8][claim_hash:32]; accounts =
     /// [mint_authority, user, user_escrow, user_escrow_token, fund_hold,
-    ///  spender_registry, token_mint, token_program] → fund_hold is index 4.
+    ///  spender_registry, token_mint, token_program, rent_recipient]
+    /// → fund_hold is index 4, rent_recipient index 8.
     fn mock_escrow_burn(_pid: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
         assert_eq!(data.len(), 40, "burn_held_funds CPI data must be disc+claim_hash");
-        let mut fh = accounts[4].data.borrow_mut();
-        fh[FH_CLAIM_HASH..FH_CLAIM_HASH + 32].copy_from_slice(&data[8..40]);
-        fh[FH_STATUS] = HOLD_BURNED;
+        assert_eq!(
+            accounts.len(), 9,
+            "burn_held_funds must receive 9 accounts — the 9th is the rent recipient \
+             the closed FundHold refunds to. Without it the 105-byte PDA is stranded."
+        );
+
+        {
+            let mut ue = accounts[2].data.borrow_mut();
+            assert!(ue.len() >= UE_RECEIPT_LEN,
+                "the user_escrow stub must be wide enough to hold the burn receipt");
+            ue[..UE_RECEIPT_LEN].copy_from_slice(&data[8..40]);
+        }
+
+        // Stand in for `close = rent_recipient`. No realloc(0): program-test runs
+        // native processors over copied buffers, where AccountInfo::realloc's
+        // length write past the data pointer is not valid.
+        let hold = &accounts[4];
+        let rent_recipient = &accounts[8];
+        let refund = hold.lamports();
+        **rent_recipient.try_borrow_mut_lamports()? += refund;
+        **hold.try_borrow_mut_lamports()? -= refund;
+        hold.data.borrow_mut().fill(0);
         Ok(())
     }
 
@@ -4729,8 +4768,8 @@ mod release_claim_integration_tests {
         pt.add_account(treas_tok, spl_token_account(&flow_mint, &FOUNDATION_PUBKEY));
         pt.add_account(fh1, fund_hold_account());
         pt.add_account(fh2, fund_hold_account());
-        pt.add_account(ue1, stub(mock_escrow_id(), 8));
-        pt.add_account(ue2, stub(mock_escrow_id(), 8));
+        pt.add_account(ue1, stub(mock_escrow_id(), UE_RECEIPT_LEN));
+        pt.add_account(ue2, stub(mock_escrow_id(), UE_RECEIPT_LEN));
         pt.add_account(uet1, stub(mock_escrow_id(), 8));
         pt.add_account(uet2, stub(mock_escrow_id(), 8));
 
@@ -4798,15 +4837,18 @@ mod release_claim_integration_tests {
         assert_eq!(c.released_amount, derived * 2);
         assert_eq!(c.released_bytes, bytes * 2);
 
-        // Both FundHolds actually burned, each with its own claim_hash.
-        for (fh, rel) in [(fh1, &r1), (fh2, &r2)] {
-            let a = banks.get_account(fh).await.unwrap().unwrap();
-            assert_eq!(a.data[FH_STATUS], HOLD_BURNED,
-                "every reserved client's FundHold must be burned");
+        // Both FundHolds actually burned, each with its own claim_hash. The hold
+        // is now CLOSED rather than stamped Burned, so "the client was charged"
+        // is asserted as the account's absence plus the receipt the mock parks
+        // on user_escrow — the FundHold's own bytes are gone by then.
+        for (fh, ue, rel) in [(fh1, ue1, &r1), (fh2, ue2, &r2)] {
+            assert!(banks.get_account(fh).await.unwrap().is_none(),
+                "every reserved client's FundHold must be closed, not merely marked Burned");
+            let a = banks.get_account(ue).await.unwrap().unwrap();
             let want = compute_claim_hash(
                 &rel.client_pubkey, &rel.session_id, rel.batch_nonce,
                 &compute_merkle_leaf_hash_from_release(rel));
-            assert_eq!(&a.data[FH_CLAIM_HASH..FH_CLAIM_HASH + 32], &want[..],
+            assert_eq!(&a.data[..UE_RECEIPT_LEN], &want[..],
                 "burn CPI must carry this client's claim_hash");
         }
 
@@ -4869,8 +4911,8 @@ mod release_claim_integration_tests {
         pt.add_account(treas_tok, spl_token_account(&flow_mint, &FOUNDATION_PUBKEY));
         pt.add_account(fh1, fund_hold_account());
         pt.add_account(fh2, fund_hold_account());
-        pt.add_account(ue1, stub(mock_escrow_id(), 8));
-        pt.add_account(ue2, stub(mock_escrow_id(), 8));
+        pt.add_account(ue1, stub(mock_escrow_id(), UE_RECEIPT_LEN));
+        pt.add_account(ue2, stub(mock_escrow_id(), UE_RECEIPT_LEN));
         pt.add_account(uet1, stub(mock_escrow_id(), 8));
         pt.add_account(uet2, stub(mock_escrow_id(), 8));
         // cb_pda deliberately NOT added: lamports == 0 ⇒ create_pda_account path.
@@ -4935,9 +4977,129 @@ mod release_claim_integration_tests {
         assert_eq!(cb.pending_relay_flow, derived * 2 * RELAY_SPLIT_PCT / 100,
             "BOTH clients' deferred 70% accumulated");
         for fh in [fh1, fh2] {
-            assert_eq!(banks.get_account(fh).await.unwrap().unwrap().data[FH_STATUS], HOLD_BURNED);
+            assert!(banks.get_account(fh).await.unwrap().is_none(),
+                "the deferred branch must close the FundHold too — the rent is owed \
+                 back whether or not the $FLOW mint was deferred");
         }
         assert_eq!(token_balance(&mut banks, relay_tok).await, 0, "nothing minted below the gate");
+    }
+
+    /// The FundHold's rent must come back. Before this change burn_held_funds
+    /// set status = Burned and returned, leaving a 105-byte rent-exempt PDA
+    /// (1,621,680 lamports) stranded forever — and because fund_hold is seeded
+    /// by claim_hash, every epoch minted a fresh one per client.
+    ///
+    /// What this proves and what it does not: `mock_escrow_burn` stands in for
+    /// user_escrow::burn_held_funds, so this asserts rewards-v2 forwards a
+    /// writable rent recipient as the 9th CPI account and that the lamports land
+    /// on the relay. It does NOT prove Anchor's `close = rent_recipient` works —
+    /// only a real validator can, and tests/user-escrow.ts owns that.
+    #[tokio::test]
+    async fn burning_a_hold_returns_its_rent_to_the_relay() {
+        let relay = Keypair::new();
+        let epoch = 7_401u64;
+        let c1 = [41u8; 32];
+        let bytes = 500_000_000u64; // < BYTES_PER_FLOW ⇒ repFlow CPI skipped
+        let derived = derive_reward_amount(bytes, DEFAULT_ROUTING_PER_MB);
+
+        let r1 = ClientReleaseOnChain {
+            client_pubkey: c1, session_id: [5u8; 16], batch_nonce: 1,
+            total_bytes: bytes, merkle_proof: vec![], client_signature: [1u8; 64],
+            device_uuid: [0u8; 16], record_count: 1,
+        };
+        let root = compute_merkle_leaf_hash_from_release(&r1); // single-leaf tree
+
+        let (c_pda, c_bump) = Pubkey::find_program_address(
+            &[b"claim_commitment", relay.pubkey().as_ref(), &epoch.to_le_bytes()], &id());
+        let (cs1, cs1_b) = Pubkey::find_program_address(
+            &[b"claim_state", &c1, relay.pubkey().as_ref()], &id());
+        let (service_auth, _) = Pubkey::find_program_address(&[b"mint_authority"], &id());
+        let (cb_pda, _) = Pubkey::find_program_address(
+            &[b"claimable_balance", relay.pubkey().as_ref(), &epoch.to_le_bytes()], &id());
+        let s = Keypair::new().pubkey();
+        let flow_mint = Keypair::new().pubkey();
+        let relay_tok = Keypair::new().pubkey();
+        // Above the repFlow gate ⇒ the PAID branch, which mints. That makes
+        // require_foundation_treasury bite, so reward_treasury must be the
+        // foundation's canonical ATA (H-1) and relay_repflow_user the real
+        // repflow-token PDA — a random pubkey fails before the burn CPI runs.
+        let treas_tok = Pubkey::find_program_address(
+            &[FOUNDATION_PUBKEY.as_ref(), spl_token::id().as_ref(), flow_mint.as_ref()],
+            &Pubkey::new_from_array([
+                140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131,
+                11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
+            ]),
+        ).0;
+        let repflow = Pubkey::find_program_address(
+            &[b"repflow_user", relay.pubkey().as_ref()], &REPFLOW_PROGRAM_ID).0;
+        let fh1 = Keypair::new().pubkey();
+        let ue1 = Keypair::new().pubkey();
+        let uet1 = Keypair::new().pubkey();
+
+        let mut pt = program_test_burn();
+        pt.add_account(c_pda, commitment_account_n(
+            &relay.pubkey(), epoch, root, derived, bytes, c_bump, 1));
+        pt.add_account(cs1, claim_state_account(c1, &relay.pubkey(), cs1_b));
+        pt.add_account(repflow, repflow_user_account(MIN_RELAY_REPFLOW));
+        pt.add_account(flow_mint, flow_mint_account(&service_auth));
+        pt.add_account(relay_tok, spl_token_account(&flow_mint, &relay.pubkey()));
+        pt.add_account(treas_tok, spl_token_account(&flow_mint, &FOUNDATION_PUBKEY));
+        pt.add_account(fh1, fund_hold_account());
+        pt.add_account(ue1, stub(mock_escrow_id(), UE_RECEIPT_LEN));
+        pt.add_account(uet1, stub(mock_escrow_id(), 8));
+
+        let (mut banks, payer, bh) = pt.start().await;
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(
+                &payer.pubkey(), &relay.pubkey(), 2_000_000_000)],
+            Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let relay_before = banks.get_balance(relay.pubkey()).await.unwrap();
+        let hold_rent = banks.get_balance(fh1).await.unwrap();
+        assert!(hold_rent > 0, "the FundHold fixture must be rent-bearing");
+
+        let ix = Instruction {
+            program_id: id(),
+            accounts: vec![
+                AccountMeta::new(relay.pubkey(), true),
+                AccountMeta::new(c_pda, false),
+                AccountMeta::new_readonly(mock_escrow_id(), false),
+                AccountMeta::new_readonly(service_auth, false),
+                AccountMeta::new_readonly(s, false),
+                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new(flow_mint, false),
+                AccountMeta::new_readonly(s, false),
+                AccountMeta::new_readonly(s, false),
+                AccountMeta::new_readonly(repflow, false),
+                AccountMeta::new_readonly(s, false),
+                AccountMeta::new(relay_tok, false),
+                AccountMeta::new(treas_tok, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                AccountMeta::new_readonly(Pubkey::new_from_array(c1), false),
+                AccountMeta::new(cs1, false),
+                AccountMeta::new(ue1, false),
+                AccountMeta::new(fh1, false),
+                AccountMeta::new(uet1, false),
+                AccountMeta::new(cb_pda, false),
+            ],
+            data: borsh::to_vec(&RewardsInstruction::ReleaseClaim {
+                claim_epoch: epoch, releases: vec![r1] }).unwrap(),
+        };
+        banks.process_transaction(Transaction::new_signed_with_payer(
+            &[ix], Some(&relay.pubkey()), &[&relay], bh)).await
+            .expect("release must land");
+
+        assert_eq!(
+            banks.get_balance(fh1).await.unwrap(), 0,
+            "the FundHold must be closed, not merely marked Burned"
+        );
+        let relay_after = banks.get_balance(relay.pubkey()).await.unwrap();
+        assert!(
+            relay_after > relay_before,
+            "the relay paid this rent at reserve time and must get it back: \
+             before={relay_before} after={relay_after}"
+        );
     }
 }
 

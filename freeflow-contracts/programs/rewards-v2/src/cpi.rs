@@ -157,12 +157,18 @@ pub fn cpi_release_funds<'a>(
 /// CPI to user_escrow::burn_held_funds.
 ///
 /// Decrements both UserEscrow.held and UserEscrow.balance, SPL-burns `amount`
-/// from the escrow token account, marks FundHold as Burned.
+/// from the escrow token account, and CLOSES the FundHold PDA.
 /// Called at ReleaseClaim after the 7-day dispute window.
+///
+/// `rent_recipient_ai` receives the closed FundHold's rent. rewards-v2 passes
+/// its own signer (the relay wallet, account 0 of ReleaseClaim), which is the
+/// account that funded the hold at reserve time — so a relay can only ever
+/// refund itself, and the outer transaction needs no new account.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 pub fn cpi_burn_held_funds<'a>(
     user_escrow_program_ai: &AccountInfo<'a>,
+    rent_recipient_ai:      &AccountInfo<'a>,
     mint_authority_ai:      &AccountInfo<'a>,
     user_ai:                &AccountInfo<'a>,
     user_escrow_state_ai:   &AccountInfo<'a>,
@@ -190,6 +196,8 @@ pub fn cpi_burn_held_funds<'a>(
             AccountMeta { pubkey: *spender_registry_ai.key,  is_signer: false, is_writable: false },
             AccountMeta { pubkey: *token_mint_ai.key,        is_signer: false, is_writable: true  },
             AccountMeta { pubkey: *token_program_ai.key,     is_signer: false, is_writable: false },
+            // 8: rent_recipient — last, matching BurnHeldFunds' field order.
+            AccountMeta { pubkey: *rent_recipient_ai.key,    is_signer: false, is_writable: true  },
         ],
         data,
     };
@@ -205,6 +213,7 @@ pub fn cpi_burn_held_funds<'a>(
             spender_registry_ai.clone(),
             token_mint_ai.clone(),
             token_program_ai.clone(),
+            rent_recipient_ai.clone(),
         ],
         &[&[b"mint_authority", &[mint_authority_bump]]],
     )
