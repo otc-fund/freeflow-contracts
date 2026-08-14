@@ -4659,8 +4659,11 @@ mod release_claim_integration_tests {
     /// registers a hand-written processor at the escrow id. What it DOES pin is
     /// the rewards-v2 half of the contract: the CPI carries exactly 9 accounts,
     /// and account 8 is a writable rent recipient the lamports can land on.
-    /// A separate Anchor TypeScript test proves the `close` itself, on a real
-    /// validator where the real program runs.
+    /// The `close` itself is NOT covered by any currently-passing test —
+    /// `tests/user-escrow.ts` still fetches the FundHold after burning and
+    /// asserts `status == Burned`, which is the pre-close behavior. That file
+    /// needs updating (to expect the account gone) before the close is proven
+    /// on a real validator.
     ///
     /// CPI data = [disc:8][claim_hash:32]; accounts =
     /// [mint_authority, user, user_escrow, user_escrow_token, fund_hold,
@@ -4993,7 +4996,10 @@ mod release_claim_integration_tests {
     /// user_escrow::burn_held_funds, so this asserts rewards-v2 forwards a
     /// writable rent recipient as the 9th CPI account and that the lamports land
     /// on the relay. It does NOT prove Anchor's `close = rent_recipient` works —
-    /// only a real validator can, and tests/user-escrow.ts owns that.
+    /// only a real validator can, and no currently-passing test covers that yet.
+    /// `tests/user-escrow.ts` still asserts the pre-close behavior (status ==
+    /// Burned, account still present) and needs updating to expect the FundHold
+    /// gone before it can own this claim.
     #[tokio::test]
     async fn burning_a_hold_returns_its_rent_to_the_relay() {
         let relay = Keypair::new();
