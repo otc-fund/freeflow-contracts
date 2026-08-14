@@ -41,6 +41,15 @@ const PaymentTypeUsdc:       PaymentType = { usdc:       {} };
 const PaymentTypeUsdt:       PaymentType = { usdt:       {} };
 const PaymentTypeCreditCard: PaymentType = { creditCard: {} };
 
+// Placeholder for `pool_vault` on the no-referrer path. When `referrer` is None
+// the handler computes referral_reward = 0 and never touches the account, but
+// pool_vault is #[account(mut)] and an executable account can never satisfy a
+// `mut` constraint — so the program's "pass SystemProgram::id()" doc comment
+// holds for referral_config only, and yields ConstraintMut (2000) for pool_vault.
+// Any writable non-executable address works; an unfunded throwaway makes the
+// "never read, never written" intent obvious.
+const UNUSED_POOL_VAULT = Keypair.generate().publicKey;
+
 async function airdrop(provider: anchor.AnchorProvider, key: PublicKey, sol = 10) {
   const sig = await provider.connection.requestAirdrop(key, sol * LAMPORTS_PER_SOL);
   await provider.connection.confirmTransaction(sig, "confirmed");
@@ -292,7 +301,7 @@ describe("user-escrow", () => {
       const paymentCents = new BN(300); // $3.00 = 30 $FLOW
 
       await program.methods
-        .purchaseAndEscrow(paymentCents, PaymentTypeSol)
+        .purchaseAndEscrow(paymentCents, PaymentTypeSol, null)
         .accounts({
           user:               user.publicKey,
           userEscrow:         userEscrowPda,
@@ -302,6 +311,9 @@ describe("user-escrow", () => {
           tokenMint,
           tokenProgram:       TOKEN_PROGRAM_ID,
           systemProgram:      SystemProgram.programId,
+          // referrer = None → both referral accounts are SystemProgram.
+          poolVault:          UNUSED_POOL_VAULT,
+          referralConfig:     SystemProgram.programId,
         })
         .signers([user])
         .rpc();
@@ -316,7 +328,7 @@ describe("user-escrow", () => {
       const before = await program.account.userEscrow.fetch(userEscrowPda);
 
       await program.methods
-        .purchaseAndEscrow(new BN(100), PaymentTypeSol) // $1.00 = 10 $FLOW
+        .purchaseAndEscrow(new BN(100), PaymentTypeSol, null) // $1.00 = 10 $FLOW
         .accounts({
           user:               user.publicKey,
           userEscrow:         userEscrowPda,
@@ -326,6 +338,9 @@ describe("user-escrow", () => {
           tokenMint,
           tokenProgram:       TOKEN_PROGRAM_ID,
           systemProgram:      SystemProgram.programId,
+          // referrer = None → both referral accounts are SystemProgram.
+          poolVault:          UNUSED_POOL_VAULT,
+          referralConfig:     SystemProgram.programId,
         })
         .signers([user])
         .rpc();
@@ -352,7 +367,7 @@ describe("user-escrow", () => {
       const before = await program.account.userEscrow.fetch(userEscrowPda);
 
       await program.methods
-        .purchaseAndEscrow(paymentCents, PaymentTypeSol)
+        .purchaseAndEscrow(paymentCents, PaymentTypeSol, null)
         .accounts({
           user:               user.publicKey,
           userEscrow:         userEscrowPda,
@@ -362,6 +377,9 @@ describe("user-escrow", () => {
           tokenMint,
           tokenProgram:       TOKEN_PROGRAM_ID,
           systemProgram:      SystemProgram.programId,
+          // referrer = None → both referral accounts are SystemProgram.
+          poolVault:          UNUSED_POOL_VAULT,
+          referralConfig:     SystemProgram.programId,
         })
         .signers([user])
         .rpc();
@@ -380,7 +398,7 @@ describe("user-escrow", () => {
       const escrowBefore = await getAccount(provider.connection, userEscrowToken);
 
       await program.methods
-        .purchaseAndEscrow(new BN(100), PaymentTypeSol)
+        .purchaseAndEscrow(new BN(100), PaymentTypeSol, null)
         .accounts({
           user:               user.publicKey,
           userEscrow:         userEscrowPda,
@@ -390,6 +408,9 @@ describe("user-escrow", () => {
           tokenMint,
           tokenProgram:       TOKEN_PROGRAM_ID,
           systemProgram:      SystemProgram.programId,
+          // referrer = None → both referral accounts are SystemProgram.
+          poolVault:          UNUSED_POOL_VAULT,
+          referralConfig:     SystemProgram.programId,
         })
         .signers([user])
         .rpc();
@@ -414,7 +435,7 @@ describe("user-escrow", () => {
       const before = await program.account.userEscrow.fetch(userEscrowPda);
 
       await program.methods
-        .purchaseAndEscrow(new BN(500), PaymentTypeUsdc) // $5.00 = 50 $FLOW
+        .purchaseAndEscrow(new BN(500), PaymentTypeUsdc, null) // $5.00 = 50 $FLOW
         .accounts({
           user:               user.publicKey,
           userEscrow:         userEscrowPda,
@@ -424,6 +445,9 @@ describe("user-escrow", () => {
           tokenMint,
           tokenProgram:       TOKEN_PROGRAM_ID,
           systemProgram:      SystemProgram.programId,
+          // referrer = None → both referral accounts are SystemProgram.
+          poolVault:          UNUSED_POOL_VAULT,
+          referralConfig:     SystemProgram.programId,
         })
         .signers([user])
         .rpc();
@@ -441,7 +465,7 @@ describe("user-escrow", () => {
       const before = await program.account.userEscrow.fetch(userEscrowPda);
 
       await program.methods
-        .purchaseAndEscrow(new BN(200), PaymentTypeUsdt) // $2.00 = 20 $FLOW
+        .purchaseAndEscrow(new BN(200), PaymentTypeUsdt, null) // $2.00 = 20 $FLOW
         .accounts({
           user:               user.publicKey,
           userEscrow:         userEscrowPda,
@@ -451,6 +475,9 @@ describe("user-escrow", () => {
           tokenMint,
           tokenProgram:       TOKEN_PROGRAM_ID,
           systemProgram:      SystemProgram.programId,
+          // referrer = None → both referral accounts are SystemProgram.
+          poolVault:          UNUSED_POOL_VAULT,
+          referralConfig:     SystemProgram.programId,
         })
         .signers([user])
         .rpc();
@@ -463,7 +490,7 @@ describe("user-escrow", () => {
       const before = await program.account.userEscrow.fetch(userEscrowPda);
 
       await program.methods
-        .purchaseAndEscrow(new BN(1000), PaymentTypeCreditCard) // $10.00 = 100 $FLOW
+        .purchaseAndEscrow(new BN(1000), PaymentTypeCreditCard, null) // $10.00 = 100 $FLOW
         .accounts({
           user:               user.publicKey,
           userEscrow:         userEscrowPda,
@@ -473,6 +500,9 @@ describe("user-escrow", () => {
           tokenMint,
           tokenProgram:       TOKEN_PROGRAM_ID,
           systemProgram:      SystemProgram.programId,
+          // referrer = None → both referral accounts are SystemProgram.
+          poolVault:          UNUSED_POOL_VAULT,
+          referralConfig:     SystemProgram.programId,
         })
         .signers([user])
         .rpc();
@@ -489,7 +519,7 @@ describe("user-escrow", () => {
     it("emits PurchaseAndEscrowed event", async () => {
       // Parse events from transaction logs (more reliable than websocket in local tests).
       const sig = await program.methods
-        .purchaseAndEscrow(new BN(100), PaymentTypeSol)
+        .purchaseAndEscrow(new BN(100), PaymentTypeSol, null)
         .accounts({
           user:               user.publicKey,
           userEscrow:         userEscrowPda,
@@ -499,6 +529,9 @@ describe("user-escrow", () => {
           tokenMint,
           tokenProgram:       TOKEN_PROGRAM_ID,
           systemProgram:      SystemProgram.programId,
+          // referrer = None → both referral accounts are SystemProgram.
+          poolVault:          UNUSED_POOL_VAULT,
+          referralConfig:     SystemProgram.programId,
         })
         .signers([user])
         .rpc();
@@ -525,7 +558,7 @@ describe("user-escrow", () => {
       // 3 purchases in quick succession
       for (let i = 0; i < 3; i++) {
         await program.methods
-          .purchaseAndEscrow(new BN(100), PaymentTypeSol)
+          .purchaseAndEscrow(new BN(100), PaymentTypeSol, null)
           .accounts({
             user:               user.publicKey,
             userEscrow:         userEscrowPda,
@@ -535,6 +568,9 @@ describe("user-escrow", () => {
             tokenMint,
             tokenProgram:       TOKEN_PROGRAM_ID,
             systemProgram:      SystemProgram.programId,
+            // referrer = None → both referral accounts are SystemProgram.
+            poolVault:          UNUSED_POOL_VAULT,
+            referralConfig:     SystemProgram.programId,
           })
           .signers([user])
           .rpc();
@@ -552,7 +588,7 @@ describe("user-escrow", () => {
       const before = await program.account.userEscrow.fetch(userEscrowPda);
 
       await program.methods
-        .purchaseAndEscrow(largeCents, PaymentTypeSol)
+        .purchaseAndEscrow(largeCents, PaymentTypeSol, null)
         .accounts({
           user:               user.publicKey,
           userEscrow:         userEscrowPda,
@@ -562,6 +598,9 @@ describe("user-escrow", () => {
           tokenMint,
           tokenProgram:       TOKEN_PROGRAM_ID,
           systemProgram:      SystemProgram.programId,
+          // referrer = None → both referral accounts are SystemProgram.
+          poolVault:          UNUSED_POOL_VAULT,
+          referralConfig:     SystemProgram.programId,
         })
         .signers([user])
         .rpc();
@@ -573,7 +612,7 @@ describe("user-escrow", () => {
     it("handles zero payment amount gracefully", async () => {
       try {
         await program.methods
-          .purchaseAndEscrow(new BN(0), PaymentTypeSol)
+          .purchaseAndEscrow(new BN(0), PaymentTypeSol, null)
           .accounts({
             user:               user.publicKey,
             userEscrow:         userEscrowPda,
@@ -583,6 +622,9 @@ describe("user-escrow", () => {
             tokenMint,
             tokenProgram:       TOKEN_PROGRAM_ID,
             systemProgram:      SystemProgram.programId,
+            // referrer = None → both referral accounts are SystemProgram.
+            poolVault:          UNUSED_POOL_VAULT,
+            referralConfig:     SystemProgram.programId,
           })
           .signers([user])
           .rpc();
@@ -980,7 +1022,7 @@ describe("user-escrow", () => {
     before(async () => {
       // $200.00 = 2000 FLOW (200 * 9-decimal FLOW per dollar)
       await program.methods
-        .purchaseAndEscrow(new BN(2000_00), PaymentTypeSol)  // 200000 cents = $2000 = 20000 FLOW
+        .purchaseAndEscrow(new BN(2000_00), PaymentTypeSol, null)  // 200000 cents = $2000 = 20000 FLOW
         .accounts({
           user:              user.publicKey,
           userEscrow:        userEscrowPda,
@@ -990,6 +1032,9 @@ describe("user-escrow", () => {
           tokenMint,
           tokenProgram:      TOKEN_PROGRAM_ID,
           systemProgram:     SystemProgram.programId,
+          // referrer = None → both referral accounts are SystemProgram.
+          poolVault:          UNUSED_POOL_VAULT,
+          referralConfig:     SystemProgram.programId,
         })
         .signers([user])
         .rpc();
@@ -1181,7 +1226,7 @@ describe("user-escrow", () => {
 
   describe("BurnHeldFunds", () => {
 
-    it("burns held tokens, decrements held+balance, marks FundHold Burned", async () => {
+    it("burns held tokens, decrements held+balance, closes FundHold and refunds its rent", async () => {
       const claimHash  = Buffer.alloc(32, 0x33);
       const sessionId  = Buffer.alloc(16, 0x44);
       const holdAmount = new BN(200_000_000_000); // 200 FLOW
@@ -1191,7 +1236,13 @@ describe("user-escrow", () => {
         program.programId
       );
 
-      // Create the hold.
+      // The rent recipient is rewardsContractPda: it is the `payer` on the hold
+      // below, mirroring production, where the relay wallet funds the FundHold in
+      // hold_client_funds and rewards-v2 forwards that same wallet as account 8 of
+      // the burn CPI. A relay can therefore only ever refund itself.
+      const rentRecipient = rewardsContractPda.publicKey;
+
+      // Create the hold. rewardsContractPda pays the FundHold's rent.
       await program.methods
         .holdClientFunds(holdAmount, [...claimHash], [...sessionId])
         .accounts({
@@ -1209,6 +1260,26 @@ describe("user-escrow", () => {
       const escrowBefore = await program.account.userEscrow.fetch(userEscrowPda);
       const splBefore    = (await provider.connection.getTokenAccountBalance(userEscrowToken)).value.amount;
 
+      // Snapshot the rent that is about to be reclaimed, straight off the live
+      // account rather than a hardcoded constant, and cross-check it against the
+      // runtime's own rent-exemption schedule for that data length.
+      const holdInfoBefore = await provider.connection.getAccountInfo(fundHoldPda);
+      assert.isNotNull(holdInfoBefore, "FundHold must exist before the burn");
+      const holdRent = holdInfoBefore!.lamports;
+      const rentExemptMin = await provider.connection.getMinimumBalanceForRentExemption(
+        holdInfoBefore!.data.length
+      );
+      assert.equal(
+        holdRent, rentExemptMin,
+        `FundHold should hold exactly the rent-exempt minimum for ${holdInfoBefore!.data.length} bytes`
+      );
+
+      // Fee-payer netting: .rpc() makes the provider wallet the fee payer, and
+      // rewardsContractPda is only an extra signer, so it is never charged a fee.
+      // The delta below is therefore the rent refund alone and can be asserted as
+      // exact equality — no `>` slack, no fee subtraction.
+      const rentRecipientBefore = await provider.connection.getBalance(rentRecipient);
+
       // Burn.
       await program.methods
         .burnHeldFunds([...claimHash])
@@ -1221,6 +1292,7 @@ describe("user-escrow", () => {
           spenderRegistry:  spenderRegistryPda,
           tokenMint:        tokenMint,
           tokenProgram:     TOKEN_PROGRAM_ID,
+          rentRecipient:    rentRecipient,
         })
         .signers([rewardsContractPda])
         .rpc();
@@ -1242,8 +1314,21 @@ describe("user-escrow", () => {
         "SPL token account must decrease by holdAmount"
       );
 
-      const hold = await program.account.fundHold.fetch(fundHoldPda);
-      assert.deepEqual(hold.status, { burned: {} }, "FundHold status must be Burned");
+      // (1) The FundHold is gone. getAccountInfo returning null is checked rather
+      // than a throwing .fetch(), which would also "pass" on a mistyped PDA.
+      const holdInfoAfter = await provider.connection.getAccountInfo(fundHoldPda);
+      assert.isNull(
+        holdInfoAfter,
+        "FundHold account must be closed by `close = rent_recipient`, not merely marked Burned"
+      );
+
+      // (2) Its lamports landed on the rent recipient.
+      const rentRecipientAfter = await provider.connection.getBalance(rentRecipient);
+      assert.equal(
+        rentRecipientAfter - rentRecipientBefore,
+        holdRent,
+        `rent recipient must receive exactly the FundHold's ${holdRent} lamports`
+      );
     });
 
     it("rejects burn of a non-Active hold (already Released)", async () => {
@@ -1266,6 +1351,7 @@ describe("user-escrow", () => {
             spenderRegistry:  spenderRegistryPda,
             tokenMint:        tokenMint,
             tokenProgram:     TOKEN_PROGRAM_ID,
+            rentRecipient:    rewardsContractPda.publicKey,
           })
           .signers([rewardsContractPda])
           .rpc();
