@@ -522,14 +522,15 @@ mod integration {
     use solana_program_test::*;
     use solana_sdk::{
         account::Account,
-        instruction::{AccountMeta, Instruction},
+        instruction::{AccountMeta, Instruction, InstructionError},
         signature::{Keypair, Signer},
         system_program,
-        transaction::Transaction,
+        transaction::{Transaction, TransactionError},
     };
 
     use crate::{
         constants::*,
+        errors::RewardsError,
         id,
         process_instruction,
         types::{
@@ -538,6 +539,38 @@ mod integration {
         },
         RewardsInstruction,
     };
+
+    /// Assert a transaction failed with one SPECIFIC `InstructionError`.
+    ///
+    /// Every gate test in this module used to assert only `result.is_err()`, and
+    /// that is exactly how three of them came to pass on an error raised long
+    /// before the check they were named for: they handed a random keypair as the
+    /// commitment account, so `require_own_commitment` (`handlers.rs:1623`)
+    /// rejected them before the kill switch, the M-3 PDA check or the epoch
+    /// comparison was ever reached. `is_err()` cannot tell those apart. This can.
+    fn assert_ix_error(
+        result:   Result<(), BanksClientError>,
+        expected: InstructionError,
+        what:     &str,
+    ) {
+        match result {
+            Err(BanksClientError::TransactionError(TransactionError::InstructionError(0, ref got)))
+                if *got == expected => {}
+            Err(other) => panic!("{what}\n  expected InstructionError: {expected:?}\n  got: {other:?}"),
+            Ok(()) => panic!("{what}\n  expected InstructionError: {expected:?}\n  got: transaction SUCCEEDED"),
+        }
+    }
+
+    /// The `claim_commitment` PDA the handler recomputes in `require_own_commitment`
+    /// (`handlers.rs:848-858`). A test that passes anything else is rejected there,
+    /// before reaching whatever it meant to exercise.
+    fn commitment_pda(relay: &Pubkey, claim_epoch: u64) -> Pubkey {
+        Pubkey::find_program_address(
+            &[b"claim_commitment", relay.as_ref(), &claim_epoch.to_le_bytes()],
+            &id(),
+        ).0
+    }
+
 
     // ── Test fixture helpers ──────────────────────────────────────────────────
 
@@ -896,14 +929,18 @@ mod integration {
         let claim_epoch = 100u64;
 
         let mut pt              = program_test();
-        let commitment_pk       = Keypair::new().pubkey();
-        let foundation_cfg_pk   = Keypair::new().pubkey();
+        // Both of these MUST be the PDAs the handler recomputes. This test used to
+        // pass a random keypair for each, so it died at require_own_commitment
+        // (handlers.rs:1623) and never reached the kill switch it is named for —
+        // while still passing, because it only asserted is_err().
+        let commitment_pk       = commitment_pda(&relay.pubkey(), claim_epoch);
+        let (foundation_cfg_pk, fc_bump) = foundation_config_pda();
         let repflow_user_pk     = Keypair::new().pubkey();
         let trial_cap_pk        = Keypair::new().pubkey();
 
         pt.add_account(commitment_pk,    commitment_account(claim_epoch, &relay.pubkey()));
         pt.add_account(foundation_cfg_pk,
-            prepopulated_fc_account(&relay.pubkey(), false /* disabled */, 255));
+            prepopulated_fc_account(&relay.pubkey(), false /* disabled */, fc_bump));
         pt.add_account(repflow_user_pk,  repflow_user_account(MIN_RELAY_REPFLOW + 1000));
         pt.add_account(trial_cap_pk,     stub_account());
 
@@ -930,7 +967,11 @@ mod integration {
             &[&relay],
             recent_blockhash,
         )).await;
-        assert!(result.is_err(), "TrialDisabled must cause transaction failure");
+        assert_ix_error(
+            result,
+            InstructionError::Custom(RewardsError::TrialDisabled as u32),
+            "trial_enabled = false must be rejected with TrialDisabled",
+        );
     }
 
     /// `ReleaseTrialClaim` rejects a forged `foundation_config` (M-3).
@@ -957,7 +998,11 @@ mod integration {
         let claim_epoch = 101u64;
 
         let mut pt            = program_test();
-        let commitment_pk     = Keypair::new().pubkey();
+        // Genuine commitment PDA: without it the transaction dies at
+        // require_own_commitment (handlers.rs:1623) and never reaches the M-3
+        // check this test exists to cover.
+        let commitment_pk     = commitment_pda(&relay.pubkey(), claim_epoch);
+        // Deliberately NOT the canonical PDA — this is the forgery under test.
         let foundation_cfg_pk = Keypair::new().pubkey();
         let repflow_user_pk   = Pubkey::find_program_address(
             &[b"repflow_user", relay.pubkey().as_ref()], &REPFLOW_PROGRAM_ID).0; // F-1: genuine PDA
@@ -991,11 +1036,17 @@ mod integration {
             &[&relay],
             recent_blockhash,
         )).await;
-        assert!(
-            result.is_err(),
+        // Both require_own_commitment and the M-3 check return InvalidArgument, so
+        // this assertion alone cannot say which fired. What pins it to M-3 is the
+        // commitment PDA above being derived exactly as the handler derives it, so
+        // require_own_commitment cannot reject: M-3 is the only reachable source of
+        // InvalidArgument before the kill switch (which would be Custom, not this).
+        assert_ix_error(
+            result,
+            InstructionError::InvalidArgument,
             "a foundation_config that is not the canonical PDA must be rejected \
              (M-3) — without the check a relay forges a config whose wallet is \
-             one it controls and re-enables the trial path for itself"
+             one it controls and re-enables the trial path for itself",
         );
     }
 
@@ -1008,7 +1059,12 @@ mod integration {
         let wrong_epoch       = 201u64;
 
         let mut pt            = program_test();
-        let commitment_pk     = Keypair::new().pubkey();
+        // Derived from the epoch the INSTRUCTION carries (201), because that is what
+        // require_own_commitment hashes — so the PDA check passes and execution
+        // reaches the epoch comparison. The ACCOUNT DATA then stores 200, which is
+        // the mismatch under test. Deriving from stored_epoch instead would fail one
+        // check earlier and prove nothing.
+        let commitment_pk     = commitment_pda(&relay.pubkey(), wrong_epoch);
         let foundation_cfg_pk = Keypair::new().pubkey();
         let repflow_user_pk   = Keypair::new().pubkey();
         let trial_cap_pk      = Keypair::new().pubkey();
@@ -1043,7 +1099,14 @@ mod integration {
             &[&relay],
             recent_blockhash,
         )).await;
-        assert!(result.is_err(), "epoch mismatch must cause transaction failure");
+        // As in the M-3 test, InvalidArgument is shared with require_own_commitment;
+        // what pins it to the epoch comparison is that the commitment PDA is derived
+        // from wrong_epoch, so the PDA check cannot be the one rejecting.
+        assert_ix_error(
+            result,
+            InstructionError::InvalidArgument,
+            "a claim_epoch that disagrees with ClaimCommitment.claim_epoch must be rejected",
+        );
     }
 
     /// `ReleaseTrialClaim` fails when relay_wallet is not a signer.
