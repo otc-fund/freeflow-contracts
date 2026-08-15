@@ -1,18 +1,53 @@
-/prompts/
-/docs/
-/Wallet/
-BOOTSTRAP.md
-freeflow-contracts/deploy/
+target/
+.anchor/
+# Cargo.lock is intentionally committed for reproducible Solana program builds.
+# The Solana platform-tools cargo (1.79) cannot parse edition2024 Cargo.toml files,
+# so the lockfile is pinned to safe dependency versions (indexmap 2.7.0, etc.).
+# See workspace Cargo.toml [workspace.dependencies] for the version constraints.
+*.tsbuildinfo
+node_modules/
 
-# 460MB DHT snapshot — never belongs in git.
-dht_state_backup_*.json
+# Tests
+tests/*.ts
+programs/*/tests/
 
-# Throwaway WSL build/diagnostic scratch.
-freeflow-contracts/_*.sh
+# Private / local-only
+prompts/
+docs/
+Wallet/
+
+# ── Migrated from the parent-directory .gitignore ────────────────────────────
+# Until the repository was re-rooted here, the git root was the PARENT of this
+# directory and these rules were written as `freeflow-contracts/...`. They are
+# re-anchored to the new root below. Rules for the old root's siblings
+# (BOOTSTRAP.md) were dropped as out-of-tree; prompts/, docs/ and Wallet/ were
+# already covered unanchored above.
+
+/deploy/
+/_*.sh
 
 # Security audits document exploitable gaps in a LIVE deployed contract.
 # This repo is PUBLIC — these must never be committed.
-freeflow-contracts/SECURITY-AUDIT.md
-freeflow-contracts/SECURITY-FIXES-PLAN.md
-freeflow-contracts/**/SECURITY-AUDIT*.md
-freeflow-contracts/**/SECURITY-FIXES*.md
+/SECURITY-AUDIT.md
+/SECURITY-FIXES-PLAN.md
+**/SECURITY-AUDIT*.md
+**/SECURITY-FIXES*.md
+
+# BUILD.md — internal deploy runbook: toolchain pinning, upgrade-authority
+# handling and the on-disk location of the deploy wallet. Operational detail that
+# does not belong in a public repo.
+#
+# NOTE: unlike the two above, this file WAS tracked and has already been pushed,
+# so untracking it here stops future changes leaking but does NOT remove it from
+# published history. Scrubbing that needs a history rewrite and a force-push.
+/BUILD.md
+
+# 460MB DHT snapshot — never belongs in git. The known copy now sits outside this
+# root, but the rule is kept unanchored so one appearing in-tree is still caught.
+dht_state_backup_*.json
+
+# Key material must never reach a public repo. The deploy wallet is the UPGRADE
+# AUTHORITY of the live program, so this pairs with .gitleaks.toml: gitleaks
+# catches a key in a diff, these stop it being staged at all.
+**/*keypair*.json
+**/id.json

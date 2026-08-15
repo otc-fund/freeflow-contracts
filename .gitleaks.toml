@@ -14,8 +14,9 @@
 # own passes the default ruleset with "no leaks found". The rule below is what
 # closes that.
 #
-# `/Wallet/` is gitignored, so the normal path is already covered — this is the
-# backstop for a keypair pasted, exported, or copied somewhere else in the tree.
+# The deploy wallet lives OUTSIDE this repository root, and .gitignore also
+# blocks keypair-shaped paths — this is the backstop for a keypair pasted,
+# exported, or copied somewhere else in the tree.
 
 [extend]
 useDefault = true
