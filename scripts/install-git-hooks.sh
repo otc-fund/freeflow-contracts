@@ -26,7 +26,29 @@ GIT_DIR=$(git rev-parse --git-dir 2>/dev/null) || {
     echo "install-git-hooks: not inside a git repository."
     exit 1
 }
-HOOKS_DST="$GIT_DIR/hooks"
+
+# Honour core.hooksPath if the repo sets one — installing into .git/hooks while
+# git is reading somewhere else means the hooks silently never run.
+#
+# This is not hypothetical: this repo had core.hooksPath set to an ABSOLUTE path
+# pointing at the git dir's previous location. When the repository was re-rooted
+# the path went stale, git found no hooks there, and commits stopped being
+# scanned with no error of any kind. An absolute hooksPath also breaks on every
+# fresh clone. If one is configured here, say so loudly.
+CONFIGURED=$(git config --get core.hooksPath || true)
+if [ -n "$CONFIGURED" ]; then
+    HOOKS_DST="$CONFIGURED"
+    echo "install-git-hooks: core.hooksPath is set to '$CONFIGURED' — installing there."
+    case "$CONFIGURED" in
+        /*|[A-Za-z]:[/\\]*)
+            echo "  WARNING: that is an ABSOLUTE path. It will break if this repo is"
+            echo "           moved or cloned, and hooks then fail SILENTLY. Consider:"
+            echo "               git config --unset core.hooksPath"
+            ;;
+    esac
+else
+    HOOKS_DST="$GIT_DIR/hooks"
+fi
 mkdir -p "$HOOKS_DST"
 
 for hook in "$HOOKS_SRC"/*; do
