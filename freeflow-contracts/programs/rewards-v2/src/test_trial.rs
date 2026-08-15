@@ -1057,7 +1057,6 @@ mod integration {
         let foundation_cfg_pk = Keypair::new().pubkey();
         let repflow_user_pk   = Keypair::new().pubkey();
         let trial_cap_pk      = Keypair::new().pubkey();
-        let stub              = Keypair::new().pubkey();
 
         pt.add_account(commitment_pk,    commitment_account(claim_epoch, &relay.pubkey()));
         pt.add_account(foundation_cfg_pk,
@@ -1066,31 +1065,17 @@ mod integration {
         pt.add_account(trial_cap_pk,     stub_account());
 
         let (mut banks, payer, recent_blockhash) = pt.start().await;
-        // relay_wallet NOT marked as signer
-        let ix = Instruction {
-            program_id: id(),
-            accounts: vec![
-                AccountMeta::new(relay.pubkey(), false /* NOT signer */),
-                AccountMeta::new(commitment_pk, false),
-                AccountMeta::new_readonly(foundation_cfg_pk, false),
-                AccountMeta::new_readonly(stub, false),
-                AccountMeta::new(stub, false),
-                AccountMeta::new_readonly(stub, false),
-                AccountMeta::new_readonly(stub, false),
-                AccountMeta::new(stub, false),
-                AccountMeta::new(repflow_user_pk, false),
-                AccountMeta::new(stub, false),
-                AccountMeta::new(stub, false),
-                AccountMeta::new(stub, false),
-                AccountMeta::new(stub, false),
-                AccountMeta::new(trial_cap_pk, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
-            data: encode_ix(&RewardsInstruction::ReleaseTrialClaim {
-                claim_epoch,
-                releases: vec![],
-            }),
-        };
+        // Built from the shared helper, then the ONE deviation under test is applied:
+        // relay_wallet is not a signer. This used to be a hand-written copy of the
+        // account list, which kept the stale 15-entry spelling after the helper was
+        // corrected to 13 — a second copy is a second thing to drift, and
+        // release_trial_claim_ix_matches_the_handler_account_list only pins the helper.
+        // Deriving from the helper means there is exactly one spelling to keep right.
+        let mut ix = release_trial_claim_ix(
+            &relay, commitment_pk, foundation_cfg_pk, repflow_user_pk,
+            trial_cap_pk, claim_epoch, vec![],
+        );
+        ix.accounts[0].is_signer = false;
         let result = banks.process_transaction(Transaction::new_signed_with_payer(
             &[ix],
             Some(&payer.pubkey()),
