@@ -1,0 +1,45 @@
+#!/bin/sh
+# Pre-commit hook: run gitleaks against the staged diff.
+#
+# Installed into <git-dir>/hooks/pre-commit by scripts/install-git-hooks.sh.
+# Requires: gitleaks on PATH (https://github.com/gitleaks/gitleaks).
+#
+# WHY THIS REPO IN PARTICULAR: it is PUBLIC
+# (github.com/otc-fund/freeflow-contracts) and carries the source of a live
+# deployed program. A secret committed here is a secret published, and the
+# upgrade authority for that program is a keypair. Deploy keypairs are kept out
+# of the tree (`/Wallet/` is gitignored) — this hook is the backstop for
+# anything that slips into a diff anyway.
+
+# Deliberately NO `set -e`. With it, a non-zero gitleaks exit terminates the
+# script immediately and every message below becomes unreachable — the commit is
+# still blocked, but with no explanation. The explicit `if !` is what keeps the
+# guidance printable.
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "pre-commit: gitleaks is not on PATH."
+    echo "            Install it, or run ./freeflow-contracts/scripts/install-git-hooks.sh"
+    echo "            for platform instructions. This hook FAILS CLOSED:"
+    echo "            no scanner means no commit."
+    exit 1
+fi
+
+# `gitleaks git --staged` scans staged content only — not the worktree, not
+# history. (`gitleaks protect` is the pre-8.18 spelling; it still functions but
+# is no longer in `--help`, so prefer the documented form.)
+#
+# `--redact` keeps matched secret values out of terminal scrollback and CI logs
+# while still printing the file:line pointer.
+if ! gitleaks git --staged --redact --verbose --no-banner; then
+    echo ""
+    echo "pre-commit: gitleaks BLOCKED this commit — redacted findings above."
+    echo "            Remove the secret, re-stage, and commit again."
+    echo ""
+    echo "            If it is genuinely a false positive, add a targeted rule to"
+    echo "            .gitleaks.toml or a 'gitleaks:allow' comment on that line."
+    echo "            Do NOT reach for --no-verify: on a public repo holding a"
+    echo "            live program's source, that is how a key gets published."
+    exit 1
+fi
+
+exit 0

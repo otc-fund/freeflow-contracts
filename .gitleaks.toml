@@ -1,0 +1,72 @@
+# gitleaks config for this repo.
+#
+# `useDefault = true` keeps the whole upstream ruleset (PEM keys, AWS, GitHub
+# tokens, …) and adds repo-specific rules below.
+#
+# WHY A CUSTOM RULE IS REQUIRED HERE: the default ruleset does NOT recognise a
+# Solana keypair. That format — a JSON array of 64 byte-values, which is what
+# `solana-keygen` writes — is the single most damaging thing that could be
+# committed to this repo, because the deploy wallet is the UPGRADE AUTHORITY for
+# the live program `26pFEqpZYeG5xxmAMc74ZsANo6Kdduf5HYq5qk7Y34eT`. Publishing it
+# would hand an attacker the ability to replace the program.
+#
+# Verified empirically on gitleaks 8.30.1: a 64-int keypair array staged on its
+# own passes the default ruleset with "no leaks found". The rule below is what
+# closes that.
+#
+# `/Wallet/` is gitignored, so the normal path is already covered — this is the
+# backstop for a keypair pasted, exported, or copied somewhere else in the tree.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id          = "solana-keypair-json"
+description = "Solana keypair — JSON array of 64 byte values (solana-keygen on-disk format)"
+# 64 integers, comma-separated, in brackets. Anchored on the exact element count
+# so a 32-byte pubkey literal (e.g. Pubkey::new_from_array in constants.rs) does
+# not match; only a full secret key does.
+regex       = '''\[\s*\d{1,3}(\s*,\s*\d{1,3}){63}\s*\]'''
+tags        = ["key", "solana", "private-key"]
+
+[[rules]]
+id          = "solana-keypair-filename"
+description = "A file named like a Solana keypair, regardless of contents"
+# Path-only rule: catches an empty/renamed/base64'd keypair the content rule
+# would miss. Deliberately broad — a file with one of these names has no
+# business in a public repo even if this particular copy looks harmless.
+path        = '''(^|/)(id|.*[-_]?keypair|.*[-_]?wallet|authority|upgrade[-_]?authority)\.json$'''
+tags        = ["key", "solana", "filename"]
+
+[allowlist]
+description = "Known-public values and files that cannot hold a real secret"
+
+paths = [
+    # Lockfiles carry checksums that trip high-entropy heuristics.
+    '''(^|/)Cargo\.lock$''',
+    '''(^|/)package-lock\.json$''',
+    '''(^|/)yarn\.lock$''',
+]
+
+# Match the regexes below against the whole LINE, not just the matched secret.
+# Without this, gitleaks compares them to the extracted high-entropy token alone
+# (the default `regexTarget = "secret"`), so a pattern that includes the
+# assignment's key name can never match and the allowlist silently does nothing.
+regexTarget = "line"
+
+regexes = [
+    # Solana PROGRAM IDs are public base58 addresses — they are the on-chain
+    # equivalent of a URL, not a credential. The upstream `generic-api-key`
+    # heuristic flags them purely as high-entropy strings: 9 such findings exist
+    # in this repo's history, all of them `[programs.*]` tables in Anchor.toml
+    # or doc snippets quoting the same block.
+    #
+    # Scoped to the known program-name keys rather than allowlisting Anchor.toml
+    # wholesale, so a real secret introduced into that file is still caught —
+    # note `[provider] wallet` there is a PATH to a keypair, and if it ever
+    # became an inline key this allowlist would not hide it.
+    # Covers both spellings in this repo: the bare program names used as keys in
+    # Anchor.toml's `[programs.*]` tables, and the `*_program_id` form used in
+    # sidecar/relay config and in docs quoting it.
+    '''(?i)\b[a-z0-9_]*(program_id|repflow_token|staking|rewards|registry|user_escrow|referral)\s*=\s*"[1-9A-HJ-NP-Za-km-z]{32,44}"''',
+]
