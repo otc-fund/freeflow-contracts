@@ -2079,15 +2079,22 @@ pub fn process_slash_trial_fraud_ix(
     let repflow_config       = next_account_info(iter)?;
     let system_prog          = next_account_info(iter)?;
 
-    if !foundation_wallet.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-
-    // Verify foundation authority. Legacy-tolerant — see read_foundation_config_compat.
-    let fc = read_foundation_config_compat(&foundation_config_ai.data.borrow())?;
-    if fc.wallet != foundation_wallet.key.to_bytes() {
-        return Err(ProgramError::IllegalOwner);
-    }
+    // Verify foundation authority.
+    //
+    // Must go through `require_foundation_signer`, which pins
+    // `foundation_config` to the canonical `[b"foundation_config"]` PDA before
+    // trusting any field in it — the same order every other foundation-gated
+    // handler uses (`CommitClaim` :313, `ReleaseTrialClaim` :1638,
+    // `SetTrialEnabled` :2001, `ClaimRelayUptime` :2364). Reading the account's
+    // wallet field without first pinning its address does not authenticate
+    // anything, because the caller chooses which account to pass.
+    //
+    // This was previously a hand-rolled copy of that helper which had drifted
+    // and omitted the address check (H-2). Delegating rather than re-inlining
+    // the check is deliberate: the second copy is what allowed the drift. The
+    // helper is also strictly stricter — it rejects an uninitialised config
+    // (`lamports() == 0`) rather than falling through to a parse error.
+    require_foundation_signer(program_id, foundation_wallet, foundation_config_ai)?;
 
     // Load or create relay reputation.
     // Created here if the relay has never had a ClientDispute — trial fraud
@@ -3918,6 +3925,123 @@ mod release_trial_claim_integration_tests {
         let tu_acct = banks.get_account(trial_usage_pda).await.unwrap().unwrap();
         let tu = TrialUsage::try_from_slice(&tu_acct.data[..TRIAL_USAGE_SIZE]).unwrap();
         assert_eq!(tu.used_bytes, bytes, "trial usage records the served bytes");
+    }
+
+    // ── H-2: SlashTrialFraud foundation gate ─────────────────────────────────
+
+    /// Build the eight accounts `process_slash_trial_fraud_ix` reads, with the
+    /// `foundation_config` slot left to the caller. `relay_repflow_user` is the
+    /// account the reputation PDA is seeded from, so it must be a real
+    /// `[b"repflow_user", relay]` PDA.
+    fn slash_ix(
+        foundation_wallet: &Pubkey,
+        foundation_config: Pubkey,
+        relay: &Pubkey,
+    ) -> (Instruction, Pubkey, Pubkey) {
+        let repflow_pk = Pubkey::find_program_address(
+            &[b"repflow_user", relay.as_ref()], &REPFLOW_PROGRAM_ID).0;
+        // Seeded from the repflow_user key, not the relay wallet — handlers.rs
+        // takes `relay_repflow_user.key.to_bytes()` as the seed.
+        let (rep_pda, _) = Pubkey::find_program_address(
+            &[b"relay_reputation", repflow_pk.as_ref()], &id());
+        let (slash_auth, _) = Pubkey::find_program_address(&[b"slash_authority"], &id());
+        let rf_config = Pubkey::find_program_address(
+            &[b"repflow_config"], &REPFLOW_PROGRAM_ID).0;
+
+        let ix = Instruction {
+            program_id: id(),
+            accounts: vec![
+                AccountMeta::new(*foundation_wallet, true),
+                AccountMeta::new_readonly(foundation_config, false),
+                AccountMeta::new(rep_pda, false),
+                AccountMeta::new(repflow_pk, false),
+                AccountMeta::new_readonly(slash_auth, false),
+                AccountMeta::new_readonly(REPFLOW_PROGRAM_ID, false),
+                AccountMeta::new_readonly(rf_config, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            ],
+            data: borsh::to_vec(&RewardsInstruction::SlashTrialFraud {
+                claim_epoch:      7_779,
+                device_uuid:      [9u8; 16],
+                device_signature: [1u8; 64],
+            }).expect("encode"),
+        };
+        (ix, rep_pda, repflow_pk)
+    }
+
+    /// H-2: the `foundation_config` account must be pinned to the canonical
+    /// `[b"foundation_config"]` PDA.
+    ///
+    /// The gate used to be a hand-rolled `fc.wallet == signer` over whatever
+    /// account the caller supplied, with no address check — unlike all five
+    /// siblings. So anyone could create an account holding their OWN pubkey in
+    /// the wallet field, pass it here, sign with that same wallet, and the
+    /// comparison held. That let an arbitrary caller slash any relay's repFlow
+    /// below `MIN_RELAY_REPFLOW` and stop its reward payouts; `slash_count` and
+    /// `lifetime_slashed` never decay, so the damage is permanent.
+    ///
+    /// The forged account below is deliberately owned by this program and holds
+    /// a well-formed `FoundationConfig`, and every other account is genuine —
+    /// so the ONLY thing that can reject this transaction is the address check.
+    #[tokio::test]
+    async fn slash_trial_fraud_rejects_a_forged_foundation_config() {
+        let attacker = Keypair::new();
+        let victim   = Keypair::new();
+        // A perfectly well-formed config — at an address that is not the PDA.
+        let forged = Keypair::new().pubkey();
+
+        let (ix, _rep, repflow_pk) = slash_ix(&attacker.pubkey(), forged, &victim.pubkey());
+
+        let mut pt = program_test();
+        pt.add_account(forged, foundation_config_account(&attacker.pubkey(), 255));
+        pt.add_account(repflow_pk, repflow_user_account(MIN_RELAY_REPFLOW * 2));
+
+        let (mut banks, payer, bh) = pt.start().await;
+        fund(&mut banks, &payer, &attacker.pubkey(), bh).await;
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let err = banks
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix], Some(&attacker.pubkey()), &[&attacker], bh,
+            ))
+            .await
+            .expect_err("a forged foundation_config must be rejected");
+
+        let msg = format!("{err:?}");
+        assert!(msg.contains("InvalidArgument"),
+            "must be rejected by the PDA pin (InvalidArgument), got: {msg}");
+    }
+
+    /// Regression guard for the half of the gate that always worked: the
+    /// canonical PDA with the wrong signer is `IllegalOwner`. Pairs with the
+    /// test above so a future "fix" cannot satisfy one by breaking the other.
+    #[tokio::test]
+    async fn slash_trial_fraud_rejects_the_canonical_config_with_a_wrong_signer() {
+        let attacker = Keypair::new();
+        let victim   = Keypair::new();
+        let (fc_pda, fc_bump) = Pubkey::find_program_address(&[b"foundation_config"], &id());
+
+        let (ix, _rep, repflow_pk) = slash_ix(&attacker.pubkey(), fc_pda, &victim.pubkey());
+
+        let mut pt = program_test();
+        // The REAL config, registering the real foundation — not the attacker.
+        pt.add_account(fc_pda, foundation_config_account(&FOUNDATION_PUBKEY, fc_bump));
+        pt.add_account(repflow_pk, repflow_user_account(MIN_RELAY_REPFLOW * 2));
+
+        let (mut banks, payer, bh) = pt.start().await;
+        fund(&mut banks, &payer, &attacker.pubkey(), bh).await;
+        let bh = banks.get_latest_blockhash().await.unwrap();
+
+        let err = banks
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[ix], Some(&attacker.pubkey()), &[&attacker], bh,
+            ))
+            .await
+            .expect_err("a non-foundation signer must be rejected");
+
+        let msg = format!("{err:?}");
+        assert!(msg.contains("IllegalOwner"),
+            "wrong signer must be IllegalOwner, got: {msg}");
     }
 }
 
