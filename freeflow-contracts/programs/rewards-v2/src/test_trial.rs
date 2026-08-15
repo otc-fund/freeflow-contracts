@@ -805,6 +805,21 @@ mod integration {
     ///
     /// `releases` is usually empty for gate tests that error out before the
     /// per-release loop.
+    ///
+    /// The 13 fixed accounts must match `process_release_trial_claim_ix`
+    /// (`handlers.rs:1596-1608`) position for position. This list used to carry a
+    /// `repflow_mint` and a `relay_repflow_ata` at [9] and [10], left over from
+    /// before repFlow went PDA-only — the handler stopped reading them but this
+    /// builder kept sending them.
+    ///
+    /// It did not fail, and that is the trap worth remembering: a Solana handler
+    /// ignores trailing accounts rather than rejecting them (unlike Borsh, which
+    /// rejects trailing instruction bytes). So the two extra entries silently slid
+    /// `trial_mint_cap` and `system_program` two slots past where the handler
+    /// looks, and because every displaced slot held the same `stub` the handler
+    /// received a stub as `trial_mint_cap` and a stub as `system_program`. Every
+    /// test here still passed, because they all assert an error raised before
+    /// either account is touched.
     fn release_trial_claim_ix(
         relay:             &Keypair,
         commitment_pk:     Pubkey,
@@ -827,15 +842,51 @@ mod integration {
                 AccountMeta::new_readonly(stub, false),             // [6] repflow_program (stub)
                 AccountMeta::new(stub, false),                      // [7] repflow_config (stub)
                 AccountMeta::new(repflow_user_pk, false),           // [8] relay_repflow_user
-                AccountMeta::new(stub, false),                      // [9] repflow_mint (stub)
-                AccountMeta::new(stub, false),                      // [10] relay_repflow_ata
-                AccountMeta::new(stub, false),                      // [11] reward_relay
-                AccountMeta::new(stub, false),                      // [12] reward_treasury
-                AccountMeta::new(trial_cap_pk, false),              // [13] trial_mint_cap
-                AccountMeta::new_readonly(system_program::ID, false),// [14] system_program
+                AccountMeta::new(stub, false),                      // [9] reward_relay
+                AccountMeta::new(stub, false),                      // [10] reward_treasury
+                AccountMeta::new(trial_cap_pk, false),              // [11] trial_mint_cap
+                AccountMeta::new_readonly(system_program::ID, false),// [12] system_program
             ],
             data: encode_ix(&RewardsInstruction::ReleaseTrialClaim { claim_epoch, releases }),
         }
+    }
+
+    /// Pins the builder above to the handler's fixed-account list.
+    ///
+    /// Every other test in this module passes with EITHER the correct list or the
+    /// stale 15-account one, because they all error out before reaching the
+    /// displaced slots — which is exactly how the drift survived. This test is the
+    /// one that can tell them apart: it asserts the real (non-stub) keys land on
+    /// the indices `process_release_trial_claim_ix` reads them from, so a
+    /// reordered, added or removed account fails here instead of silently
+    /// weakening every gate test.
+    #[test]
+    fn release_trial_claim_ix_matches_the_handler_account_list() {
+        let relay             = Keypair::new();
+        let commitment_pk     = Keypair::new().pubkey();
+        let foundation_cfg_pk = Keypair::new().pubkey();
+        let repflow_user_pk   = Keypair::new().pubkey();
+        let trial_cap_pk      = Keypair::new().pubkey();
+
+        let ix = release_trial_claim_ix(
+            &relay, commitment_pk, foundation_cfg_pk, repflow_user_pk,
+            trial_cap_pk, 100, vec![],
+        );
+
+        // 13 fixed accounts, no per-release tail (releases is empty).
+        assert_eq!(ix.accounts.len(), 13,
+            "ReleaseTrialClaim takes 13 fixed accounts (handlers.rs:1596-1608)");
+
+        assert_eq!(ix.accounts[0].pubkey, relay.pubkey(), "[0] relay_wallet");
+        assert!(ix.accounts[0].is_signer,                 "[0] relay_wallet must sign");
+        assert_eq!(ix.accounts[1].pubkey, commitment_pk,     "[1] commitment");
+        assert_eq!(ix.accounts[2].pubkey, foundation_cfg_pk, "[2] foundation_config");
+        assert_eq!(ix.accounts[8].pubkey, repflow_user_pk,   "[8] relay_repflow_user");
+        // The two assertions the stale list broke: with repflow_mint/relay_repflow_ata
+        // at [9] and [10] these sat at [13] and [14], so the handler read a stub for
+        // both and no test noticed.
+        assert_eq!(ix.accounts[11].pubkey, trial_cap_pk,       "[11] trial_mint_cap");
+        assert_eq!(ix.accounts[12].pubkey, system_program::ID, "[12] system_program");
     }
 
     /// `ReleaseTrialClaim` fails with `TrialDisabled` when `foundation_config.trial_enabled = false`.
