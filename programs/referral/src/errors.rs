@@ -41,6 +41,14 @@ pub enum ReferralError {
                                     //      already means "the signer is not the foundation",
                                     //      and a shared code makes the test unable to say
                                     //      which check rejected the transaction.
+                                    //      RegisterReferralCode reuses it for the account it
+                                    //      creates, which is the same address under the same
+                                    //      derivation — one meaning, one code.
+    InvalidFlowMint,                // 24 — RegisterReferralCode was handed a mint that is not
+                                    //      the canonical $FLOW mint. Distinct from 23 so a
+                                    //      test can tell "wrong mint" from "wrong ATA", which
+                                    //      matters because the wrong mint *also* makes the
+                                    //      derived ATA wrong.
 }
 
 impl From<ReferralError> for ProgramError {

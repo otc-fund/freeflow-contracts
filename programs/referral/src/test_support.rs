@@ -16,11 +16,13 @@
 
 #![cfg(test)]
 
-use std::sync::Once;
+use std::{cell::RefCell, sync::Once};
 
 use solana_program::{
+    account_info::AccountInfo,
     clock::Clock,
-    entrypoint::SUCCESS,
+    entrypoint::{ProgramResult, SUCCESS},
+    instruction::Instruction,
     program_error::ProgramError,
     program_stubs::{set_syscall_stubs, SyscallStubs},
     pubkey::Pubkey,
@@ -40,6 +42,34 @@ struct TestSyscallStubs;
 impl SyscallStubs for TestSyscallStubs {
     /// Silence handler logging so a failing assertion is readable.
     fn sol_log(&self, _message: &str) {}
+
+    /// Record the CPI and return success, which is what the default stub does
+    /// minus the recording.
+    ///
+    /// There is still no CPI runtime here, so the callee never executes and no
+    /// account is really created or debited. What the recording *does* buy is
+    /// the request: which program the handler asked for, with which accounts,
+    /// flags and data. For a handler whose job is to issue a well-formed CPI —
+    /// `register_code` and its ATA creation — that request is the behaviour
+    /// under test, and asserting on it is the difference between testing the
+    /// call and testing nothing.
+    fn sol_invoke_signed(
+        &self,
+        instruction: &Instruction,
+        _account_infos: &[AccountInfo],
+        signers_seeds: &[&[&[u8]]],
+    ) -> ProgramResult {
+        CPI_LOG.with(|log| {
+            log.borrow_mut().push(RecordedCpi {
+                instruction: instruction.clone(),
+                signers_seeds: signers_seeds
+                    .iter()
+                    .map(|seeds| seeds.iter().map(|seed| seed.to_vec()).collect())
+                    .collect(),
+            });
+        });
+        Ok(())
+    }
 
     fn sol_get_clock_sysvar(&self, var_addr: *mut u8) -> u64 {
         let clock = Clock {
@@ -68,6 +98,39 @@ pub fn install_syscall_stubs() {
     STUBS.call_once(|| {
         set_syscall_stubs(Box::new(TestSyscallStubs));
     });
+}
+
+/// One CPI a handler asked the runtime to make.
+#[derive(Clone, Debug)]
+pub struct RecordedCpi {
+    pub instruction:   Instruction,
+    pub signers_seeds: Vec<Vec<Vec<u8>>>,
+}
+
+thread_local! {
+    /// CPIs seen on *this* thread. `cargo test` gives each test its own thread
+    /// and the stub table is global, so per-thread is what keeps a parallel run
+    /// from mixing one handler's CPIs into another's assertions.
+    static CPI_LOG: RefCell<Vec<RecordedCpi>> = RefCell::new(Vec::new());
+}
+
+/// Drop anything recorded so far. Call immediately before the handler under
+/// test, so the log describes that call and nothing else.
+pub fn reset_cpi_log() {
+    CPI_LOG.with(|log| log.borrow_mut().clear());
+}
+
+/// Every CPI issued on this thread since the last `reset_cpi_log`, in order.
+pub fn recorded_cpis() -> Vec<RecordedCpi> {
+    CPI_LOG.with(|log| log.borrow().clone())
+}
+
+/// The CPIs from `recorded_cpis` that targeted `program_id`.
+pub fn recorded_cpis_to(program_id: &Pubkey) -> Vec<RecordedCpi> {
+    recorded_cpis()
+        .into_iter()
+        .filter(|cpi| &cpi.instruction.program_id == program_id)
+        .collect()
 }
 
 /// The error every handler must return when handed a config it did not verify.

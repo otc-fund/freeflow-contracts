@@ -16,9 +16,16 @@ spl-token      = { workspace = true }
 borsh          = "1"
 sha2           = "0.10"
 
-# I-2: an independent oracle for the canonical-ATA derivation in `approve_claim`.
+# I-2: an independent oracle for the canonical-ATA derivation in `approve_claim`
+# and for the `CreateIdempotent` instruction `register_code` builds by hand.
 # Test-only, so it never reaches the .so. Version 3 is the line that pairs with
 # the workspace's `spl-token = "4"` (2.x pairs with spl-token 3), and 3.0.4 is
 # already in Cargo.lock via anchor-spl, so this adds no new resolution.
+#
+# Deliberately NOT promoted to a regular dependency: it pulls spl-token-2022 in
+# with it, which would put that whole tree into the on-chain build graph of a
+# program that is about to be deployed from an already-built .so. Hand-building
+# the six-meta instruction costs a dozen lines, changes no dependency edge, and
+# leaves this crate free to serve as the oracle those lines are checked against.
 [dev-dependencies]
 spl-associated-token-account = { version = "3", features = ["no-entrypoint"] }
