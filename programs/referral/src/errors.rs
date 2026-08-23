@@ -44,11 +44,16 @@ pub enum ReferralError {
                                     //      RegisterReferralCode reuses it for the account it
                                     //      creates, which is the same address under the same
                                     //      derivation — one meaning, one code.
-    InvalidFlowMint,                // 24 — RegisterReferralCode was handed a mint that is not
-                                    //      the canonical $FLOW mint. Distinct from 23 so a
-                                    //      test can tell "wrong mint" from "wrong ATA", which
-                                    //      matters because the wrong mint *also* makes the
-                                    //      derived ATA wrong.
+    InvalidFlowMint,                // 24 — a mint that is not the canonical $FLOW mint
+                                    //      (`utils::FLOW_MINT`). Returned by two instructions,
+                                    //      about the two ends of the same derivation:
+                                    //      RegisterReferralCode when the caller names another
+                                    //      mint for the ATA it opens, and ApproveClaim when the
+                                    //      configured pool vault holds another token. Distinct
+                                    //      from 23 so a test can tell "wrong mint" from "wrong
+                                    //      ATA", which matters because the wrong mint *also*
+                                    //      makes the derived ATA wrong — 23 is precisely the
+                                    //      error a missing mint check hides behind.
 }
 
 impl From<ReferralError> for ProgramError {

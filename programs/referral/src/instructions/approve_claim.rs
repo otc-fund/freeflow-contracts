@@ -17,6 +17,7 @@ use solana_program::{
 use crate::{
     errors::ReferralError,
     state::{ClaimRequest, RewardsPool},
+    utils::FLOW_MINT,
 };
 
 /// Associated Token Account program (`ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`).
@@ -60,7 +61,14 @@ pub fn process(
         return Err(ReferralError::InvalidAuthority.into());
     }
 
-    // ── H-1: Validate pool vault matches config ─────────────────────────────
+    // ── H-ref-1: Validate pool vault matches config ─────────────────────────
+    // `H-ref-N` follows `SECURITY-AUDIT.md`'s own convention for referral-scoped
+    // findings (`L-ref-1`, `L-ref-2` at :290-291). Not plain `H-1`: that id is
+    // taken, by an unrelated rewards-v2 finding at `SECURITY-AUDIT.md:37`
+    // (`reward_treasury` unvalidated in Release / ReleaseTrial), fixed and
+    // deployed in `1d6e330`. `errors.rs:21` and `record_referral.rs` still
+    // carry the old collision.
+    //
     // Mirrors `record_referral.rs:77` exactly — same binding, same error. The
     // owner and length pins in step 3 ask whether this account is *shaped* like
     // a token account; only this asks whether it is *the* one. All three are
@@ -112,6 +120,32 @@ pub fn process(
         // same one the balance was just read from.
         Pubkey::new_from_array(vault_data[0..32].try_into().unwrap())
     };
+
+    // ── 3b. …and that what it holds really is $FLOW ─────────────────────────
+    // The step above is titled "check vault has enough $FLOW" and never
+    // established that it *is* $FLOW. Identity was settled at H-ref-1 above;
+    // this settles contents, and the two are different questions — the
+    // configured vault being the right account says nothing about the token
+    // inside it.
+    //
+    // Without this, the mint the payout ATA is derived from (`:113`) comes out
+    // of the vault's bytes while `register_code` opens the referrer's account
+    // against the pinned `FLOW_MINT`. The two agreeing is then a property of
+    // how the vault happened to be configured rather than of this program, and
+    // nothing on chain can restore it if it ever fails: `ReferralConfig` has no
+    // mint field, `rewards_pool_vault` is written once at `initialize` with no
+    // validation, and `update_config` has no setter for it.
+    //
+    // The failure it prevents is worth naming. A divergence does not surface as
+    // "wrong mint" — it surfaces as every referrer's address check returning
+    // `InvalidReferrerAta` (23), a fleet-wide payout outage reported as an error
+    // about the referrer, unfixable without a program upgrade.
+    //
+    // It rejects nothing legitimate: the live vault holds $FLOW, which is the
+    // denomination `request.amount` is already in.
+    if flow_mint != FLOW_MINT {
+        return Err(ReferralError::InvalidFlowMint.into());
+    }
 
     // ── 4. Derive pool PDA for signing ──────────────────────────────────────
     let (pool_pda, pool_bump) =
@@ -343,6 +377,22 @@ mod tests {
 
     // ── Task 4: the payout destination must belong to the claim's referrer ──
 
+    /// The mint the pool vault holds, for fixtures that are about something
+    /// else.
+    ///
+    /// Since step 3b pins it, any fixture meant to reach a check *after* that
+    /// step has to carry the real mint — otherwise the pin is what rejects it
+    /// and the test quietly stops asserting the thing it is named for.
+    ///
+    /// Reading `super::FLOW_MINT` here is not the echo it would be in a test
+    /// *about* the constant's value. Nothing below asserts what the mint is;
+    /// they assert the payout binding, and need a vault that gets them there.
+    /// The value is pinned to a base58 literal, independently and in one place,
+    /// by `register_code::tests::test_pinned_ids_are_the_published_ones`.
+    fn flow_mint() -> Pubkey {
+        super::FLOW_MINT
+    }
+
     /// Drive `ApproveClaim` end to end with everything well-formed *except*
     /// the payout destination, which the caller picks.
     ///
@@ -495,7 +545,7 @@ mod tests {
     fn test_approve_rejects_ata_of_a_different_referrer() {
         let program_id = Pubkey::new_unique();
         let authority  = Pubkey::new_unique();
-        let mint       = Pubkey::new_unique();
+        let mint       = flow_mint();
         let referrer_x = Pubkey::new_unique();
         let referrer_y = Pubkey::new_unique();
 
@@ -536,7 +586,7 @@ mod tests {
     fn test_approve_accepts_the_referrers_canonical_ata() {
         let program_id = Pubkey::new_unique();
         let authority  = Pubkey::new_unique();
-        let mint       = Pubkey::new_unique();
+        let mint       = flow_mint();
         let referrer_x = Pubkey::new_unique();
 
         let x_ata =
@@ -562,7 +612,7 @@ mod tests {
     fn test_approve_rejects_a_transposed_ata_seed_order() {
         let program_id = Pubkey::new_unique();
         let authority  = Pubkey::new_unique();
-        let mint       = Pubkey::new_unique();
+        let mint       = flow_mint();
         let referrer   = Pubkey::new_unique();
 
         let (transposed, _) = Pubkey::find_program_address(
@@ -599,9 +649,14 @@ mod tests {
     ///
     /// Why it matters beyond the missing check: since C-2 the mint the payout
     /// ATA is derived from comes out of these very bytes (`:95`), while
-    /// `register_code.rs:167` derives the account it creates against the
-    /// hardcoded `FLOW_MINT`. Unbound, the vault is where a caller reaches in
-    /// and moves one of those two derivations.
+    /// `register_code.rs` derives the account it creates against the shared
+    /// `FLOW_MINT`. Unbound, the vault is where a caller reaches in and moves
+    /// one of those two derivations.
+    ///
+    /// The mint below stays `new_unique` deliberately, now that step 3b pins
+    /// it: identity is settled before contents, so an unconfigured vault is
+    /// turned away without its token ever being looked at. Canonicalise this
+    /// fixture and that ordering stops being asserted.
     #[test]
     fn test_approve_rejects_a_vault_that_is_not_the_configured_one() {
         let program_id     = Pubkey::new_unique();
@@ -643,6 +698,9 @@ mod tests {
     /// still come back `InvalidPoolVault`, not the `InvalidAccountData` the
     /// shape pins would raise. Order is the whole assertion: move the binding
     /// below step 3 and this goes red while the test above stays green.
+    ///
+    /// Same reason as above for the `new_unique` mint: these bytes are not a
+    /// token account at all, so nothing may read a mint out of them either.
     #[test]
     fn test_approve_binds_the_vault_before_reading_its_bytes() {
         use crate::test_support::spl_mint_account_bytes;
@@ -672,6 +730,57 @@ mod tests {
             ProgramError::Custom(ReferralError::InvalidPoolVault as u32),
             "identity must be settled before shape — reaching the length pin at \
              all means the handler already touched bytes it had no reason to trust",
+        );
+    }
+
+    // ── The configured vault must hold **$FLOW** ─────────────────────────────
+
+    /// A vault that is genuinely the configured one, genuinely a token account,
+    /// genuinely funded — and holding some other SPL token entirely.
+    ///
+    /// Nothing here is malformed. The config is program-owned at the canonical
+    /// PDA, it names the signer as `authority`, and `rewards_pool_vault` names
+    /// the very account in slot 3. Every check that exists passes it, and the
+    /// handler then derives the payout ATA from whatever mint those bytes
+    /// happen to carry (`:113`) while `register_code` opened the referrer's
+    /// account against the pinned `FLOW_MINT`. The two addresses cannot match,
+    /// so every approval in the fleet dies on `InvalidReferrerAta` (23) — an
+    /// error naming the referrer for a mistake made in this repository.
+    ///
+    /// Nothing on chain could correct it, either: `ReferralConfig` carries no
+    /// mint, and `rewards_pool_vault` is written once at `initialize` with no
+    /// owner, length or mint validation and has no setter in `update_config`.
+    /// The two files agreeing has been a property of how the vault was
+    /// configured, not of the code. This is what makes it a property of the code.
+    ///
+    /// The impostor is `new_unique`, so it is unequal to `FLOW_MINT` whatever
+    /// `FLOW_MINT` is — this asserts the pin exists, not what it points at.
+    /// What it points at is pinned to a base58 literal by
+    /// `register_code::tests::test_pinned_ids_are_the_published_ones`.
+    #[test]
+    fn test_approve_requires_the_vault_to_hold_flow() {
+        let program_id = Pubkey::new_unique();
+        let authority  = Pubkey::new_unique();
+        let referrer   = Pubkey::new_unique();
+        let impostor   = Pubkey::new_unique();
+
+        // Correctly derived *for that mint*, so it is the address the handler
+        // itself computes from the vault's bytes. Without the pin this fixture
+        // is accepted and the transfer is signed; the ATA check cannot catch a
+        // wrong mint, because it derives from the wrong mint too.
+        let ata = spl_associated_token_account::get_associated_token_address(
+            &referrer, &impostor,
+        );
+
+        let err = approve_paying_to(&program_id, &authority, &referrer, &impostor, &ata)
+            .expect_err("a vault holding anything but $FLOW must never fund a payout");
+
+        assert_eq!(
+            err,
+            ProgramError::Custom(ReferralError::InvalidFlowMint as u32),
+            "the mint pin must be what rejects this — the vault is the \
+             configured one, correctly shaped and amply funded, and the \
+             destination is the canonical ATA for the mint it holds",
         );
     }
 

@@ -1,4 +1,4 @@
-//! Shared utility functions for the referral program.
+//! Shared utility functions and pinned constants for the referral program.
 
 use borsh::BorshDeserialize;
 use solana_program::{
@@ -9,6 +9,30 @@ use solana_program::{
 
 use crate::errors::ReferralError;
 use crate::state::ReferralConfig;
+
+/// The canonical $FLOW mint (`7w6YxBZmXMZfuS4PJCwDmY5hX98RrpnR7xNEV9Ugwzxc`).
+///
+/// Shared rather than duplicated because two instructions derive addresses from
+/// it and they have to agree by *construction*, not by configuration.
+/// `register_code` opens the referrer's ATA against this mint; `approve_claim`
+/// requires the pool vault to hold it before deriving the payout address it
+/// transfers into. A private copy in each file lets the two drift, and the
+/// failure mode is silent and fleet-wide: every referrer's address check comes
+/// back `InvalidReferrerAta` (23) — an error naming the referrer for a mistake
+/// made in this repository — and no payout completes.
+///
+/// Pinned here rather than read from chain for want of anywhere to read it
+/// from. `ReferralConfig` has no mint field, and `rewards_pool_vault` — the
+/// account a mint would otherwise be inferred from — is written once at
+/// `initialize` with no owner, length or mint validation and has **no setter**
+/// in `update_config`, so a wrong value there is unreachable without a program
+/// upgrade. A compile-time constant is at least visible in a diff.
+///
+/// Its value is pinned to the published base58 address by
+/// `register_code::tests::test_pinned_ids_are_the_published_ones`, which spells
+/// that address out independently rather than reading it back from here.
+pub const FLOW_MINT: Pubkey =
+    solana_program::pubkey!("7w6YxBZmXMZfuS4PJCwDmY5hX98RrpnR7xNEV9Ugwzxc");
 
 /// Calculate the referral reward for a given purchase amount.
 ///

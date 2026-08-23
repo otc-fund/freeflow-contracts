@@ -18,7 +18,11 @@ use solana_program::{
     sysvar::Sysvar,
 };
 
-use crate::{errors::ReferralError, state::ReferralCode, utils::sha256_hash};
+use crate::{
+    errors::ReferralError,
+    state::ReferralCode,
+    utils::{sha256_hash, FLOW_MINT},
+};
 
 /// Associated Token Account program (`ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`).
 ///
@@ -34,15 +38,6 @@ const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
 /// exists. A referrer registering a second code, or one who already holds
 /// $FLOW, has to find this a no-op rather than a failed transaction.
 const ATA_CREATE_IDEMPOTENT: u8 = 1;
-
-/// The canonical $FLOW mint (`7w6YxBZmXMZfuS4PJCwDmY5hX98RrpnR7xNEV9Ugwzxc`).
-///
-/// Pinned rather than taken from the caller. `approve_claim` derives the payout
-/// address from the *vault's* mint, so an ATA opened here against any other
-/// mint is an address that instruction can never pay into — and the referrer
-/// would have spent rent to open a worthless account to get it.
-const FLOW_MINT: Pubkey =
-    solana_program::pubkey!("7w6YxBZmXMZfuS4PJCwDmY5hX98RrpnR7xNEV9Ugwzxc");
 
 /// Instruction data (after discriminant).
 #[derive(BorshSerialize, BorshDeserialize)]
@@ -223,6 +218,13 @@ mod tests {
     /// test follows it happily, while on chain every referrer would be handed
     /// an ATA that `approve_claim` — which derives from the *vault's* mint —
     /// can never pay into.
+    ///
+    /// Now that `FLOW_MINT` is one shared constant (`utils.rs`) rather than a
+    /// private copy per file, this literal carries **more** weight, not less.
+    /// Sharing removes the risk that the two derivations disagree with each
+    /// other; it does nothing about them being wrong together, and this is the
+    /// only place in the program where the value is checked against something
+    /// outside itself.
     const CANONICAL_FLOW_MINT: &str = "7w6YxBZmXMZfuS4PJCwDmY5hX98RrpnR7xNEV9Ugwzxc";
 
     fn flow_mint() -> Pubkey {
@@ -631,10 +633,17 @@ mod tests {
     /// constants to their published addresses rather than trusting that a
     /// 32-byte literal was transcribed correctly.
     ///
-    /// `approve_claim` pins its own copy of the ATA program id the same way.
-    /// That is what keeps two files' constants equal without either importing
-    /// the other, and it is why `CANONICAL_FLOW_MINT` above is written out
-    /// rather than read from `super::FLOW_MINT`.
+    /// The two ids get there differently, on purpose. `ASSOCIATED_TOKEN_PROGRAM_ID`
+    /// is still a private copy in each file, kept equal by both being checked
+    /// against `spl_associated_token_account::id()` — the crate that defines
+    /// the convention. `FLOW_MINT` has no such upstream to check against, so a
+    /// per-file copy could only ever be kept in step by hand; it is one shared
+    /// constant in `utils.rs` instead, and `super::FLOW_MINT` here resolves
+    /// through this file's import of it.
+    ///
+    /// Which leaves this assertion as the whole of the external evidence for
+    /// its value, and is why `CANONICAL_FLOW_MINT` above is written out rather
+    /// than read from `super::FLOW_MINT`.
     #[test]
     fn test_pinned_ids_are_the_published_ones() {
         assert_eq!(
