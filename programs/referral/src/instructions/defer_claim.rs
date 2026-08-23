@@ -22,7 +22,7 @@ use crate::{
 /// 1. `[]`         config        — `ReferralConfig` PDA (authority check)
 /// 2. `[signer]`   authority     — Foundation authority
 pub fn process(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
 ) -> ProgramResult {
     let iter = &mut accounts.iter();

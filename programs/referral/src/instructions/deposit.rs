@@ -27,7 +27,7 @@ pub struct DepositRewardsPoolArgs {
 /// 4. `[writable]` vault          — pool vault SPL token account (destination)
 /// 5. `[]`         token_program  — SPL Token program
 pub fn process(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     args: DepositRewardsPoolArgs,
 ) -> ProgramResult {

@@ -24,7 +24,7 @@ pub struct UpdateReferralConfigArgs {
 /// 0. `[writable]` config    — existing `ReferralConfig` PDA
 /// 1. `[signer]`   authority — must match `config.authority`
 pub fn process(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     args: UpdateReferralConfigArgs,
 ) -> ProgramResult {
