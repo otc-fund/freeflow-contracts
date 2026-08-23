@@ -60,6 +60,24 @@ pub fn process(
         return Err(ReferralError::InvalidAuthority.into());
     }
 
+    // ── H-1: Validate pool vault matches config ─────────────────────────────
+    // Mirrors `record_referral.rs:77` exactly — same binding, same error. The
+    // owner and length pins in step 3 ask whether this account is *shaped* like
+    // a token account; only this asks whether it is *the* one. All three are
+    // wanted, and none substitutes for another.
+    //
+    // It sits above step 3 on purpose. That step reads the vault balance out of
+    // these bytes and — since C-2 — the mint it derives the referrer's payout
+    // ATA from. Neither may come from an account the config never named, so the
+    // identity question has to be settled before the first byte is trusted.
+    //
+    // It rejects nothing legitimate: the foundation already sends exactly this
+    // account (freeflow-sidecar .../referral/authority.rs:163 sets
+    // `vault: cfg.rewards_pool_vault`, read from this very on-chain config).
+    if vault_info.key.to_bytes() != config.rewards_pool_vault {
+        return Err(ReferralError::InvalidPoolVault.into());
+    }
+
     // ── 2. Validate claim request is Pending ────────────────────────────────
     let mut request = ClaimRequest::try_from_slice(&claim_request_info.data.borrow())?;
     if request.status != 0 {
@@ -364,6 +382,27 @@ mod tests {
         referrer_ata: &Pubkey,
         vault_bytes:  Vec<u8>,
     ) -> Result<(), ProgramError> {
+        approve_with_declared_vault(
+            program_id, authority, referrer, mint, referrer_ata, vault_bytes, None,
+        )
+    }
+
+    /// As `approve_with_vault`, but `declared_vault` says what the *config*
+    /// names as `rewards_pool_vault`.
+    ///
+    /// `None` — every caller above — means the config names the very account
+    /// passed in slot 3, which is the honest arrangement and the one the
+    /// foundation produces. `Some(other)` splits the two apart, which is the
+    /// only way to ask whether the handler ever compares them.
+    fn approve_with_declared_vault(
+        program_id:     &Pubkey,
+        authority:      &Pubkey,
+        referrer:       &Pubkey,
+        mint:           &Pubkey,
+        referrer_ata:   &Pubkey,
+        vault_bytes:    Vec<u8>,
+        declared_vault: Option<&Pubkey>,
+    ) -> Result<(), ProgramError> {
         use crate::test_support::{
             claim_request_bytes, config_bytes, install_syscall_stubs,
             rewards_pool_bytes, spl_token_account_bytes_for_mint,
@@ -388,7 +427,8 @@ mod tests {
         let mut pool_lamports  = 1_000_000u64;
         let mut pool_data      = rewards_pool_bytes(1_000_000_000, 0);
         let mut cfg_lamports   = 1_000_000u64;
-        let mut cfg_data       = config_bytes(authority, &vault_key);
+        let mut cfg_data       =
+            config_bytes(authority, declared_vault.unwrap_or(&vault_key));
         let mut vault_lamports = 1_000_000u64;
         let mut vault_data     = vault_bytes;
         let mut ata_lamports   = 1_000_000u64;
@@ -542,6 +582,96 @@ mod tests {
         assert_eq!(
             err,
             ProgramError::Custom(ReferralError::InvalidReferrerAta as u32),
+        );
+    }
+
+    // ── The vault must be the *configured* one, not merely a token account ───
+
+    /// A real, correctly-shaped, Tokenkeg-owned SPL token account for the right
+    /// mint, holding more than enough — and simply not the account
+    /// `config.rewards_pool_vault` names.
+    ///
+    /// The owner and length pins in step 3 both pass it, because both ask about
+    /// *shape*. Nothing asked about *identity*, so the handler read a balance
+    /// and a mint out of an account the config never blessed, then signed a
+    /// `rewards_pool`-authorised transfer out of it. `record_referral.rs:77`
+    /// has enforced exactly this binding, with exactly this error, all along.
+    ///
+    /// Why it matters beyond the missing check: since C-2 the mint the payout
+    /// ATA is derived from comes out of these very bytes (`:95`), while
+    /// `register_code.rs:167` derives the account it creates against the
+    /// hardcoded `FLOW_MINT`. Unbound, the vault is where a caller reaches in
+    /// and moves one of those two derivations.
+    #[test]
+    fn test_approve_rejects_a_vault_that_is_not_the_configured_one() {
+        let program_id     = Pubkey::new_unique();
+        let authority      = Pubkey::new_unique();
+        let mint           = Pubkey::new_unique();
+        let referrer       = Pubkey::new_unique();
+        // The config points at some other account entirely.
+        let configured_vault = Pubkey::new_unique();
+
+        // Genuine in every other respect — right mint, right referrer, canonical
+        // ATA — so identity is the only thing left that can reject this.
+        let ata =
+            spl_associated_token_account::get_associated_token_address(&referrer, &mint);
+
+        let err = approve_with_declared_vault(
+            &program_id,
+            &authority,
+            &referrer,
+            &mint,
+            &ata,
+            crate::test_support::spl_token_account_bytes_for_mint(&mint, 1_000_000_000),
+            Some(&configured_vault),
+        )
+        .expect_err("only config.rewards_pool_vault may fund a referral payout");
+
+        assert_eq!(
+            err,
+            ProgramError::Custom(ReferralError::InvalidPoolVault as u32),
+            "the vault binding must be what rejects this, and it must speak with \
+             the same code `record_referral` already uses for it (14)",
+        );
+    }
+
+    /// The binding has to be checked *before* the vault's bytes are read, or it
+    /// is not a binding — it is a second opinion arriving after the handler has
+    /// already trusted the account.
+    ///
+    /// An unconfigured account whose bytes are not a token account at all must
+    /// still come back `InvalidPoolVault`, not the `InvalidAccountData` the
+    /// shape pins would raise. Order is the whole assertion: move the binding
+    /// below step 3 and this goes red while the test above stays green.
+    #[test]
+    fn test_approve_binds_the_vault_before_reading_its_bytes() {
+        use crate::test_support::spl_mint_account_bytes;
+
+        let program_id       = Pubkey::new_unique();
+        let authority        = Pubkey::new_unique();
+        let mint             = Pubkey::new_unique();
+        let referrer         = Pubkey::new_unique();
+        let configured_vault = Pubkey::new_unique();
+
+        let ata =
+            spl_associated_token_account::get_associated_token_address(&referrer, &mint);
+
+        let err = approve_with_declared_vault(
+            &program_id,
+            &authority,
+            &referrer,
+            &mint,
+            &ata,
+            spl_mint_account_bytes(1_000_000_000, 9, None),
+            Some(&configured_vault),
+        )
+        .expect_err("an unconfigured account must never be read as the vault");
+
+        assert_eq!(
+            err,
+            ProgramError::Custom(ReferralError::InvalidPoolVault as u32),
+            "identity must be settled before shape — reaching the length pin at \
+             all means the handler already touched bytes it had no reason to trust",
         );
     }
 
