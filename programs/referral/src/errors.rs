@@ -19,9 +19,9 @@ pub enum ReferralError {
     PurchaseBelowMinimum,           // 12
     InvalidRewardAmount,            // 13 — M-5: transferred_reward != calculated reward
     InvalidPoolVault,               // 14 — H-1: pool_vault doesn't match config.rewards_pool_vault
-    InvalidReferralConfigOwner,     // 15 — H-2: referral_config not owned by referral program
-    InvalidReferralConfigSize,      // 16 — H-2: referral_config data too small
-    InvalidReferralConfigAuthority, // 17 — H-2: config authority doesn't match expected
+    InvalidReferralConfigOwner,     // 15 — C-2: referral_config not owned by referral program
+    InvalidReferralConfigSize,      // 16 — C-2: referral_config data too small
+    InvalidReferralConfigAuthority, // 17 — C-2: config authority doesn't match expected
     ReviewPeriodNotExpired,         // 18 — reserved for future auto-release guard
     ClaimAlreadyExecuted,           // 19
     InvalidClaimStatus,             // 20

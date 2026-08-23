@@ -1,8 +1,14 @@
 //! Shared utility functions for the referral program.
 
-use solana_program::program_error::ProgramError;
+use borsh::BorshDeserialize;
+use solana_program::{
+    account_info::AccountInfo,
+    program_error::ProgramError,
+    pubkey::Pubkey,
+};
 
 use crate::errors::ReferralError;
+use crate::state::ReferralConfig;
 
 /// Calculate the referral reward for a given purchase amount.
 ///
@@ -29,6 +35,36 @@ pub fn sha256_hash(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hasher.finalize().into()
+}
+
+/// Load the singleton `ReferralConfig`, proving the account is authentic first.
+///
+/// Rejects any account that is not program-owned AND the canonical
+/// `[b"referral_config"]` PDA, closing the forged-config authority bypass (C-2).
+///
+/// Both checks are load-bearing for different reasons. The owner check stops a
+/// foreign account: an attacker cannot write arbitrary bytes into an account this
+/// program owns. The PDA check stops type confusion between this program's OWN
+/// account types — today no sibling type is exactly `ReferralConfig::SIZE` (86)
+/// bytes and borsh rejects trailing bytes, so confusion is blocked by an accident
+/// of sizing rather than by design. Keep the PDA check so a future 86-byte type
+/// cannot silently reopen it.
+pub fn load_verified_config(
+    config_info: &AccountInfo,
+    program_id: &Pubkey,
+) -> Result<ReferralConfig, ProgramError> {
+    if config_info.owner != program_id {
+        return Err(ReferralError::InvalidReferralConfigOwner.into());
+    }
+    let (pda, _) = Pubkey::find_program_address(&[b"referral_config"], program_id);
+    if config_info.key != &pda {
+        return Err(ReferralError::InvalidReferralConfigOwner.into());
+    }
+    if config_info.data_len() < ReferralConfig::SIZE {
+        return Err(ReferralError::InvalidReferralConfigSize.into());
+    }
+    ReferralConfig::try_from_slice(&config_info.data.borrow())
+        .map_err(|_| ReferralError::InvalidReferralConfigSize.into())
 }
 
 #[cfg(test)]
@@ -68,5 +104,110 @@ mod tests {
         let h1 = sha256_hash(b"FREEFLOW");
         let h2 = sha256_hash(b"freeflow");
         assert_ne!(h1, h2, "hash is case-sensitive; callers must uppercase before hashing");
+    }
+
+    // ── C-2: load_verified_config ────────────────────────────────────────────
+
+    /// Build an 86-byte buffer that borsh-deserializes into a `ReferralConfig`,
+    /// with `authority` written at offset 18..50 (after `reward_bps: u16` and
+    /// the two `u64`s). This is exactly the layout an attacker would forge.
+    fn config_bytes(authority: [u8; 32]) -> Vec<u8> {
+        let mut data = vec![0u8; ReferralConfig::SIZE];
+        data[0..2].copy_from_slice(&250u16.to_le_bytes()); // reward_bps
+        data[2..10].copy_from_slice(&1_000u64.to_le_bytes()); // max_reward_lamports
+        data[10..18].copy_from_slice(&100u64.to_le_bytes()); // min_purchase_lamports
+        data[18..50].copy_from_slice(&authority); // authority
+        data[50..82].copy_from_slice(&[7u8; 32]); // rewards_pool_vault
+        data[82] = 255; // bump
+        data // [83..86] = _padding, left zero
+    }
+
+    /// Foreign-owned: right address, right size, perfectly well-formed bytes —
+    /// but owned by a program the attacker controls, so every byte in it is
+    /// attacker-chosen, `authority` included.
+    #[test]
+    fn test_load_verified_config_rejects_foreign_owner() {
+        let program_id = Pubkey::new_unique();
+        let attacker_program = Pubkey::new_unique();
+        let (pda, _) = Pubkey::find_program_address(&[b"referral_config"], &program_id);
+
+        let mut lamports = 1_000_000u64;
+        let mut data = config_bytes([9u8; 32]);
+        let info = AccountInfo::new(
+            &pda,
+            false,
+            false,
+            &mut lamports,
+            &mut data,
+            &attacker_program,
+            false,
+            0,
+        );
+
+        assert_eq!(
+            load_verified_config(&info, &program_id).unwrap_err(),
+            ProgramError::Custom(ReferralError::InvalidReferralConfigOwner as u32),
+            "a foreign-owned account must never be accepted as the config",
+        );
+    }
+
+    /// Program-owned but at the wrong address: guards type confusion between
+    /// this program's own account types. Nothing but the canonical PDA counts.
+    #[test]
+    fn test_load_verified_config_rejects_wrong_address() {
+        let program_id = Pubkey::new_unique();
+        let not_the_pda = Pubkey::new_unique();
+
+        let mut lamports = 1_000_000u64;
+        let mut data = config_bytes([9u8; 32]);
+        let info = AccountInfo::new(
+            &not_the_pda,
+            false,
+            false,
+            &mut lamports,
+            &mut data,
+            &program_id,
+            false,
+            0,
+        );
+
+        assert_eq!(
+            load_verified_config(&info, &program_id).unwrap_err(),
+            ProgramError::Custom(ReferralError::InvalidReferralConfigOwner as u32),
+            "only the canonical [b\"referral_config\"] PDA may be read as the config",
+        );
+    }
+
+    /// The one account that is genuinely the config: program-owned, canonical
+    /// PDA, exactly `ReferralConfig::SIZE` bytes.
+    #[test]
+    fn test_load_verified_config_accepts_canonical_pda() {
+        let program_id = Pubkey::new_unique();
+        let (pda, _) = Pubkey::find_program_address(&[b"referral_config"], &program_id);
+        let authority = [42u8; 32];
+
+        let mut lamports = 1_000_000u64;
+        let mut data = config_bytes(authority);
+        assert_eq!(data.len(), 86, "ReferralConfig::SIZE is 86");
+        let info = AccountInfo::new(
+            &pda,
+            false,
+            false,
+            &mut lamports,
+            &mut data,
+            &program_id,
+            false,
+            0,
+        );
+
+        let config = load_verified_config(&info, &program_id)
+            .expect("the canonical program-owned config PDA must load");
+        assert_eq!(
+            config.authority, authority,
+            "authority must round-trip from bytes 18..50",
+        );
+        assert_eq!(config.reward_bps, 250);
+        assert_eq!(config.max_reward_lamports, 1_000);
+        assert_eq!(config.min_purchase_lamports, 100);
     }
 }
