@@ -293,6 +293,12 @@ mod tests {
         assert_eq!(e, ProgramError::Custom(19));
         let e: ProgramError = ReferralError::InvalidClaimStatus.into();
         assert_eq!(e, ProgramError::Custom(20));
+        // C-2 / M-2: the two config-verification branches, pinned apart so an
+        // inserted variant cannot silently renumber one onto the other.
+        let e: ProgramError = ReferralError::InvalidReferralConfigOwner.into();
+        assert_eq!(e, ProgramError::Custom(15));
+        let e: ProgramError = ReferralError::InvalidReferralConfigAddress.into();
+        assert_eq!(e, ProgramError::Custom(22));
     }
 
     // ── SHA-256 helper ───────────────────────────────────────────────────────

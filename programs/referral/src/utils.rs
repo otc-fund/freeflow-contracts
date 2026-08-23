@@ -49,6 +49,14 @@ pub fn sha256_hash(data: &[u8]) -> [u8; 32] {
 /// bytes and borsh rejects trailing bytes, so confusion is blocked by an accident
 /// of sizing rather than by design. Keep the PDA check so a future 86-byte type
 /// cannot silently reopen it.
+///
+/// The two checks return **different** error codes on purpose (M-2). They once
+/// shared `InvalidReferralConfigOwner`, which made every caller's test a weak
+/// oracle: the six handler tests pin a foreign-owned account *at the canonical
+/// PDA*, so asserting the shared code proved only "rejected" — never "the owner
+/// branch rejected it". Change the seed here and all six would have stayed green
+/// while silently exercising the address branch instead. Distinct codes make each
+/// branch independently observable: delete one and only its own test goes red.
 pub fn load_verified_config(
     config_info: &AccountInfo,
     program_id: &Pubkey,
@@ -58,7 +66,7 @@ pub fn load_verified_config(
     }
     let (pda, _) = Pubkey::find_program_address(&[b"referral_config"], program_id);
     if config_info.key != &pda {
-        return Err(ReferralError::InvalidReferralConfigOwner.into());
+        return Err(ReferralError::InvalidReferralConfigAddress.into());
     }
     if config_info.data_len() < ReferralConfig::SIZE {
         return Err(ReferralError::InvalidReferralConfigSize.into());
@@ -147,12 +155,17 @@ mod tests {
         assert_eq!(
             load_verified_config(&info, &program_id).unwrap_err(),
             ProgramError::Custom(ReferralError::InvalidReferralConfigOwner as u32),
-            "a foreign-owned account must never be accepted as the config",
+            "a foreign-owned account must never be accepted as the config — and the \
+             code must name the OWNER branch. This fixture sits at the canonical PDA \
+             precisely so the address branch cannot be what rejected it.",
         );
     }
 
     /// Program-owned but at the wrong address: guards type confusion between
     /// this program's own account types. Nothing but the canonical PDA counts.
+    ///
+    /// Program-owned on purpose, so the owner branch passes and only the address
+    /// branch can be what rejects this.
     #[test]
     fn test_load_verified_config_rejects_wrong_address() {
         let program_id = Pubkey::new_unique();
@@ -173,8 +186,20 @@ mod tests {
 
         assert_eq!(
             load_verified_config(&info, &program_id).unwrap_err(),
-            ProgramError::Custom(ReferralError::InvalidReferralConfigOwner as u32),
+            ProgramError::Custom(ReferralError::InvalidReferralConfigAddress as u32),
             "only the canonical [b\"referral_config\"] PDA may be read as the config",
+        );
+    }
+
+    /// M-2: the two rejection paths must stay distinguishable. If these ever
+    /// collapse back to one code, the pair of tests above stops being an oracle
+    /// for *which* check fired and both could pass on the wrong branch.
+    #[test]
+    fn test_load_verified_config_branches_have_distinct_codes() {
+        assert_ne!(
+            ReferralError::InvalidReferralConfigOwner as u32,
+            ReferralError::InvalidReferralConfigAddress as u32,
+            "the owner check and the PDA check must never share an error code",
         );
     }
 

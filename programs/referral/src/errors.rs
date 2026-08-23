@@ -21,11 +21,20 @@ pub enum ReferralError {
     InvalidPoolVault,               // 14 — H-1: pool_vault doesn't match config.rewards_pool_vault
     InvalidReferralConfigOwner,     // 15 — C-2: referral_config not owned by referral program
     InvalidReferralConfigSize,      // 16 — C-2: referral_config data too small
-    InvalidReferralConfigAuthority, // 17 — C-2: config authority doesn't match expected
+    InvalidReferralConfigAuthority, // 17 — reserved: config.authority != an expected key.
+                                    //      Unused in this program. `user-escrow` 6009 already
+                                    //      means exactly that, so it is NOT reused for the
+                                    //      address check below — same name, same audit, two
+                                    //      different failures would be a trap.
     ReviewPeriodNotExpired,         // 18 — reserved for future auto-release guard
     ClaimAlreadyExecuted,           // 19
     InvalidClaimStatus,             // 20
     ReviewDeadlinePassed,           // 21 — M-1: foundation acted after 48h window closed
+    InvalidReferralConfigAddress,   // 22 — M-2: referral_config is not the canonical
+                                    //      [b"referral_config"] PDA. Deliberately distinct
+                                    //      from 15 so a test asserting the owner branch can
+                                    //      never be satisfied by the address branch, or the
+                                    //      other way round.
 }
 
 impl From<ReferralError> for ProgramError {
