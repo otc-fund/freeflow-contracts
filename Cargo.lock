@@ -3320,6 +3320,7 @@ dependencies = [
  "borsh 1.5.1",
  "sha2 0.10.9",
  "solana-program",
+ "spl-associated-token-account 3.0.4",
  "spl-token",
 ]
 

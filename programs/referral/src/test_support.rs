@@ -194,3 +194,35 @@ pub fn spl_token_account_bytes_for_mint(mint: &Pubkey, amount: u64) -> Vec<u8> {
 pub fn spl_token_account_bytes(amount: u64) -> Vec<u8> {
     spl_token_account_bytes_for_mint(&Pubkey::default(), amount)
 }
+
+/// A genuine 82-byte SPL **Mint**, packed by `spl_token` itself.
+///
+/// Tokenkeg owns a mint exactly as it owns a token account, so an owner check
+/// cannot tell the two apart — only the length can, which is what the pin in
+/// `approve_claim` step 3 is for. Packing through `Mint::pack_into_slice`
+/// rather than hand-rolling the bytes keeps the fixture honest: this is what a
+/// real mint on chain looks like, field for field.
+///
+/// `freeze_authority` is a parameter because the handler reads its vault
+/// balance from `[64..72]`, and in an 82-byte mint that range falls inside the
+/// freeze authority. A caller that wants "a mint that would sail past the
+/// solvency check if the length pin were gone" passes `Some([0xFF; 32])`.
+pub fn spl_mint_account_bytes(
+    supply: u64,
+    decimals: u8,
+    freeze_authority: Option<Pubkey>,
+) -> Vec<u8> {
+    use solana_program::{program_option::COption, program_pack::Pack};
+
+    let mut data = vec![0u8; spl_token::state::Mint::LEN];
+    spl_token::state::Mint {
+        mint_authority: COption::None,
+        supply,
+        decimals,
+        is_initialized: true,
+        freeze_authority: freeze_authority.map_or(COption::None, COption::Some),
+    }
+    .pack_into_slice(&mut data);
+    assert_eq!(data.len(), 82, "an SPL mint is 82 bytes, not 165");
+    data
+}

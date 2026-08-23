@@ -32,8 +32,8 @@ const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
 /// 2. `[]`         config         — `ReferralConfig` PDA (authority check)
 /// 3. `[writable]` vault          — pool SPL token vault (source)
 /// 4. `[writable]` referrer_ata   — referrer's $FLOW ATA (destination). Must be
-///                                  the canonical ATA of `claim_request.referrer`
-///                                  for the vault's mint; derived, not trusted.
+///    the canonical ATA of `claim_request.referrer` for the vault's mint;
+///    derived, not trusted.
 /// 5. `[signer]`   authority      — Foundation authority (must match config.authority)
 /// 6. `[]`         token_program  — SPL Token program
 pub fn process(
@@ -339,6 +339,31 @@ mod tests {
         mint:         &Pubkey,
         referrer_ata: &Pubkey,
     ) -> Result<(), ProgramError> {
+        approve_with_vault(
+            program_id,
+            authority,
+            referrer,
+            mint,
+            referrer_ata,
+            crate::test_support::spl_token_account_bytes_for_mint(mint, 1_000_000_000),
+        )
+    }
+
+    /// As `approve_paying_to`, but the bytes behind `vault_info` are the
+    /// caller's too.
+    ///
+    /// I-3 needs that second variable: the vault is the account the handler
+    /// reads both the balance and — since C-2 — the mint out of, so "is this
+    /// really a token account" is a question only a caller-supplied `vault`
+    /// can ask.
+    fn approve_with_vault(
+        program_id:   &Pubkey,
+        authority:    &Pubkey,
+        referrer:     &Pubkey,
+        mint:         &Pubkey,
+        referrer_ata: &Pubkey,
+        vault_bytes:  Vec<u8>,
+    ) -> Result<(), ProgramError> {
         use crate::test_support::{
             claim_request_bytes, config_bytes, install_syscall_stubs,
             rewards_pool_bytes, spl_token_account_bytes_for_mint,
@@ -365,7 +390,7 @@ mod tests {
         let mut cfg_lamports   = 1_000_000u64;
         let mut cfg_data       = config_bytes(authority, &vault_key);
         let mut vault_lamports = 1_000_000u64;
-        let mut vault_data     = spl_token_account_bytes_for_mint(mint, 1_000_000_000);
+        let mut vault_data     = vault_bytes;
         let mut ata_lamports   = 1_000_000u64;
         let mut ata_data       = spl_token_account_bytes_for_mint(mint, 0);
         let mut sig_lamports   = 1_000_000u64;
@@ -435,11 +460,11 @@ mod tests {
         let referrer_y = Pubkey::new_unique();
 
         // Y's canonical ATA: a perfectly real, correctly derived token account
-        // for the same mint — it simply is not X's.
-        let (y_ata, _) = Pubkey::find_program_address(
-            &[referrer_y.as_ref(), spl_token::id().as_ref(), mint.as_ref()],
-            &super::ASSOCIATED_TOKEN_PROGRAM_ID,
-        );
+        // for the same mint — it simply is not X's. Derived by upstream (I-2),
+        // so "correctly derived" is a claim about the ATA standard rather than
+        // about this file's own arithmetic.
+        let y_ata =
+            spl_associated_token_account::get_associated_token_address(&referrer_y, &mint);
 
         let err = approve_paying_to(&program_id, &authority, &referrer_x, &mint, &y_ata)
             .expect_err("a claim naming X must never pay out to Y's ATA");
@@ -458,6 +483,15 @@ mod tests {
     /// `derive_ata(referrer, flow_mint, token_program)`) — still goes through.
     ///
     /// Without this, `return Err(..)` would satisfy the test above.
+    ///
+    /// I-2: the expected address comes from `spl_associated_token_account`, the
+    /// crate that *defines* the convention, and deliberately not from re-running
+    /// the handler's own `find_program_address` expression. A mirrored expected
+    /// value proves only that the file agrees with itself: transpose the seeds
+    /// in `process` and in the tests together and a mirrored suite still goes
+    /// green, while the deployed program would reject every address the
+    /// foundation sends — a total payout outage on a live program. Upstream
+    /// does not move when this file moves, so it is an oracle, not an echo.
     #[test]
     fn test_approve_accepts_the_referrers_canonical_ata() {
         let program_id = Pubkey::new_unique();
@@ -465,12 +499,103 @@ mod tests {
         let mint       = Pubkey::new_unique();
         let referrer_x = Pubkey::new_unique();
 
-        let (x_ata, _) = Pubkey::find_program_address(
-            &[referrer_x.as_ref(), spl_token::id().as_ref(), mint.as_ref()],
-            &super::ASSOCIATED_TOKEN_PROGRAM_ID,
-        );
+        let x_ata =
+            spl_associated_token_account::get_associated_token_address(&referrer_x, &mint);
 
         approve_paying_to(&program_id, &authority, &referrer_x, &mint, &x_ata)
-            .expect("the referrer's own canonical ATA must still be paid");
+            .expect(
+                "the referrer's own canonical ATA must still be paid — if this \
+                 fails, the seed order or the program id in `process` has \
+                 drifted from the ATA standard",
+            );
+    }
+
+    /// I-2, the other half: name the wrong seed order outright, so no edit to
+    /// this file can quietly agree with it.
+    ///
+    /// `[token_program, referrer, mint]` is the transposition a careless edit
+    /// produces; upstream's `get_associated_token_address_and_bump_seed_internal`
+    /// uses `[wallet, token_program, mint]`. Swapping `process` over to the
+    /// transposition and swapping the tests with it left the old suite at 63
+    /// passing. This test has no mirror to swap.
+    #[test]
+    fn test_approve_rejects_a_transposed_ata_seed_order() {
+        let program_id = Pubkey::new_unique();
+        let authority  = Pubkey::new_unique();
+        let mint       = Pubkey::new_unique();
+        let referrer   = Pubkey::new_unique();
+
+        let (transposed, _) = Pubkey::find_program_address(
+            &[spl_token::id().as_ref(), referrer.as_ref(), mint.as_ref()],
+            &super::ASSOCIATED_TOKEN_PROGRAM_ID,
+        );
+        assert_ne!(
+            transposed,
+            spl_associated_token_account::get_associated_token_address(&referrer, &mint),
+            "the transposition has to change the address, or this test asserts \
+             nothing",
+        );
+
+        let err = approve_paying_to(&program_id, &authority, &referrer, &mint, &transposed)
+            .expect_err("a transposed seed order does not name the canonical ATA");
+
+        assert_eq!(
+            err,
+            ProgramError::Custom(ReferralError::InvalidReferrerAta as u32),
+        );
+    }
+
+    // ── I-3: `vault` must be a token account, not merely Tokenkeg-owned ──────
+
+    /// An SPL **Mint** is owned by the token program exactly as a token account
+    /// is, so the owner check that opens step 3 waves one straight through.
+    /// What turns it away is the length pin — a mint is 82 bytes, a token
+    /// account 165 — and that pin has to hold, because the handler goes on to
+    /// read the vault balance (`[64..72]`) and, since C-2, the mint it derives
+    /// the referrer's ATA from (`[0..32]`) out of these very bytes.
+    ///
+    /// Note where those offsets land inside an 82-byte mint: `[0..32]` is in
+    /// `mint_authority` and `[64..72]` in `freeze_authority`. Both are in
+    /// bounds, so nothing panics — without the pin the handler would simply
+    /// read a balance and a mint out of a mint's authority fields and carry on.
+    /// That is what makes the pin a real check rather than a formality, and it
+    /// is why the second case below exists: give the mint a freeze authority
+    /// whose bytes happen to read as a huge balance and the solvency check
+    /// passes too, leaving an ATA derived from garbage as the only thing
+    /// standing between a mint and a signed transfer.
+    #[test]
+    fn test_approve_rejects_a_mint_shaped_vault() {
+        use crate::test_support::spl_mint_account_bytes;
+
+        let program_id = Pubkey::new_unique();
+        let authority  = Pubkey::new_unique();
+        let mint       = Pubkey::new_unique();
+        let referrer   = Pubkey::new_unique();
+
+        // Genuine in every other respect, so the length pin is what is on trial.
+        let ata =
+            spl_associated_token_account::get_associated_token_address(&referrer, &mint);
+
+        for (label, freeze_authority) in [
+            ("a plain mint", None),
+            (
+                "a mint whose freeze authority reads as a huge balance",
+                Some(Pubkey::new_from_array([0xFF; 32])),
+            ),
+        ] {
+            let vault = spl_mint_account_bytes(1_000_000_000, 9, freeze_authority);
+            assert_eq!(vault.len(), 82, "an SPL mint is 82 bytes");
+
+            let err =
+                approve_with_vault(&program_id, &authority, &referrer, &mint, &ata, vault)
+                    .expect_err("an 82-byte mint must never serve as the pool vault");
+
+            assert_eq!(
+                err,
+                ProgramError::InvalidAccountData,
+                "the length pin must be what rejects {label}, not some later \
+                 check reached on misread bytes",
+            );
+        }
     }
 }
