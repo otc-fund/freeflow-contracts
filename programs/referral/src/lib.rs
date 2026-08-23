@@ -25,6 +25,8 @@ use solana_program::{
 mod errors;
 mod instructions;
 mod state;
+#[cfg(test)]
+mod test_support;
 mod utils;
 
 use instructions::{

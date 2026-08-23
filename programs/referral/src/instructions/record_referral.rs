@@ -23,7 +23,7 @@ use solana_program::{
 
 use crate::{
     errors::ReferralError,
-    state::{ReferralCode, ReferralConfig, ReferralRecord, ReferrerBalance, RewardsPool},
+    state::{ReferralCode, ReferralRecord, ReferrerBalance, RewardsPool},
     utils::calculate_reward,
 };
 
@@ -68,7 +68,10 @@ pub fn process(
     }
 
     // ── 1. Load config ──────────────────────────────────────────────────────
-    let config = ReferralConfig::try_from_slice(&config_info.data.borrow())?;
+    // C-2: prove the account IS the config first. Everything below — the H-1
+    // vault check, the minimum, the reward rate — is only as trustworthy as
+    // the account these numbers came out of.
+    let config = crate::utils::load_verified_config(config_info, program_id)?;
 
     // ── H-1: Validate pool vault matches config ─────────────────────────────
     if pool_vault_info.key.to_bytes() != config.rewards_pool_vault {
@@ -271,5 +274,133 @@ mod tests {
         let expected    = calculate_reward(purchase_amount, reward_bps, max_reward).unwrap();
         let transferred = expected; // matches
         assert_eq!(expected, transferred, "M-5 passes");
+    }
+
+    /// C-2: an attacker-owned config at the canonical PDA address. Here the
+    /// forged `authority` is beside the point — what a forged config buys the
+    /// attacker is control of `reward_bps`, `max_reward_lamports`,
+    /// `min_purchase_lamports` and `rewards_pool_vault`, so the H-1 vault check
+    /// and the M-5 reward check are both being validated against numbers the
+    /// attacker chose. Before the fix this minted an arbitrary
+    /// `ReferrerBalance.total_earned` credit out of nothing.
+    ///
+    /// The stubbed `create_account` CPI is a no-op off-chain, so the record and
+    /// balance accounts are pre-allocated at their real sizes here.
+    #[test]
+    fn test_record_referral_rejects_foreign_owned_config() {
+        use crate::{
+            state::{ReferralRecord, ReferrerBalance},
+            test_support::{
+                forged_config_bytes, forged_config_rejection, install_syscall_stubs,
+                referral_code_bytes, referrer_balance_bytes, rewards_pool_bytes,
+            },
+        };
+        use solana_program::{account_info::AccountInfo, pubkey::Pubkey};
+
+        install_syscall_stubs();
+
+        let program_id       = Pubkey::new_unique();
+        let attacker_program = Pubkey::new_unique();
+        let attacker         = Pubkey::new_unique(); // the "client" signer
+        let referrer         = Pubkey::new_unique();
+        let vault_key        = Pubkey::new_unique();
+        let code_key         = Pubkey::new_unique();
+        let system_id        = solana_program::system_program::id();
+        let token_program_id = spl_token::id();
+        let (config_pda, _)  =
+            Pubkey::find_program_address(&[b"referral_config"], &program_id);
+        let (pool_pda, _)    =
+            Pubkey::find_program_address(&[b"rewards_pool"], &program_id);
+        let (balance_pda, _) = Pubkey::find_program_address(
+            &[b"referrer_balance", referrer.as_ref()],
+            &program_id,
+        );
+        let seq_bytes = 0u32.to_le_bytes();
+        let (record_pda, _) = Pubkey::find_program_address(
+            &[
+                b"referral_record",
+                referrer.as_ref(),
+                attacker.as_ref(),
+                &seq_bytes,
+            ],
+            &program_id,
+        );
+
+        let code_hash       = [7u8; 32];
+        let purchase_amount = 1_000_000_000u64;
+        // forged_config_bytes sets reward_bps = 250 and max_reward = u64::MAX
+        let reward = calculate_reward(purchase_amount, 250, u64::MAX).unwrap();
+
+        let mut rec_lamports  = 1_000_000u64;
+        let mut rec_data      = vec![0u8; ReferralRecord::SIZE];
+        let mut bal_lamports  = 1_000_000u64;
+        let mut bal_data      = referrer_balance_bytes(&referrer, 0, 0, 0);
+        assert_eq!(bal_data.len(), ReferrerBalance::SIZE);
+        let mut code_lamports = 1_000_000u64;
+        let mut code_data     = referral_code_bytes(&referrer, code_hash);
+        let mut cfg_lamports  = 1_000_000u64;
+        let mut cfg_data      = forged_config_bytes(&attacker, &vault_key);
+        let mut pool_lamports = 1_000_000u64;
+        let mut pool_data     = rewards_pool_bytes(0, 0);
+        let mut cli_lamports  = 1_000_000_000u64;
+        let mut cli_data: Vec<u8> = Vec::new();
+        let mut ref_lamports  = 1_000_000u64;
+        let mut ref_data: Vec<u8> = Vec::new();
+        let mut sys_lamports  = 1_000_000u64;
+        let mut sys_data: Vec<u8> = Vec::new();
+        let mut vlt_lamports  = 1_000_000u64;
+        let mut vlt_data: Vec<u8> = Vec::new();
+
+        let accounts = [
+            AccountInfo::new(
+                &record_pda, false, true,
+                &mut rec_lamports, &mut rec_data, &program_id, false, 0,
+            ),
+            AccountInfo::new(
+                &balance_pda, false, true,
+                &mut bal_lamports, &mut bal_data, &program_id, false, 0,
+            ),
+            AccountInfo::new(
+                &code_key, false, false,
+                &mut code_lamports, &mut code_data, &program_id, false, 0,
+            ),
+            AccountInfo::new(
+                &config_pda, false, false,
+                &mut cfg_lamports, &mut cfg_data, &attacker_program, false, 0,
+            ),
+            AccountInfo::new(
+                &pool_pda, false, true,
+                &mut pool_lamports, &mut pool_data, &program_id, false, 0,
+            ),
+            AccountInfo::new(
+                &attacker, true, true,
+                &mut cli_lamports, &mut cli_data, &system_id, false, 0,
+            ),
+            AccountInfo::new(
+                &referrer, false, false,
+                &mut ref_lamports, &mut ref_data, &system_id, false, 0,
+            ),
+            AccountInfo::new(
+                &system_id, false, false,
+                &mut sys_lamports, &mut sys_data, &system_id, true, 0,
+            ),
+            AccountInfo::new(
+                &vault_key, false, false,
+                &mut vlt_lamports, &mut vlt_data, &token_program_id, false, 0,
+            ),
+        ];
+
+        let err = super::process(
+            &program_id,
+            &accounts,
+            super::RecordReferralArgs {
+                code_hash,
+                purchase_amount,
+                transferred_reward: reward,
+            },
+        )
+        .expect_err("a foreign-owned config must never drive reward accounting");
+
+        assert_eq!(err, forged_config_rejection());
     }
 }
