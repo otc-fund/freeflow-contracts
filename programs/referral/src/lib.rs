@@ -299,6 +299,8 @@ mod tests {
         assert_eq!(e, ProgramError::Custom(15));
         let e: ProgramError = ReferralError::InvalidReferralConfigAddress.into();
         assert_eq!(e, ProgramError::Custom(22));
+        let e: ProgramError = ReferralError::InvalidReferrerAta.into();
+        assert_eq!(e, ProgramError::Custom(23));
     }
 
     // ── SHA-256 helper ───────────────────────────────────────────────────────

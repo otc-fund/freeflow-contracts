@@ -169,10 +169,28 @@ pub fn rewards_pool_bytes(total_deposited: u64, total_distributed: u64) -> Vec<u
     bytes
 }
 
-/// A 165-byte SPL token account with `amount` at offset 64..72, where
-/// `approve_claim` reads the vault balance from.
-pub fn spl_token_account_bytes(amount: u64) -> Vec<u8> {
+/// The same 86 bytes as `forged_config_bytes`, for the case where the account
+/// they land in IS the genuine config: program-owned, at the canonical PDA.
+///
+/// Only the account's provenance ever differs, never the bytes — which is
+/// exactly why the provenance checks in `load_verified_config` have to exist.
+pub fn config_bytes(authority: &Pubkey, rewards_pool_vault: &Pubkey) -> Vec<u8> {
+    forged_config_bytes(authority, rewards_pool_vault)
+}
+
+/// A 165-byte SPL token account for `mint` holding `amount`.
+///
+/// Two fields matter to `approve_claim`: the mint at 0..32, which it derives
+/// the referrer's canonical ATA from, and the amount at 64..72, which it reads
+/// the vault balance from.
+pub fn spl_token_account_bytes_for_mint(mint: &Pubkey, amount: u64) -> Vec<u8> {
     let mut data = vec![0u8; 165];
+    data[0..32].copy_from_slice(mint.as_ref());
     data[64..72].copy_from_slice(&amount.to_le_bytes());
     data
+}
+
+/// As above with an all-zero mint, for the tests that never read it.
+pub fn spl_token_account_bytes(amount: u64) -> Vec<u8> {
+    spl_token_account_bytes_for_mint(&Pubkey::default(), amount)
 }

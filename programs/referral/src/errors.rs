@@ -35,6 +35,12 @@ pub enum ReferralError {
                                     //      from 15 so a test asserting the owner branch can
                                     //      never be satisfied by the address branch, or the
                                     //      other way round.
+    InvalidReferrerAta,             // 23 — Task 4: the ApproveClaim payout destination is not
+                                    //      the canonical ATA of `claim_request.referrer`.
+                                    //      Its own code, not `InvalidAuthority` (1): that one
+                                    //      already means "the signer is not the foundation",
+                                    //      and a shared code makes the test unable to say
+                                    //      which check rejected the transaction.
 }
 
 impl From<ReferralError> for ProgramError {
